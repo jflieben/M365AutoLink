@@ -12,7 +12,7 @@ M365AutoLink automatically finds all Microsoft Teams and SharePoint sites you ha
 # Usage
 
 ## Quick Start
-1. Download the script `M365AutoLink.ps1`.
+1. Download the script [`M365AutoLink.ps1`](https://github.com/jflieben/M365AutoLink/blob/main/M365AutoLink.ps1).
 2. [Grant Consent](https://login.microsoftonline.com/organizations/adminconsent?client_id=ae7727e4-0471-4690-b155-76cbf5fdcb30) to the SSO app registration
 3. Open a PowerShell terminal (PowerShell 5.x or 7.x).
 4. Run the script: 
