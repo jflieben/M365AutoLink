@@ -30,24 +30,36 @@ You can edit the `##########START CONFIGURATION##########` block at the top of t
 # Authentication & Permissions
 The script uses Microsoft Graph APIs to discover sites and create shortcuts. 
 
-## Automatic App Registration
+## Automatic App Registration (easiest)
 You can consent to the "Lieben Consultancy" multi-tenant app:
 [Grant Consent](https://login.microsoftonline.com/organizations/adminconsent?client_id=ae7727e4-0471-4690-b155-76cbf5fdcb30)
 
+These are delegated permissions only, and thus 100% safe.
+
+![Graph Permissions](graphpermissions.png)
+
 ## Manual App Registration
-Create your own App Registration in Azure AD:
+If you don't want to use my app registration, you can create your own App Registration in Azure AD:
 1. Create a new App Registration ("Mobile and desktop applications").
 2. Set Redirect URI to `http://localhost`.
-3. Enable "Allow public client flows".
-4. Replace the `$ClientID` variable in the script with your new Application (Client) ID.
+3. Check the box for: https://login.microsoftonline.com/common/oauth2/nativeclient
+4. Enable "Allow public client flows".
+5. Replace the `$ClientID` variable in the script with your new Application (Client) ID.
+6. Add and grant the permissions shown below
 
 ## Required Permissions
 The script requires the following delegated permissions to function:
-- `Files.ReadWrite.All`: To create shortcuts in OneDrive.
-- `Team.ReadBasic.All`: To find Teams you are a member of.
-- `Sites.Read.All`: To find SharePoint sites you have access to.
 
-![Graph Permissions](graphpermissions.png)
+Graph:
+- `Files.ReadWrite.All`: To create shortcuts in OneDrive.
+- `Sites.Read.All`: To find SharePoint sites you have access to.
+- `User.Read`: To allow user access.
+
+Sharepoint:
+- `AllSites.Read`: To get metadata of existing links
+
+Your app registration's permissions should look like this:
+![Graph Permissions](requiredpermissions.png)
 
 # Copyright/License
 https://www.lieben.nu/liebensraum/commercial-use/
@@ -55,7 +67,7 @@ https://www.lieben.nu/liebensraum/commercial-use/
 
 # Support / Risk
 Support at best-effort, use at your own risk.
-When reporting issues, please include `lastRun.log` from `%APPDATA%\M365AutoLink\`.
+When reporting issues here on GitHub, please include `lastRun.log` from `%APPDATA%\M365AutoLink\`.
 
 # Author
 Jos Lieben (https://www.lieben.nu)
