@@ -27,6 +27,10 @@ You can edit the `##########START CONFIGURATION##########` block at the top of t
 - `$excludedSitesByWildcard`: Patterns for sites to skip.
 - `$includedSitesByWildcard`: Patterns for sites to include.
 
+Note that if you disable indexing of a site, it will not be included irrespective of above filtering.
+![Excluded from Search](excludefromsearch.png)
+
+
 # Authentication & Permissions
 The script uses Microsoft Graph APIs to discover sites and create shortcuts. 
 

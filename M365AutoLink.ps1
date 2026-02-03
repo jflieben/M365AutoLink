@@ -11,6 +11,7 @@
     - PowerShell 5.x or 7.x
     - Microsoft 365 (licensed) account
     - Automatic or Manual app registration (see below)
+    - Sites should be included in search (which is default but can be overridden at site level)
 
 .APP REGISTRATION REQUIREMENTS
     AUTOMATIC: 
@@ -73,6 +74,7 @@ $excludedSitesByWildcard = @(
     "*/portals/personal/*"
     "*/sites/AllCompany*"
     "*/personal/*"
+    "*/contentstorage/*"
 )
 #if you define included site, only sites matching one of the patterns you enter will be linked. Use a * to match 1 or more characters
 #e.g. https://contoso.sharepoint.com/sites/HR*" would include all sites where the name starts with HR"
