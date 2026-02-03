@@ -26,6 +26,8 @@ You can edit the `##########START CONFIGURATION##########` block at the top of t
 - `$FolderName`: The name of the folder created in OneDrive (Default: "Entire Organization").
 - `$excludedSitesByWildcard`: Patterns for sites to skip.
 - `$includedSitesByWildcard`: Patterns for sites to include.
+- `$maxFileCount`: Only create a link if the site has less than this amount of files
+- `$minFileCount`: Only create a link if the site has more than this amount of files
 
 Note that if you disable indexing of a site, it will not be included irrespective of above filtering.
 ![Excluded from Search](excludefromsearch.png)

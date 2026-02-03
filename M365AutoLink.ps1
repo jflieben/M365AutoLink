@@ -81,6 +81,11 @@ $excludedSitesByWildcard = @(
 $includedSitesByWildcard = @(
     "https://*.sharepoint.com/sites/*"
 )
+
+#below variables can be used to filter based on the number of existing files in the target location before creating a link
+$maxFileCount = 300000
+$minFileCount = 0
+
 ##########END CONFIGURATION#############################
 
 #base vars
@@ -578,7 +583,15 @@ try {
     #retrieve current shortcuts
     Write-Log "Getting target info for all current shortcuts...." "INFO" 
     $folderContents = New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$rootUrl/personal/$userComponent/_api/web/GetFolderByServerRelativeUrl('/personal/$userComponent/$libraryName/$FolderName')/Files?`$top=5000&`$format=json&`$expand=listItem" -Method GET
-
+    
+    #sometimes, e.g. when a library is changed to sync-blocked, onedrive changes it to a folder. These should be wiped as they would only confuse the user
+    New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$rootUrl/personal/$userComponent/_api/web/GetFolderByServerRelativeUrl('/personal/$userComponent/$libraryName/$FolderName')/Folders?`$top=5000&`$format=json&`$expand=listItem" -Method GET | ForEach-Object {
+        if($_.UniqueId){
+            New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$rootUrl/personal/$userComponent/_api/web/GetFolderById('$($_.UniqueId)')/DeleteObject()" -Method POST
+            Write-Log "Found and deleted an unexpected folder where only links should exist. Name: $($_.Name)" "ERROR" 
+        }
+    }
+    
     foreach($shortCut in $folderContents){
         $shortCutMetaData = (New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$rootUrl/personal/$userComponent/_api/web/lists('$($docLibrary.id)')/GetItemByUniqueId('$($shortCut.UniqueId)')?`$expand=FieldValuesAsText" -Method GET -MaxAttempts 1)
         $currentShortCuts += @{
@@ -632,7 +645,7 @@ try {
             # Get more site info to determine if the site is archived or read-only or other blocking properties using the sharepoint API
             $siteDetails = New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$($site.webUrl)/_api/site" -Method "GET" -MaxAttempts 1
             if($siteDetails.WriteLocked -or $siteDetails.ReadOnly){
-                Write-Log "Site is locked or read only, skipping..." "WARN"
+                Write-Log "  Site is locked or read only, skipping..." "WARN"
                 continue
             }
 
@@ -640,6 +653,23 @@ try {
             $lists = (New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/sites/$($site.id)/lists" -Method "GET" -MaxAttempts 3) | Where-Object { $_.list.template -eq "documentLibrary" -and !$_.list.hidden}
 
             foreach($list in $lists){
+                # Get ItemCount and other relevant filterable criteria for this list
+                $listMetaData = New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$($site.webUrl)/_api/lists/GetById('$($list.id)')" -Method GET
+                if($listMetaData.Hidden){
+                    Write-Log "  $($list.displayName) is hidden, skipping..." "WARN"
+                    continue
+                }
+
+                if($listMetaData.ItemCount -gt $maxFileCount){
+                    Write-Log "  $($list.displayName) has more than $($maxFileCount) files, skipping..." "WARN"
+                    continue
+                }
+
+                if($listMetaData.ItemCount -lt $minFileCount){
+                    Write-Log "  $($list.displayName) has less than $($minFileCount) files, skipping..." "WARN"
+                    continue
+                }
+                
                 # Extract SharePoint IDs from the site
                 $desiredShortcuts += @{
                     shortCut = @{
@@ -711,7 +741,7 @@ try {
 
         if (-not $shouldExist) {
             try {
-                Write-Log "Deleting obsolete shortcut with ID '$($existing.ID)'..." "INFO"
+                Write-Log "  Deleting obsolete shortcut with ID '$($existing.ID)'..." "INFO"
                 New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/me/drive/items/$($existing.ID)" -Method DELETE
                 $deletedCount++
                 Write-Log "  Successfully deleted obsolete shortcut" "SUCCESS"
