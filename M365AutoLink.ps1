@@ -56,13 +56,15 @@
     Date: 2025-01-27
     Copyright/License: https://www.lieben.nu/liebensraum/commercial-use/ (Commercial (re)use not allowed without prior written consent by the author, otherwise free to use/modify as long as header are kept intact)
     Microsoft doc: https://support.microsoft.com/en-us/office/add-shortcuts-to-shared-folders-in-onedrive-d66b1347-99b7-4470-9360-ffc048d35a33
+    Always test carefully, use at your own risk, author takes no responsibility for this script
     
 .EXAMPLE
     .\M365AutoLink.ps1
 #>
 
 ##########START CONFIGURATION#############################
-$FolderName = "Entire Organization" #this is the folder created in onedrive to house all links this tool will create. Feel free to change this to something localized, the tool will auto-create it if it does not exist
+$FolderName = "Entire Org" #this is the folder created in onedrive to house all links this tool will create. Feel free to change this to something localized, the tool will auto-create it if it does not exist
+#WARNING: Any pre-existing folders in above folder will be deleted!
 $CloudType = "global" #global, usgov, usdod, china
 $ClientID = "ae7727e4-0471-4690-b155-76cbf5fdcb30" #Lieben Consultancy public client ID, you can also create your own (see APP REGISTRATION REQUIREMENTS above)
 
