@@ -5,7 +5,7 @@ M365AutoLink automatically finds all Microsoft Teams and SharePoint sites you ha
 
 # Features
 - **Saves Time**: Instantly links all your collaborative spaces to your OneDrive.
-- **Organization**: Creates a dedicated folder (default: "Entire Organization") in your OneDrive root for all shortcuts.
+- **Organization**: Creates a dedicated folder (default: "AutoLink") in your OneDrive root for all shortcuts.
 - **Silent Operation**: Caches authentication tokens so subsequent runs can happen silently in the background.
 - **Smart Filtering**: Includes configuration to exclude specific site patterns (e.g. personal sites).
 
@@ -23,7 +23,7 @@ M365AutoLink automatically finds all Microsoft Teams and SharePoint sites you ha
 
 ## Configuration
 You can edit the `##########START CONFIGURATION##########` block at the top of the script to customize:
-- `$FolderName`: The name of the folder created in OneDrive (Default: "Entire Organization").
+- `$FolderName`: The name of the folder created in OneDrive (Default: "AutoLink").
 - `$excludedSitesByWildcard`: Patterns for sites to skip.
 - `$includedSitesByWildcard`: Patterns for sites to include.
 - `$maxFileCount`: Only create a link if the site has less than this amount of files
