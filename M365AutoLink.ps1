@@ -85,6 +85,14 @@ $includedSitesByWildcard = @(
     "https://*.sharepoint.com/sites/*"
 )
 
+#link name cleanup patterns - applied to shortcut names after creation and to existing shortcuts on each run
+#each entry has a Pattern (string to find) and Replacement (string to replace with)
+#patterns are applied in order, final name is trimmed of leading/trailing whitespace
+$linkNameReplacements = @(
+    @{ Pattern = " - Documents"; Replacement = "" }
+    @{ Pattern = "- Documents"; Replacement = "" }
+)
+
 #below variables can be used to filter based on the number of existing files in the target location before creating a link
 $maxFileCount = 300000
 $minFileCount = 0
@@ -124,6 +132,18 @@ switch($CloudType){
 }
 
 #region Helper Functions
+function Get-CleanedShortcutName {
+    param([string]$Name)
+    $cleanedName = $Name
+    foreach($replacement in $linkNameReplacements) {
+        $cleanedName = $cleanedName.Replace($replacement.Pattern, $replacement.Replacement)
+    }
+    $cleanedName = $cleanedName.Trim()
+    if([string]::IsNullOrWhiteSpace($cleanedName)){
+        $cleanedName = $Name.Trim() # fallback to original if cleaning produces empty string
+    }
+    return $cleanedName
+}
 
 function get-AccessToken{    
     Param(
@@ -599,6 +619,7 @@ try {
         $shortCutMetaData = (New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$rootUrl/personal/$userComponent/_api/web/lists('$($docLibrary.id)')/GetItemByUniqueId('$($shortCut.UniqueId)')?`$expand=FieldValuesAsText" -Method GET -MaxAttempts 1)
         $currentShortCuts += @{
             "ID" = $shortCut.uniqueId
+            "Name" = $shortCutMetaData.FieldValuesAsText.FileLeafRef
             "targetSiteId" = $shortCutMetaData.FieldValuesAsText.A2ODRemoteItemSiteId
             "targetWebId" = $shortCutMetaData.FieldValuesAsText.A2ODRemoteItemWebId
             "targetListId" = $shortCutMetaData.FieldValuesAsText.A2ODRemoteItemListId
@@ -684,7 +705,6 @@ try {
                     }
                     siteName = $site.displayName
                     listName = $list.displayName
-
                 }
             }
         }catch{
@@ -720,7 +740,19 @@ try {
             } | ConvertTo-Json -Depth 3
             
             Write-Log "  Creating shortcut..." "INFO"
-            $Null = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/me/drive/items/$($targetFolder.id)/children" -Method POST -Body $shortcutBody
+            $newShortCut = $Null; $newShortCut = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/me/drive/items/$($targetFolder.id)/children" -Method POST -Body $shortcutBody
+            
+            # Rename the shortcut if link name cleanup patterns apply
+            $cleanName = Get-CleanedShortcutName -Name $newShortCut.name
+            if($newShortCut.id -and $cleanName -ne $newShortCut.name) {
+                try {
+                    $renameBody = @{ name = $cleanName } | ConvertTo-Json
+                    $Null = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/me/drive/items/$($newShortCut.id)" -Method PATCH -Body $renameBody
+                    Write-Log "  Renamed shortcut from '$($newShortCut.name)' to '$($cleanName)'" "INFO"
+                } catch {
+                    Write-Log "  Failed to rename shortcut '$($newShortCut.name)': $($_.Exception.Message)" "WARN"
+                }
+            }            
             # Small delay to avoid throttling
             Start-Sleep -Milliseconds 500
             Write-Log "  Successfully created shortcut for '$($desiredShortcut.shortcut.siteUrl)'" "SUCCESS"
@@ -731,6 +763,28 @@ try {
         }
     }
     
+    # Rename existing shortcuts if link name cleanup patterns apply
+    $renameCount = 0
+    if($linkNameReplacements.Count -gt 0) {
+        Write-Log "Checking existing shortcuts for name cleanup..." "INFO"
+        foreach($existing in $currentShortCuts) {
+            if(-not $existing.Name) { continue }
+            $cleanedName = Get-CleanedShortcutName -Name $existing.Name
+            if($cleanedName -ne $existing.Name) {
+                try {
+                    $renameBody = @{ name = $cleanedName } | ConvertTo-Json
+                    $Null = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/me/drive/items/$($existing.ID)" -Method PATCH -Body $renameBody
+                    Write-Log "  Renamed '$($existing.Name)' to '$cleanedName'" "SUCCESS"
+                    # Small delay to avoid throttling
+                    Start-Sleep -Milliseconds 500                    
+                    $renameCount++
+                } catch {
+                    Write-Log "  Failed to rename '$($existing.Name)': $($_.Exception.Message)" "WARN"
+                }
+            }
+        }
+    }    
+
     #delete shortcuts user should no longer have access to
     $deletedCount = 0
     foreach($existing in $currentShortCuts) {
@@ -746,6 +800,8 @@ try {
             try {
                 Write-Log "  Deleting obsolete shortcut with ID '$($existing.ID)'..." "INFO"
                 New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/me/drive/items/$($existing.ID)" -Method DELETE
+                # Small delay to avoid throttling
+                Start-Sleep -Milliseconds 500
                 $deletedCount++
                 Write-Log "  Successfully deleted obsolete shortcut" "SUCCESS"
             } catch {
@@ -758,6 +814,7 @@ try {
     # Summary
     Write-Log "=== Summary ===" "INFO"
     Write-Log "Shortcuts Created: $successCount" "SUCCESS"
+    Write-Log "Shortcuts Renamed: $renamedCount" "SUCCESS"
     Write-Log "Shortcuts Skipped: $skipCount" "SUCCESS"
     Write-Log "Shortcuts deleted: $deletedCount" "SUCCESS"
     if($errorCount -gt 0){
@@ -768,7 +825,6 @@ try {
     
     Write-Log "=== Script Completed ===" "SUCCESS"
     Stop-Transcript
-    
 } catch {
     Write-Log "Fatal error: $($_.Exception.Message)" "ERROR"
     Write-Log $_.ScriptStackTrace "ERROR"
