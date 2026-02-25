@@ -744,7 +744,7 @@ try {
             
             # Rename the shortcut if link name cleanup patterns apply
             $cleanName = Get-CleanedShortcutName -Name $newShortCut.name
-            if($newShortCut.id -and $cleanName -ne $newShortCut.name -and $existingShortCuts.Name -notcontains $cleanName){ {
+            if($newShortCut.id -and $cleanName -ne $newShortCut.name -and $existingShortCuts.Name -notcontains $cleanName){
                 try {
                     $renameBody = @{ name = $cleanName } | ConvertTo-Json
                     $Null = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/me/drive/items/$($newShortCut.id)" -Method PATCH -Body $renameBody

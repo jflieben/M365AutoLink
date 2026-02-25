@@ -28,6 +28,19 @@ You can edit the `##########START CONFIGURATION##########` block at the top of t
 - `$includedSitesByWildcard`: Patterns for sites to include.
 - `$maxFileCount`: Only create a link if the site has less than this amount of files
 - `$minFileCount`: Only create a link if the site has more than this amount of files
+- `$linkNameReplacements`: An array of find/replace patterns applied to shortcut names after creation (see below).
+
+### Link Name Cleanup
+By default, shortcuts are named after the library (e.g. "Documents"). You can automatically clean up these names using `$linkNameReplacements`. Each entry has a `Pattern` (text to find) and a `Replacement` (text to replace it with). Patterns are applied in order and the final name is trimmed.
+
+Default configuration:
+```powershell
+$linkNameReplacements = @(
+    @{ Pattern = " - Documents"; Replacement = "" }
+    @{ Pattern = "- Documents"; Replacement = "" }
+)
+```
+This turns a shortcut like `Marketing - Documents` into `Marketing`. Renaming is also applied to existing shortcuts on each run, so changing these patterns will update previously created shortcuts.
 
 Note that if you disable indexing of a site, it will not be included irrespective of above filtering.
 ![Excluded from Search](excludefromsearch.png)
