@@ -560,7 +560,7 @@ try {
     # Pre populate the token cache
     $token = Get-AccessToken -resource $global:octo.graphUrl
     
-    # Get all Teams the user is a member of
+    # Get all sites the user has access to
     Write-Log "Retrieving accessible sites..." "INFO"
     $sites = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/sites?search=*" -Method "GET"
     
@@ -827,7 +827,7 @@ try {
     # Summary
     Write-Log "=== Summary ===" "INFO"
     Write-Log "Shortcuts Created: $successCount" "SUCCESS"
-    Write-Log "Shortcuts Renamed: $renamedCount" "SUCCESS"
+    Write-Log "Shortcuts Renamed: $renameCount" "SUCCESS"
     Write-Log "Shortcuts Skipped: $skipCount" "SUCCESS"
     Write-Log "Shortcuts deleted: $deletedCount" "SUCCESS"
     if($errorCount -gt 0){

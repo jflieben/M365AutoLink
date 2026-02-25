@@ -87,6 +87,11 @@ https://www.lieben.nu/liebensraum/commercial-use/
 # Support / Risk
 Support at best-effort, use at your own risk.
 When reporting issues here on GitHub, please include `lastRun.log` from `%APPDATA%\M365AutoLink\`.
+Before reporting an issue, ensure that:
+- The user having issues can actually access the site through the browser
+- The site in question is not excluded from Search (/layouts/15/srchvis.aspx)
+- Restricted Content (copilot) is not enabled for the site
+- You're not already syncing the site some other way to the device (e.g. through onedrive direct sync)
 
 # Author
 Jos Lieben (https://www.lieben.nu)
