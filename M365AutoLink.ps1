@@ -476,7 +476,7 @@ function New-GraphQuery {
                             $Data = $Data | ConvertFrom-Json -AsHashtable
                         } catch {
                             # Fallback for PS5.1 duplicate key issues (e.g. 'Id' and 'ID')
-                            Add-Type -AssemblyName System.Web.Extensions
+                            $Null = Add-Type -AssemblyName System.Web.Extensions
                             $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
                             $serializer.MaxJsonLength = 2147483647
                             $jsonContent = $serializer.DeserializeObject($Data)
@@ -556,6 +556,9 @@ try {
     Write-Log "=== M365AutoLink Started ===" "INFO"
 
     [void] [System.Reflection.Assembly]::LoadWithPartialName("System.Web")
+
+    # Pre populate the token cache
+    $token = Get-AccessToken -resource $global:octo.graphUrl
     
     # Get all Teams the user is a member of
     Write-Log "Retrieving accessible sites..." "INFO"
@@ -567,6 +570,16 @@ try {
     }
     
     Write-Log "Found $($sites.Count) sites" "SUCCESS"
+
+    Write-Log "Will apply the following exclusiong patterns later:" "INFO"
+    foreach($pattern in $excludedSitesByWildcard){
+        Write-Log "  - $pattern" "INFO"
+    }
+
+    Write-Log "Will apply the following inclusion patterns later (if defined):" "INFO"
+    foreach($pattern in $includedSitesByWildcard){
+        Write-Log "  - $pattern" "INFO"
+    }
     
     # Check if target folder exists, create if not
     Write-Log "Checking for '$FolderName' folder in OneDrive..." "INFO"
