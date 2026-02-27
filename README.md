@@ -142,6 +142,106 @@ For non-Azure environments (e.g. on-premises server, local workstation), configu
 
 > **Note**: Client secrets are not supported. Certificate-based auth is required for the app registration fallback.
 
+#### Step-by-step: Generate a certificate and configure it in Entra ID
+
+##### 1. Generate a self-signed certificate
+
+Open a PowerShell terminal **as Administrator** and run:
+
+```powershell
+# Generate a self-signed certificate valid for 2 years
+$cert = New-SelfSignedCertificate `
+    -Subject "CN=M365AutoLink" `
+    -CertStoreLocation "Cert:\CurrentUser\My" `
+    -KeyExportPolicy Exportable `
+    -KeySpec Signature `
+    -KeyLength 2048 `
+    -KeyAlgorithm RSA `
+    -HashAlgorithm SHA256 `
+    -NotAfter (Get-Date).AddYears(2)
+
+# Display the thumbprint (you'll need this later)
+Write-Output "Thumbprint: $($cert.Thumbprint)"
+```
+
+##### 2. Export the certificate
+
+```powershell
+# Export the public key (.cer) — this is uploaded to Entra ID
+Export-Certificate -Cert $cert -FilePath "C:\certs\M365AutoLink.cer"
+
+# Export the private key (.pfx) — this stays on the machine that runs the script
+$pfxPassword = ConvertTo-SecureString -String "YourPfxPassword" -Force -AsPlainText
+Export-PfxCertificate -Cert $cert -FilePath "C:\certs\M365AutoLink.pfx" -Password $pfxPassword
+```
+
+##### 3. Create an App Registration in Entra ID
+
+1. Go to the [Azure portal](https://portal.azure.com) → **Microsoft Entra ID** → **App registrations** → **New registration**.
+2. Name: `M365AutoLink` (or any name you prefer).
+3. Supported account types: **Accounts in this organizational directory only**.
+4. Click **Register**.
+5. Copy the **Application (client) ID** and **Directory (tenant) ID** — you'll need them for the script configuration.
+
+##### 4. Upload the certificate to the App Registration
+
+1. In your App Registration, go to **Certificates & secrets** → **Certificates** tab.
+2. Click **Upload certificate**.
+3. Select the `.cer` file you exported in step 2 (`C:\certs\M365AutoLink.cer`).
+4. Click **Add**.
+5. Verify the certificate appears with the correct thumbprint.
+
+##### 5. Grant API permissions
+
+1. In the App Registration, go to **API permissions** → **Add a permission**.
+2. Add **Microsoft Graph** (Application permissions):
+   - `Sites.Read.All`
+   - `Files.ReadWrite.All`
+   - `User.Read.All`
+3. Add **SharePoint** (Application permissions):
+   - `Sites.FullControl.All`
+4. Click **Grant admin consent for \<your tenant\>**.
+
+##### 6a. Configure the script — using thumbprint
+
+Use this approach when the certificate is installed in the Windows certificate store on the machine running the script (the certificate was generated there, or you imported the PFX into `CurrentUser\My` or `LocalMachine\My`).
+
+```powershell
+$ClientId = "your-application-client-id"
+$TenantId = "your-tenant-id-or-contoso.onmicrosoft.com"
+$CertificateThumbprint = "A1B2C3D4E5F6..."  # from step 1
+$CertificatePath = ""
+$CertificatePassword = ""
+```
+
+> **Tip**: To find the thumbprint of an already-installed certificate, run:
+> ```powershell
+> Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -like "*M365AutoLink*" } | Select-Object Thumbprint, Subject, NotAfter
+> ```
+
+##### 6b. Configure the script — using PFX file
+
+Use this approach when you cannot or don't want to install the certificate in the Windows certificate store (e.g. running on a locked-down server, or you want to keep the cert as a portable file).
+
+```powershell
+$ClientId = "your-application-client-id"
+$TenantId = "your-tenant-id-or-contoso.onmicrosoft.com"
+$CertificateThumbprint = ""
+$CertificatePath = "C:\certs\M365AutoLink.pfx"
+$CertificatePassword = "YourPfxPassword"  # leave empty if PFX has no password
+```
+
+##### Importing a PFX into the certificate store (optional)
+
+If you received a PFX file and want to use the thumbprint approach instead, import it first:
+
+```powershell
+$pfxPassword = ConvertTo-SecureString -String "YourPfxPassword" -Force -AsPlainText
+Import-PfxCertificate -FilePath "C:\certs\M365AutoLink.pfx" -CertStoreLocation "Cert:\CurrentUser\My" -Password $pfxPassword
+```
+
+Then use `$CertificateThumbprint` as shown in option 6a.
+
 ### Required Permissions (Application)
 
 Grant these **application** permissions to your Managed Identity or App Registration:

@@ -67,7 +67,7 @@
 .NOTES
     Author: Jose Lieben
     Version: 2.0
-    Date: 2025-01-27
+    Date: 2026-02-27
     Copyright/License: https://www.lieben.nu/liebensraum/commercial-use/ (Commercial (re)use not allowed without prior written consent by the author, otherwise free to use/modify as long as header are kept intact)
     Microsoft doc: https://support.microsoft.com/en-us/office/add-shortcuts-to-shared-folders-in-onedrive-d66b1347-99b7-4470-9360-ffc048d35a33
     Always test carefully, use at your own risk, author takes no responsibility for this script
