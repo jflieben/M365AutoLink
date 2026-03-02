@@ -239,11 +239,18 @@ function Get-AccessToken {
 
             # Sign the JWT
             $dataToSign = [System.Text.Encoding]::UTF8.GetBytes("$jwtHeaderB64.$jwtPayloadB64")
-            $rsaKey = $cert.PrivateKey
-            if(-not $rsaKey){
-                # .NET Core / PS 7+ path
+            # Prefer GetRSAPrivateKey() which returns a CNG-compatible RSA object;
+            # $cert.PrivateKey returns a legacy RSACryptoServiceProvider that fails
+            # with "Invalid algorithm specified" for CNG-backed keys (the default
+            # for New-SelfSignedCertificate).
+            $rsaKey = $null
+            try {
                 $rsaKey = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
+            } catch {}
+            if (-not $rsaKey) {
+                $rsaKey = $cert.PrivateKey
             }
+            if (-not $rsaKey) { throw "Certificate does not contain a usable RSA private key" }
             $signature = $rsaKey.SignData($dataToSign, [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
             $signatureB64 = [System.Convert]::ToBase64String($signature) -replace '\+','-' -replace '/','_' -replace '=',''
 
@@ -555,7 +562,7 @@ try {
 
     # Pre-populate the token cache via managed identity
     $token = Get-AccessToken -resource $global:octo.graphUrl
-    Write-Log "Managed identity authentication successful" "SUCCESS"
+    Write-Log "Authentication successful" "SUCCESS"
 
     # Discover tenant SharePoint URL from root site
     $rootSite = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/sites/root" -Method GET
