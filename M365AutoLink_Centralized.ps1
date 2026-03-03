@@ -107,6 +107,7 @@ $TargetUsers = @(
 #the default list is recommended
 #e.g. https://contoso.sharepoint.com/sites/HR*" would exclude all sites where the name starts with HR"
 $excludedSitesByWildcard = @(
+    "*/groupforanswersinvivaengagedonotdelete*"
     "*/sites/Streamvideo*"
     "*/portals/personal/*"
     "*/sites/AllCompany*"
@@ -134,7 +135,7 @@ $minFileCount = 0
 # Permission level required before creating a shortcut for a user:
 # "View" = create shortcut when user has View (read) or higher permissions
 # "Edit" = create shortcut only when user has Edit (contribute) or higher permissions (view-only users are skipped)
-$MinimumPermissionLevel = "View"
+$MinimumPermissionLevel = "Edit"
 
 ##########END CONFIGURATION#############################
 
@@ -621,7 +622,11 @@ try {
     $allSiteLibraries = @()
     $filteredSiteCount = 0
 
+    $siteIndex = 0
+    $siteTotal = $allTenantSites.Count
     foreach($site in $allTenantSites) {
+        $siteIndex++
+        Write-Progress -Id 0 -Activity "Phase 1/2: Enumerating sites" -Status "Site $siteIndex / $siteTotal — $($site.webUrl)" -PercentComplete ([math]::Min(100, [math]::Round(($siteIndex / $siteTotal) * 100)))
         if($null -eq $site.webUrl) { continue }
 
         # Apply exclusion patterns
@@ -693,6 +698,7 @@ try {
         }
     }
 
+    Write-Progress -Id 0 -Activity "Phase 1/2: Enumerating sites" -Completed
     Write-Log "Pre-cached $($allSiteLibraries.Count) document libraries across $filteredSiteCount sites" "SUCCESS"
     Write-Log "Minimum permission level for shortcuts: $MinimumPermissionLevel" "INFO"
 
@@ -708,10 +714,14 @@ try {
         Errors           = 0
     }
 
+    $userIndex = 0
+    $userTotal = $targetUserList.Count
     foreach($targetUser in $targetUserList) {
+        $userIndex++
         $userId = $targetUser.id
         $userUPN = $targetUser.userPrincipalName
 
+        Write-Progress -Id 0 -Activity "Phase 2/2: Processing users" -Status "User $userIndex / $userTotal — $userUPN" -PercentComplete ([math]::Min(100, [math]::Round(($userIndex / $userTotal) * 100)))
         Write-Log "========================================" "INFO"
         Write-Log "Processing user: $userUPN" "INFO"
         Write-Log "========================================" "INFO"
@@ -790,7 +800,11 @@ try {
 
             # Check user's effective permissions on each pre-cached document library
             Write-Log "  Checking permissions on $($allSiteLibraries.Count) document libraries..." "INFO"
+            $libIndex = 0
+            $libTotal = $allSiteLibraries.Count
             foreach($lib in $allSiteLibraries) {
+                $libIndex++
+                Write-Progress -Id 1 -ParentId 0 -Activity "Checking permissions" -Status "Library $libIndex / $libTotal" -PercentComplete ([math]::Min(100, [math]::Round(($libIndex / $libTotal) * 100)))
                 try {
                     $effectivePermissions = New-GraphQuery -Uri "$($lib.siteWebUrl)/_api/web/lists/GetById('$($lib.listId)')/getUserEffectivePermissions(@u)?@u='i%3A0%23.f%7Cmembership%7C$($targetUser.userPrincipalName)'" -Method GET -MaxAttempts 1
 
@@ -828,9 +842,14 @@ try {
                 }
             }
 
+            Write-Progress -Id 1 -ParentId 0 -Activity "Checking permissions" -Completed
             Write-Log "  User has access to $($desiredShortcuts.Count) document libraries" "SUCCESS"
 
+            $scIndex = 0
+            $scTotal = $desiredShortcuts.Count
             foreach($desiredShortcut in $desiredShortcuts) {
+                $scIndex++
+                Write-Progress -Id 1 -ParentId 0 -Activity "Creating shortcuts" -Status "Shortcut $scIndex / $scTotal" -PercentComplete ([math]::Min(100, [math]::Max(1, [math]::Round(($scIndex / [math]::Max(1,$scTotal)) * 100))))
                 # Check if shortcut already exists
                 $exists = $false
                 foreach($existing in $currentShortCuts) {
@@ -856,10 +875,15 @@ try {
                     } | ConvertTo-Json -Depth 3
             
                     Write-Log "    Creating shortcut for '$($desiredShortcut.listName)' ($($desiredShortcut.shortcut.siteUrl))..." "INFO"
-                    $newShortCut = $Null; $newShortCut = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/users/$userId/drive/items/$($targetFolder.id)/children" -Method POST -Body $shortcutBody
+                    $newShortCut = $Null; $newShortCut = New-GraphQuery -MaxAttempts 3 -Uri "$($global:octo.graphUrl)/v1.0/users/$userId/drive/items/$($targetFolder.id)/children" -Method POST -Body $shortcutBody
             
                     # Rename the shortcut if link name cleanup patterns apply
                     $cleanName = Get-CleanedShortcutName -Name $newShortCut.name
+                    $i = 1
+                    while($currentShortCuts.Name -contains $cleanName){
+                        $cleanName = "$($cleanName)_$($i)"
+                        $i++
+                    }
                     if($newShortCut.id -and $cleanName -ne $newShortCut.name -and $currentShortCuts.Name -notcontains $cleanName){
                         try {
                             $renameBody = @{ name = $cleanName } | ConvertTo-Json
@@ -900,9 +924,14 @@ try {
                 }
             }    
 
+            Write-Progress -Id 1 -ParentId 0 -Activity "Creating shortcuts" -Completed
             # Delete shortcuts user should no longer have access to
             $deletedCount = 0
+            $delIndex = 0
+            $delTotal = $currentShortCuts.Count
             foreach($existing in $currentShortCuts) {
+                $delIndex++
+                if($delTotal -gt 0) { Write-Progress -Id 1 -ParentId 0 -Activity "Cleaning obsolete shortcuts" -Status "$delIndex / $delTotal" -PercentComplete ([math]::Min(100, [math]::Round(($delIndex / $delTotal) * 100))) }
                 $shouldExist = $false
                 foreach($desired in $desiredShortcuts) {
                     if ($existing.targetSiteId -eq $desired.shortcut.siteId -and $existing.targetWebId -eq $desired.shortcut.webId -and $existing.targetListId -eq $desired.shortcut.listId) {
@@ -925,6 +954,7 @@ try {
                 }
             }
 
+            if($delTotal -gt 0) { Write-Progress -Id 1 -ParentId 0 -Activity "Cleaning obsolete shortcuts" -Completed }
             # Per-user summary
             Write-Log "  --- User Summary for $userUPN ---" "INFO"
             Write-Log "  Created: $successCount | Renamed: $renameCount | Skipped: $skipCount | Deleted: $deletedCount | Errors: $errorCount" "INFO"
@@ -943,6 +973,7 @@ try {
         }
     }
 
+    Write-Progress -Id 0 -Activity "Phase 2/2: Processing users" -Completed
     # Global summary
     Write-Log "=== Global Summary ===" "INFO"
     Write-Log "Users Processed: $($totalStats.UsersProcessed)" "SUCCESS"
