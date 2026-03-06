@@ -98,7 +98,7 @@ $TargetMode = "UserList"
 $TargetGroupId = ""
 
 # When TargetMode = "UserList", specify an array of UPNs
-$TargetUsers = @(
+$TargetUsers = @(""
     # "user1@contoso.com"
     # "user2@contoso.com"
 )
@@ -113,6 +113,8 @@ $excludedSitesByWildcard = @(
     "*/sites/AllCompany*"
     "*/personal/*"
     "*/contentstorage/*"
+    "*/sites/contentTypeHub*"
+    "*/sites/pwa"
 )
 #if you define included site, only sites matching one of the patterns you enter will be linked. Use a * to match 1 or more characters
 #e.g. https://contoso.sharepoint.com/sites/HR*" would include all sites where the name starts with HR"
@@ -136,6 +138,10 @@ $minFileCount = 0
 # "View" = create shortcut when user has View (read) or higher permissions
 # "Edit" = create shortcut only when user has Edit (contribute) or higher permissions (view-only users are skipped)
 $MinimumPermissionLevel = "Edit"
+
+# Number of sites to process concurrently when enumerating document libraries
+# Higher values speed up enumeration but increase API load and memory usage
+$ParallelThrottleLimit = 3
 
 ##########END CONFIGURATION#############################
 
@@ -622,11 +628,9 @@ try {
     $allSiteLibraries = @()
     $filteredSiteCount = 0
 
-    $siteIndex = 0
-    $siteTotal = $allTenantSites.Count
+    # Step 1: Pre-filter sites locally using inclusion/exclusion patterns (no API calls, very fast)
+    $filteredSites = [System.Collections.Generic.List[object]]::new()
     foreach($site in $allTenantSites) {
-        $siteIndex++
-        Write-Progress -Id 0 -Activity "Phase 1/2: Enumerating sites" -Status "Site $siteIndex / $siteTotal — $($site.webUrl)" -PercentComplete ([math]::Min(100, [math]::Round(($siteIndex / $siteTotal) * 100)))
         if($null -eq $site.webUrl) { continue }
 
         # Apply exclusion patterns
@@ -651,52 +655,167 @@ try {
         }
         if(-not $isIncluded) { continue }
 
+        $filteredSites.Add($site)
+    }
+    Write-Log "Pre-filtered to $($filteredSites.Count) sites (from $($allTenantSites.Count) total) after inclusion/exclusion patterns" "INFO"
+
+    # Step 2: Process filtered sites in parallel using runspace pool to enumerate document libraries
+    Write-Log "Enumerating document libraries from $($filteredSites.Count) sites in parallel (max $ParallelThrottleLimit concurrent)..." "INFO"
+
+    # Build InitialSessionState with helper functions and variables for parallel runspaces
+    $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    # Inject helper functions into each runspace
+    $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('Get-AccessToken', (Get-Command Get-AccessToken).Definition))
+    $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('New-GraphQuery', (Get-Command New-GraphQuery).Definition))
+    $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('Write-Log', (Get-Command Write-Log).Definition))
+    # Inject variables needed by Get-AccessToken (referenced without scope modifier)
+    $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('ClientId', $ClientId, ''))
+    $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('TenantId', $TenantId, ''))
+    $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('CertificateThumbprint', $CertificateThumbprint, ''))
+    $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('CertificatePath', $CertificatePath, ''))
+    $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('CertificatePassword', $CertificatePassword, ''))
+
+    # Create runspace pool
+    $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $ParallelThrottleLimit, $iss, $Host)
+    $pool.Open()
+
+    # Capture URL values for passing into runspaces as parameters
+    $graphUrlValue = $global:octo.graphUrl
+    $idpUrlValue = $global:octo.idpUrl
+    $sharepointUrlValue = $global:octo.sharepointUrl
+
+    # Script block executed per site in a parallel runspace
+    $processSiteBlock = {
+        param([hashtable]$siteInfo, [string]$graphUrl, [string]$idpUrl, [string]$sharepointUrl, [int]$maxFC, [int]$minFC)
+
+        # Set up global state required by Get-AccessToken / New-GraphQuery in this runspace
+        $global:octo = @{
+            graphUrl       = $graphUrl
+            idpUrl         = $idpUrl
+            sharepointUrl  = $sharepointUrl
+            LCCachedTokens = @{}
+        }
+        [void][System.Reflection.Assembly]::LoadWithPartialName("System.Web")
+
+        $result = [PSCustomObject]@{
+            Libraries   = [System.Collections.Generic.List[hashtable]]::new()
+            LogMessages = [System.Collections.Generic.List[hashtable]]::new()
+            Succeeded   = $false
+        }
+
         try {
             # Check if site is archived or read-only
-            $siteDetails = New-GraphQuery -Uri "$($site.webUrl)/_api/site" -Method "GET" -MaxAttempts 1
+            $siteDetails = New-GraphQuery -Uri "$($siteInfo.webUrl)/_api/site" -Method "GET" -MaxAttempts 1
             if($siteDetails.WriteLocked -or $siteDetails.ReadOnly){
-                Write-Log "  Site '$($site.webUrl)' is locked or read-only, skipping..." "WARN"
-                continue
+                $result.LogMessages.Add(@{ Message = "Site '$($siteInfo.webUrl)' is locked or read-only, skipping..."; Level = "WARN" })
+                return $result
             }
 
             # Get document libraries for this site
-            $lists = @((New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/sites/$($site.id)/lists" -Method "GET" -MaxAttempts 3) | Where-Object { $_.list.template -eq "documentLibrary" -and !$_.list.hidden })
+            $lists = @((New-GraphQuery -Uri "$graphUrl/v1.0/sites/$($siteInfo.id)/lists" -Method "GET" -MaxAttempts 3) | Where-Object { $_.list.template -eq "documentLibrary" -and !$_.list.hidden })
 
             foreach($list in $lists) {
                 # Get metadata for file count filtering
-                $listMetaData = New-GraphQuery -Uri "$($site.webUrl)/_api/lists/GetById('$($list.id)')" -Method GET
+                $listMetaData = New-GraphQuery -Uri "$($siteInfo.webUrl)/_api/lists/GetById('$($list.id)')" -Method GET
                 if($listMetaData.Hidden) { continue }
 
-                if($listMetaData.ItemCount -gt $maxFileCount){
-                    Write-Log "  $($site.webUrl) - '$($list.displayName)' exceeds $maxFileCount files, skipping..." "WARN"
+                if($listMetaData.ItemCount -gt $maxFC){
+                    $result.LogMessages.Add(@{ Message = "$($siteInfo.webUrl) - '$($list.displayName)' exceeds $maxFC files, skipping..."; Level = "WARN" })
                     continue
                 }
-                if($listMetaData.ItemCount -lt $minFileCount){
-                    Write-Log "  $($site.webUrl) - '$($list.displayName)' below $minFileCount files, skipping..." "WARN"
+                if($listMetaData.ItemCount -lt $minFC){
+                    $result.LogMessages.Add(@{ Message = "$($siteInfo.webUrl) - '$($list.displayName)' below $minFC files, skipping..."; Level = "WARN" })
                     continue
                 }
 
-                $allSiteLibraries += @{
-                    siteId          = $site.id
-                    siteDisplayName = $site.displayName
-                    siteWebUrl      = $site.webUrl
+                $result.Libraries.Add(@{
+                    siteId          = $siteInfo.id
+                    siteDisplayName = $siteInfo.displayName
+                    siteWebUrl      = $siteInfo.webUrl
                     listId          = $list.id
                     listDisplayName = $list.displayName
                     shortcutInfo    = @{
-                        siteId           = $site.id.Split(',')[1]
-                        siteUrl          = $site.webUrl
-                        webId            = $site.id.Split(',')[2]
+                        siteId           = $siteInfo.id.Split(',')[1]
+                        siteUrl          = $siteInfo.webUrl
+                        webId            = $siteInfo.id.Split(',')[2]
                         listId           = $list.id
                         listItemUniqueId = "root"
                     }
-                }
-                Write-Log "  Added '$($list.displayName)' from site '$($site.webUrl)' for potential linking" "INFO"
+                })
+                $result.LogMessages.Add(@{ Message = "Added '$($list.displayName)' from site '$($siteInfo.webUrl)' for potential linking"; Level = "INFO" })
             }
-            $filteredSiteCount++
+            $result.Succeeded = $true
         } catch {
-            Write-Log "  Failed to process site '$($site.webUrl)': $($_.Exception.Message)" "WARN"
+            $result.LogMessages.Add(@{ Message = "Failed to process site '$($siteInfo.webUrl)': $($_.Exception.Message)"; Level = "WARN" })
         }
+
+        return $result
     }
+
+    # Submit all sites as parallel jobs
+    $jobs = [System.Collections.Generic.List[hashtable]]::new()
+    foreach($site in $filteredSites) {
+        $ps = [powershell]::Create()
+        $ps.RunspacePool = $pool
+        [void]$ps.AddScript($processSiteBlock)
+        [void]$ps.AddParameter('siteInfo', @{ id = $site.id; displayName = $site.displayName; webUrl = $site.webUrl })
+        [void]$ps.AddParameter('graphUrl', $graphUrlValue)
+        [void]$ps.AddParameter('idpUrl', $idpUrlValue)
+        [void]$ps.AddParameter('sharepointUrl', $sharepointUrlValue)
+        [void]$ps.AddParameter('maxFC', $maxFileCount)
+        [void]$ps.AddParameter('minFC', $minFileCount)
+        $jobs.Add(@{
+            PowerShell = $ps
+            Handle     = $ps.BeginInvoke()
+            SiteUrl    = $site.webUrl
+        })
+    }
+
+    # Collect results as jobs complete
+    $completedCount = 0
+    $totalJobs = $jobs.Count
+    while($jobs.Count -gt 0) {
+        for($i = $jobs.Count - 1; $i -ge 0; $i--) {
+            if($jobs[$i].Handle.IsCompleted) {
+                $completedCount++
+                Write-Progress -Id 0 -Activity "Phase 1/2: Enumerating sites" -Status "Completed $completedCount / $totalJobs" -PercentComplete ([math]::Min(100, [math]::Round(($completedCount / $totalJobs) * 100)))
+                try {
+                    $jobResult = $jobs[$i].PowerShell.EndInvoke($jobs[$i].Handle)
+                    if($jobResult) {
+                        foreach($r in $jobResult) {
+                            # Output collected log messages
+                            if($r.LogMessages) {
+                                foreach($log in $r.LogMessages) {
+                                    Write-Log "  $($log.Message)" $log.Level
+                                }
+                            }
+                            if($r.Libraries -and $r.Libraries.Count -gt 0) {
+                                $allSiteLibraries += $r.Libraries
+                            }
+                            if($r.Succeeded) {
+                                $filteredSiteCount++
+                            }
+                        }
+                    }
+                    # Check for errors in the PowerShell error stream
+                    if($jobs[$i].PowerShell.Streams.Error.Count -gt 0) {
+                        foreach($err in $jobs[$i].PowerShell.Streams.Error) {
+                            Write-Log "  Runspace error for '$($jobs[$i].SiteUrl)': $($err.Exception.Message)" "WARN"
+                        }
+                    }
+                } catch {
+                    Write-Log "  Error collecting result for '$($jobs[$i].SiteUrl)': $($_.Exception.Message)" "WARN"
+                }
+                $jobs[$i].PowerShell.Dispose()
+                $jobs.RemoveAt($i)
+            }
+        }
+        if($jobs.Count -gt 0) { Start-Sleep -Milliseconds 100 }
+    }
+
+    # Clean up runspace pool
+    $pool.Close()
+    $pool.Dispose()
 
     Write-Progress -Id 0 -Activity "Phase 1/2: Enumerating sites" -Completed
     Write-Log "Pre-cached $($allSiteLibraries.Count) document libraries across $filteredSiteCount sites" "SUCCESS"
@@ -798,49 +917,138 @@ try {
             $skipCount = 0
             $errorCount = 0
 
-            # Check user's effective permissions on each pre-cached document library
-            Write-Log "  Checking permissions on $($allSiteLibraries.Count) document libraries..." "INFO"
-            $libIndex = 0
-            $libTotal = $allSiteLibraries.Count
-            foreach($lib in $allSiteLibraries) {
-                $libIndex++
-                Write-Progress -Id 1 -ParentId 0 -Activity "Checking permissions" -Status "Library $libIndex / $libTotal" -PercentComplete ([math]::Min(100, [math]::Round(($libIndex / $libTotal) * 100)))
-                try {
-                    $effectivePermissions = New-GraphQuery -Uri "$($lib.siteWebUrl)/_api/web/lists/GetById('$($lib.listId)')/getUserEffectivePermissions(@u)?@u='i%3A0%23.f%7Cmembership%7C$($targetUser.userPrincipalName)'" -Method GET -MaxAttempts 1
+            # Check user's effective permissions on each pre-cached document library in parallel
+            Write-Log "  Checking permissions on $($allSiteLibraries.Count) document libraries in parallel (max $ParallelThrottleLimit concurrent)..." "INFO"
 
-                    # SharePoint BasePermissions bit flags (Low word):
-                    #   ViewListItems  = 0x1 (bit 0) - read/view access
-                    #   EditListItems  = 0x4 (bit 2) - edit/contribute access
+            # Build InitialSessionState for permission-check runspaces
+            $permIss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+            $permIss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('Get-AccessToken', (Get-Command Get-AccessToken).Definition))
+            $permIss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('New-GraphQuery', (Get-Command New-GraphQuery).Definition))
+            $permIss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('Write-Log', (Get-Command Write-Log).Definition))
+            $permIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('ClientId', $ClientId, ''))
+            $permIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('TenantId', $TenantId, ''))
+            $permIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('CertificateThumbprint', $CertificateThumbprint, ''))
+            $permIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('CertificatePath', $CertificatePath, ''))
+            $permIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('CertificatePassword', $CertificatePassword, ''))
+
+            $permPool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $ParallelThrottleLimit, $permIss, $Host)
+            $permPool.Open()
+
+            $permCheckBlock = {
+                param([hashtable]$libInfo, [string]$graphUrl, [string]$idpUrl, [string]$sharepointUrl, [string]$userUPN, [string]$minPermLevel)
+
+                $global:octo = @{
+                    graphUrl       = $graphUrl
+                    idpUrl         = $idpUrl
+                    sharepointUrl  = $sharepointUrl
+                    LCCachedTokens = @{}
+                }
+                [void][System.Reflection.Assembly]::LoadWithPartialName("System.Web")
+
+                $result = [PSCustomObject]@{
+                    HasAccess   = $false
+                    Library     = $null
+                    LogMessages = [System.Collections.Generic.List[hashtable]]::new()
+                }
+
+                try {
+                    $effectivePermissions = New-GraphQuery -Uri "$($libInfo.siteWebUrl)/_api/web/lists/GetById('$($libInfo.listId)')/getUserEffectivePermissions(@u)?@u='i%3A0%23.f%7Cmembership%7C$userUPN'" -Method GET -MaxAttempts 1
+
                     $hasView = ($effectivePermissions.Low -band 0x1) -ne 0
                     $hasEdit = ($effectivePermissions.Low -band 0x4) -ne 0
 
-                    if($MinimumPermissionLevel -eq "Edit") {
+                    if($minPermLevel -eq "Edit") {
                         if(-not $hasEdit) {
                             if($hasView) {
-                                Write-Log "    User has only view access on '$($lib.listDisplayName)' ($($lib.siteWebUrl)), skipping (Edit required)..." "WARN"
+                                $result.LogMessages.Add(@{ Message = "User has only view access on '$($libInfo.listDisplayName)' ($($libInfo.siteWebUrl)), skipping (Edit required)..."; Level = "WARN" })
                             }
-                            continue
+                            return $result
                         }
                     } else {
-                        # "View" mode - view or higher
                         if(-not $hasView) {
-                            continue
+                            return $result
                         }
                     }
 
-                    $desiredShortcuts += @{
-                        shortCut = $lib.shortcutInfo
-                        siteName = $lib.siteDisplayName
-                        listName = $lib.listDisplayName
+                    $result.HasAccess = $true
+                    $result.Library = @{
+                        shortCut = $libInfo.shortcutInfo
+                        siteName = $libInfo.siteDisplayName
+                        listName = $libInfo.listDisplayName
                     }
                 } catch {
-                    # 401/403/404 = user has no access, which is expected for most libraries
                     if($_.Exception.Message -like "*401*" -or $_.Exception.Message -like "*403*" -or $_.Exception.Message -like "*404*" -or $_.Exception.StatusCode -in (401,403,"Unauthorized",404,"NotFound")) {
-                        continue
+                        return $result
                     }
-                    Write-Log "    Failed to check permissions on '$($lib.listDisplayName)' ($($lib.siteWebUrl)): $($_.Exception.Message)" "WARN"
+                    $result.LogMessages.Add(@{ Message = "Failed to check permissions on '$($libInfo.listDisplayName)' ($($libInfo.siteWebUrl)): $($_.Exception.Message)"; Level = "WARN" })
                 }
+
+                return $result
             }
+
+            # Submit all permission checks as parallel jobs
+            $permJobs = [System.Collections.Generic.List[hashtable]]::new()
+            foreach($lib in $allSiteLibraries) {
+                $ps = [powershell]::Create()
+                $ps.RunspacePool = $permPool
+                [void]$ps.AddScript($permCheckBlock)
+                [void]$ps.AddParameter('libInfo', @{
+                    siteWebUrl      = $lib.siteWebUrl
+                    listId          = $lib.listId
+                    listDisplayName = $lib.listDisplayName
+                    siteDisplayName = $lib.siteDisplayName
+                    shortcutInfo    = $lib.shortcutInfo
+                })
+                [void]$ps.AddParameter('graphUrl', $graphUrlValue)
+                [void]$ps.AddParameter('idpUrl', $idpUrlValue)
+                [void]$ps.AddParameter('sharepointUrl', $sharepointUrlValue)
+                [void]$ps.AddParameter('userUPN', $targetUser.userPrincipalName)
+                [void]$ps.AddParameter('minPermLevel', $MinimumPermissionLevel)
+                $permJobs.Add(@{
+                    PowerShell = $ps
+                    Handle     = $ps.BeginInvoke()
+                })
+            }
+
+            # Collect permission check results
+            $permCompletedCount = 0
+            $permTotalJobs = $permJobs.Count
+            while($permJobs.Count -gt 0) {
+                for($pi = $permJobs.Count - 1; $pi -ge 0; $pi--) {
+                    if($permJobs[$pi].Handle.IsCompleted) {
+                        $permCompletedCount++
+                        Write-Progress -Id 1 -ParentId 0 -Activity "Checking permissions" -Status "Completed $permCompletedCount / $permTotalJobs" -PercentComplete ([math]::Min(100, [math]::Round(($permCompletedCount / $permTotalJobs) * 100)))
+                        try {
+                            $permResult = $permJobs[$pi].PowerShell.EndInvoke($permJobs[$pi].Handle)
+                            if($permResult) {
+                                foreach($pr in $permResult) {
+                                    if($pr.LogMessages) {
+                                        foreach($log in $pr.LogMessages) {
+                                            Write-Log "    $($log.Message)" $log.Level
+                                        }
+                                    }
+                                    if($pr.HasAccess -and $pr.Library) {
+                                        $desiredShortcuts += $pr.Library
+                                    }
+                                }
+                            }
+                            if($permJobs[$pi].PowerShell.Streams.Error.Count -gt 0) {
+                                foreach($err in $permJobs[$pi].PowerShell.Streams.Error) {
+                                    Write-Log "    Runspace permission check error: $($err.Exception.Message)" "WARN"
+                                }
+                            }
+                        } catch {
+                            Write-Log "    Error collecting permission result: $($_.Exception.Message)" "WARN"
+                        }
+                        $permJobs[$pi].PowerShell.Dispose()
+                        $permJobs.RemoveAt($pi)
+                    }
+                }
+                if($permJobs.Count -gt 0) { Start-Sleep -Milliseconds 100 }
+            }
+
+            $permPool.Close()
+            $permPool.Dispose()
 
             Write-Progress -Id 1 -ParentId 0 -Activity "Checking permissions" -Completed
             Write-Log "  User has access to $($desiredShortcuts.Count) document libraries" "SUCCESS"
