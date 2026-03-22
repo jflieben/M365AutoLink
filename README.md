@@ -125,9 +125,10 @@ Edit the `##########START CONFIGURATION##########` block at the top of the scrip
 When running on Azure (VM, Automation Account, Functions, App Service), the script automatically acquires tokens via Managed Identity. No additional configuration needed — just grant the required permissions to the MI's service principal.
 
 Authentication methods are tried in this order:
-1. Azure Functions / App Service identity endpoint (`$env:IDENTITY_ENDPOINT`)
-2. Azure VM Instance Metadata Service (IMDS)
-3. Az PowerShell module (`Connect-AzAccount -Identity`)
+1. Cert based (only if clientId etc configured)
+2. Azure Functions / App Service identity endpoint (`$env:IDENTITY_ENDPOINT`)
+3. Azure VM Instance Metadata Service (IMDS)
+4. Az PowerShell module (`Connect-AzAccount -Identity`)
 
 #### Option 2: App Registration with Certificate
 For non-Azure environments (e.g. on-premises server, local workstation), configure an Entra ID App Registration with a certificate:
@@ -198,6 +199,7 @@ Export-PfxCertificate -Cert $cert -FilePath "C:\certs\M365AutoLink.pfx" -Passwor
    - `Sites.Read.All`
    - `Files.ReadWrite.All`
    - `User.Read.All`
+   - `GroupMember.Read.All` (can be skipped if not using TargetMode = Group)
 3. Add **SharePoint** (Application permissions):
    - `Sites.FullControl.All`
 4. Click **Grant admin consent for \<your tenant\>**.
