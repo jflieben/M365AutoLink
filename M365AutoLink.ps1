@@ -52,8 +52,8 @@
 
 .NOTES
     Author: Jose Lieben
-    Version: 1.0
-    Date: 2026-01-29
+    Version: 1.1
+    Date: 2026-03-22
     Copyright/License: https://www.lieben.nu/liebensraum/commercial-use/ (Commercial (re)use not allowed without prior written consent by the author, otherwise free to use/modify as long as header are kept intact)
     Microsoft doc: https://support.microsoft.com/en-us/office/add-shortcuts-to-shared-folders-in-onedrive-d66b1347-99b7-4470-9360-ffc048d35a33
     Always test carefully, use at your own risk, author takes no responsibility for this script
@@ -68,6 +68,9 @@ $FolderName = "AutoLink" #this is the folder created in onedrive to house all li
 $CloudType = "global" #global, usgov, usdod, china
 $ClientID = "ae7727e4-0471-4690-b155-76cbf5fdcb30" #Lieben Consultancy public client ID, you can also create your own (see APP REGISTRATION REQUIREMENTS above)
 $WindowStyle = "Normal" #Normal, Hidden, Minimized, Maximized - this controls the browser window style during authentication, Hidden will not show the browser but the user then won't be able to sign in if SSO is not working
+
+# Dry-run mode: when $true, no shortcuts are created, deleted, or renamed. The script only shows what it would do.
+$DryRun = $false
 
 #excluded sites will not be added a link if below pattern occurs in the site's URL. Use a * to match 1 or more characters
 #the default list is recommended
@@ -513,8 +516,6 @@ function New-GraphQuery {
                     $nextURL = $Data.'@odata.nextLink'  
                 }elseif($Data.'odata.nextLink'){
                     $nextURL = $Data.'odata.nextLink'                      
-                }elseif($Data.'odata.nextLink'){
-                    $nextURL = $Data.'odata.nextLink'
                 }elseif($Data.nextLink){
                     $nextURL = $Data.nextLink
                 }else{
@@ -553,7 +554,8 @@ try {
 
     Start-Transcript -Path $global:octo.LogPath -Force
 
-    Write-Log "=== M365AutoLink Started ===" "INFO"
+    Write-Log "=== M365AutoLink v1.1 Started ===" "INFO"
+    if($DryRun) { Write-Log "*** DRY RUN MODE — no changes will be made ***" "WARN" }
 
     [void] [System.Reflection.Assembly]::LoadWithPartialName("System.Web")
 
@@ -571,7 +573,7 @@ try {
     
     Write-Log "Found $($sites.Count) sites" "SUCCESS"
 
-    Write-Log "Will apply the following exclusiong patterns later:" "INFO"
+    Write-Log "Will apply the following exclusion patterns:" "INFO"
     foreach($pattern in $excludedSitesByWildcard){
         Write-Log "  - $pattern" "INFO"
     }
@@ -655,7 +657,7 @@ try {
         if($null -ne $site.webUrl){
             $isExcluded = $false
             foreach($pattern in $excludedSitesByWildcard){
-                $wildcardPattern = $pattern -replace "\*",".*"
+                $wildcardPattern = "^" + [regex]::Escape($pattern) -replace "\\\*",".*"
                 if($site.webUrl -match $wildcardPattern){
                     Write-Log "  Site URL '$($site.webUrl)' matches exclusion pattern '$pattern', skipping..." "WARN"
                     $isExcluded = $true
@@ -667,7 +669,7 @@ try {
             }
             $isIncluded = $false
             foreach($pattern in $includedSitesByWildcard){
-                $wildcardPattern = $pattern -replace "\*",".*"
+                $wildcardPattern = "^" + [regex]::Escape($pattern) -replace "\\\*",".*"
                 if($site.webUrl -match $wildcardPattern){
                     $isIncluded = $true
                     break
@@ -738,10 +740,17 @@ try {
         }
 
         if ($exists) {
-            Write-Log "  Shortcut already exists for $($desiredShortcut.shortcut.siteUrl)', skipping..." "WARN"
+            Write-Log "  Shortcut already exists for '$($desiredShortcut.shortcut.siteUrl)', skipping..." "WARN"
             $skipCount++    
             continue
         }
+
+        if($DryRun) {
+            Write-Log "  [DRY RUN] Would create shortcut for '$($desiredShortcut.shortcut.siteUrl)'" "INFO"
+            $successCount++
+            continue
+        }
+
         try {
             # Create the shortcut
             $shortcutBody = @{
@@ -755,18 +764,17 @@ try {
             Write-Log "  Creating shortcut..." "INFO"
             $newShortCut = $Null; $newShortCut = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/me/drive/items/$($targetFolder.id)/children" -Method POST -Body $shortcutBody
             
-            # Rename the shortcut if link name cleanup patterns apply
+            # Rename the shortcut if the created name differs from our desired name (Graph may append suffix)
             $cleanName = Get-CleanedShortcutName -Name $newShortCut.name
-            if($newShortCut.id -and $cleanName -ne $newShortCut.name -and $existingShortCuts.Name -notcontains $cleanName){
+            if($newShortCut.id -and $cleanName -ne $newShortCut.name -and $currentShortCuts.Name -notcontains $cleanName){
                 try {
                     $renameBody = @{ name = $cleanName } | ConvertTo-Json
                     $Null = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/me/drive/items/$($newShortCut.id)" -Method PATCH -Body $renameBody
-                    Write-Log "  Renamed shortcut from '$($newShortCut.name)' to '$($cleanName)'" "INFO"
+                    Write-Log "  Renamed shortcut from '$($newShortCut.name)' to '$cleanName'" "INFO"
                 } catch {
                     Write-Log "  Failed to rename shortcut '$($newShortCut.name)': $($_.Exception.Message)" "WARN"
                 }
             }            
-            # Small delay to avoid throttling
             Start-Sleep -Milliseconds 500
             Write-Log "  Successfully created shortcut for '$($desiredShortcut.shortcut.siteUrl)'" "SUCCESS"
             $successCount++
@@ -783,12 +791,16 @@ try {
         foreach($existing in $currentShortCuts) {
             if(-not $existing.Name) { continue }
             $cleanedName = Get-CleanedShortcutName -Name $existing.Name
-            if($cleanedName -ne $existing.Name -and $existingShortCuts.Name -notcontains $cleanName) {
+            if($cleanedName -ne $existing.Name -and $currentShortCuts.Name -notcontains $cleanedName) {
+                if($DryRun) {
+                    Write-Log "  [DRY RUN] Would rename '$($existing.Name)' to '$cleanedName'" "INFO"
+                    $renameCount++
+                    continue
+                }
                 try {
                     $renameBody = @{ name = $cleanedName } | ConvertTo-Json
                     $Null = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/me/drive/items/$($existing.ID)" -Method PATCH -Body $renameBody
                     Write-Log "  Renamed '$($existing.Name)' to '$cleanedName'" "SUCCESS"
-                    # Small delay to avoid throttling
                     Start-Sleep -Milliseconds 500                    
                     $renameCount++
                 } catch {
@@ -810,30 +822,35 @@ try {
         }
 
         if (-not $shouldExist) {
+            if($DryRun) {
+                Write-Log "  [DRY RUN] Would delete obsolete shortcut '$($existing.Name)'" "INFO"
+                $deletedCount++
+                continue
+            }
             try {
-                Write-Log "  Deleting obsolete shortcut with ID '$($existing.ID)'..." "INFO"
+                Write-Log "  Deleting obsolete shortcut '$($existing.Name)' (ID: $($existing.ID))..." "INFO"
                 New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/me/drive/items/$($existing.ID)" -Method DELETE
-                # Small delay to avoid throttling
                 Start-Sleep -Milliseconds 500
                 $deletedCount++
                 Write-Log "  Successfully deleted obsolete shortcut" "SUCCESS"
             } catch {
-                Write-Log "  Failed to delete obsolete shortcut with ID '$($existing.ID)': $($_.Exception.Message)" "ERROR"
+                Write-Log "  Failed to delete obsolete shortcut '$($existing.Name)': $($_.Exception.Message)" "ERROR"
                 $errorCount++
             }
         }
     }
     
     # Summary
-    Write-Log "=== Summary ===" "INFO"
+    $modeLabel = if($DryRun) { " (DRY RUN)" } else { "" }
+    Write-Log "=== Summary$modeLabel ===" "INFO"
     Write-Log "Shortcuts Created: $successCount" "SUCCESS"
     Write-Log "Shortcuts Renamed: $renameCount" "SUCCESS"
-    Write-Log "Shortcuts Skipped: $skipCount" "SUCCESS"
-    Write-Log "Shortcuts deleted: $deletedCount" "SUCCESS"
+    Write-Log "Shortcuts Skipped: $skipCount" "INFO"
+    Write-Log "Shortcuts Deleted: $deletedCount" "SUCCESS"
     if($errorCount -gt 0){
-        Write-Log "Errors: $errorCount" "SUCCESS"
-    }else{
         Write-Log "Errors: $errorCount" "ERROR"
+    }else{
+        Write-Log "Errors: $errorCount" "SUCCESS"
     }
     
     Write-Log "=== Script Completed ===" "SUCCESS"
