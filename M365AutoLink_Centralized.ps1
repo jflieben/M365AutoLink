@@ -29,6 +29,7 @@
     - Sites.Read.All          - Read SharePoint site information
     - Files.ReadWrite.All     - Create shortcuts in users' OneDrive
     - User.Read.All           - Read user profiles for target user enumeration
+    - GroupMember.Read.All    - Read members of group (only needed if using TargetMode = Group)
 
     SharePoint (AppId: 00000003-0000-0ff1-ce00-000000000000):
     - Sites.FullControl.All   - Access SharePoint REST APIs for site metadata
@@ -66,8 +67,8 @@
 
 .NOTES
     Author: Jose Lieben
-    Version: 2.0
-    Date: 2026-02-27
+    Version: 2.1
+    Date: 2026-03-22
     Copyright/License: https://www.lieben.nu/liebensraum/commercial-use/ (Commercial (re)use not allowed without prior written consent by the author, otherwise free to use/modify as long as header are kept intact)
     Microsoft doc: https://support.microsoft.com/en-us/office/add-shortcuts-to-shared-folders-in-onedrive-d66b1347-99b7-4470-9360-ffc048d35a33
     Always test carefully, use at your own risk, author takes no responsibility for this script
@@ -98,7 +99,7 @@ $TargetMode = "UserList"
 $TargetGroupId = ""
 
 # When TargetMode = "UserList", specify an array of UPNs
-$TargetUsers = @(""
+$TargetUsers = @(
     # "user1@contoso.com"
     # "user2@contoso.com"
 )
@@ -142,6 +143,9 @@ $MinimumPermissionLevel = "Edit"
 # Number of sites to process concurrently when enumerating document libraries
 # Higher values speed up enumeration but increase API load and memory usage
 $ParallelThrottleLimit = 3
+
+# Dry-run mode: when $true, no shortcuts are created, deleted, or renamed. The script only shows what it would do.
+$DryRun = $false
 
 ##########END CONFIGURATION#############################
 
@@ -523,8 +527,6 @@ function New-GraphQuery {
                     $nextURL = $Data.'@odata.nextLink'  
                 }elseif($Data.'odata.nextLink'){
                     $nextURL = $Data.'odata.nextLink'                      
-                }elseif($Data.'odata.nextLink'){
-                    $nextURL = $Data.'odata.nextLink'
                 }elseif($Data.nextLink){
                     $nextURL = $Data.nextLink
                 }else{
@@ -563,7 +565,8 @@ try {
 
     Start-Transcript -Path $global:octo.LogPath -Force
 
-    Write-Log "=== M365AutoLink Centralized (Managed Identity) Started ===" "INFO"
+    Write-Log "=== M365AutoLink Centralized v2.1 Started ===" "INFO"
+    if($DryRun) { Write-Log "*** DRY RUN MODE — no changes will be made ***" "WARN" }
 
     [void] [System.Reflection.Assembly]::LoadWithPartialName("System.Web")
 
@@ -591,8 +594,8 @@ try {
     switch($TargetMode) {
         "Group" {
             if(-not $TargetGroupId) { throw "TargetGroupId must be specified when TargetMode is 'Group'" }
-            Write-Log "Getting members of group '$TargetGroupId'..." "INFO"
-            $members = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/groups/$TargetGroupId/members?`$select=id,userPrincipalName,displayName" -Method GET
+            Write-Log "Getting members of group '$TargetGroupId' (including transitive members)..." "INFO"
+            $members = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/groups/$TargetGroupId/transitiveMembers?`$select=id,userPrincipalName,displayName" -Method GET
             $targetUserList = @($members | Where-Object { $_.'@odata.type' -eq '#microsoft.graph.user' })
         }
         "UserList" {
@@ -625,7 +628,7 @@ try {
     Write-Log "Found $($allTenantSites.Count) sites in tenant" "SUCCESS"
 
     Write-Log "Filtering sites and enumerating document libraries..." "INFO"
-    $allSiteLibraries = @()
+    $allSiteLibraries = [System.Collections.Generic.List[hashtable]]::new()
     $filteredSiteCount = 0
 
     # Step 1: Pre-filter sites locally using inclusion/exclusion patterns (no API calls, very fast)
@@ -636,7 +639,7 @@ try {
         # Apply exclusion patterns
         $isExcluded = $false
         foreach($pattern in $excludedSitesByWildcard){
-            $wildcardPattern = $pattern -replace "\*",".*"
+            $wildcardPattern = "^" + [regex]::Escape($pattern) -replace "\\\*",".*"
             if($site.webUrl -match $wildcardPattern){
                 $isExcluded = $true
                 break
@@ -647,7 +650,7 @@ try {
         # Apply inclusion patterns
         $isIncluded = $false
         foreach($pattern in $includedSitesByWildcard){
-            $wildcardPattern = $pattern -replace "\*",".*"
+            $wildcardPattern = "^" + [regex]::Escape($pattern) -replace "\\\*",".*"
             if($site.webUrl -match $wildcardPattern){
                 $isIncluded = $true
                 break
@@ -790,7 +793,7 @@ try {
                                 }
                             }
                             if($r.Libraries -and $r.Libraries.Count -gt 0) {
-                                $allSiteLibraries += $r.Libraries
+                                $allSiteLibraries.AddRange([hashtable[]]$r.Libraries)
                             }
                             if($r.Succeeded) {
                                 $filteredSiteCount++
@@ -821,6 +824,72 @@ try {
     Write-Log "Pre-cached $($allSiteLibraries.Count) document libraries across $filteredSiteCount sites" "SUCCESS"
     Write-Log "Minimum permission level for shortcuts: $MinimumPermissionLevel" "INFO"
 
+    # Pre-create reusable runspace pool for permission checks (shared across all users)
+    Write-Log "Preparing parallel permission-check infrastructure (max $ParallelThrottleLimit concurrent)..." "INFO"
+    $permIss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    $permIss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('Get-AccessToken', (Get-Command Get-AccessToken).Definition))
+    $permIss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('New-GraphQuery', (Get-Command New-GraphQuery).Definition))
+    $permIss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('Write-Log', (Get-Command Write-Log).Definition))
+    $permIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('ClientId', $ClientId, ''))
+    $permIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('TenantId', $TenantId, ''))
+    $permIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('CertificateThumbprint', $CertificateThumbprint, ''))
+    $permIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('CertificatePath', $CertificatePath, ''))
+    $permIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('CertificatePassword', $CertificatePassword, ''))
+    $permPool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $ParallelThrottleLimit, $permIss, $Host)
+    $permPool.Open()
+
+    $permCheckBlock = {
+        param([hashtable]$libInfo, [string]$graphUrl, [string]$idpUrl, [string]$sharepointUrl, [string]$userUPN, [string]$minPermLevel)
+
+        $global:octo = @{
+            graphUrl       = $graphUrl
+            idpUrl         = $idpUrl
+            sharepointUrl  = $sharepointUrl
+            LCCachedTokens = @{}
+        }
+        [void][System.Reflection.Assembly]::LoadWithPartialName("System.Web")
+
+        $result = [PSCustomObject]@{
+            HasAccess   = $false
+            Library     = $null
+            LogMessages = [System.Collections.Generic.List[hashtable]]::new()
+        }
+
+        try {
+            $effectivePermissions = New-GraphQuery -Uri "$($libInfo.siteWebUrl)/_api/web/lists/GetById('$($libInfo.listId)')/getUserEffectivePermissions(@u)?@u='i%3A0%23.f%7Cmembership%7C$userUPN'" -Method GET -MaxAttempts 1
+
+            $hasView = ($effectivePermissions.Low -band 0x1) -ne 0
+            $hasEdit = ($effectivePermissions.Low -band 0x4) -ne 0
+
+            if($minPermLevel -eq "Edit") {
+                if(-not $hasEdit) {
+                    if($hasView) {
+                        $result.LogMessages.Add(@{ Message = "User has only view access on '$($libInfo.listDisplayName)' ($($libInfo.siteWebUrl)), skipping (Edit required)..."; Level = "WARN" })
+                    }
+                    return $result
+                }
+            } else {
+                if(-not $hasView) {
+                    return $result
+                }
+            }
+
+            $result.HasAccess = $true
+            $result.Library = @{
+                shortCut = $libInfo.shortcutInfo
+                siteName = $libInfo.siteDisplayName
+                listName = $libInfo.listDisplayName
+            }
+        } catch {
+            if($_.Exception.Message -like "*401*" -or $_.Exception.Message -like "*403*" -or $_.Exception.Message -like "*404*" -or $_.Exception.StatusCode -in (401,403,"Unauthorized",404,"NotFound")) {
+                return $result
+            }
+            $result.LogMessages.Add(@{ Message = "Failed to check permissions on '$($libInfo.listDisplayName)' ($($libInfo.siteWebUrl)): $($_.Exception.Message)"; Level = "WARN" })
+        }
+
+        return $result
+    }
+
     # Global counters
     $totalStats = @{
         UsersProcessed   = 0
@@ -842,7 +911,7 @@ try {
 
         Write-Progress -Id 0 -Activity "Phase 2/2: Processing users" -Status "User $userIndex / $userTotal — $userUPN" -PercentComplete ([math]::Min(100, [math]::Round(($userIndex / $userTotal) * 100)))
         Write-Log "========================================" "INFO"
-        Write-Log "Processing user: $userUPN" "INFO"
+        Write-Log "Processing user: $userUPN ($userIndex/$userTotal)" "INFO"
         Write-Log "========================================" "INFO"
 
         try {
@@ -863,6 +932,11 @@ try {
                 $targetFolder = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/users/$userId/drive/root:/$($FolderName)?`$expand=listItem" -Method "GET"
                 Write-Log "  Folder '$FolderName' already exists" "INFO"
             } catch {
+                if($DryRun) {
+                    Write-Log "  [DRY RUN] Would create folder '$FolderName' — skipping user (folder needed for processing)" "WARN"
+                    $totalStats.UsersSkipped++
+                    continue
+                }
                 Write-Log "  Creating folder '$FolderName'..." "INFO"
             
                 $folderBody = @{
@@ -876,7 +950,7 @@ try {
                 $targetFolder = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/users/$userId/drive/root:/$($FolderName)?`$expand=listItem" -Method "GET"
             }
 
-            #determine root onedrive url by list item:
+            # Determine root OneDrive URL by list item
             $urlParts = $targetFolder.listItem.webUrl -split "/personal/"
             $rootUrl = $urlParts[0]
             $userComponent = $urlParts[1].Split('/')[0]
@@ -886,15 +960,17 @@ try {
 
             $currentShortCuts = @()
 
-            #retrieve current shortcuts
-            Write-Log "Getting target info for all current shortcuts...." "INFO" 
+            # Retrieve current shortcuts
+            Write-Log "  Getting target info for all current shortcuts..." "INFO" 
             $folderContents = New-GraphQuery -Uri "$rootUrl/personal/$userComponent/_api/web/GetFolderByServerRelativeUrl('/personal/$userComponent/$libraryName/$FolderName')/Files?`$top=5000&`$format=json&`$expand=listItem" -Method GET
             
-            #sometimes, e.g. when a library is changed to sync-blocked, onedrive changes it to a folder. These should be wiped as they would only confuse the user
-            New-GraphQuery -Uri "$rootUrl/personal/$userComponent/_api/web/GetFolderByServerRelativeUrl('/personal/$userComponent/$libraryName/$FolderName')/Folders?`$top=5000&`$format=json&`$expand=listItem" -Method GET | ForEach-Object {
-                if($_.UniqueId){
-                    New-GraphQuery -Uri "$rootUrl/personal/$userComponent/_api/web/GetFolderById('$($_.UniqueId)')/DeleteObject()" -Method POST
-                    Write-Log "Found and deleted an unexpected folder where only links should exist. Name: $($_.Name)" "ERROR" 
+            # Clean up unexpected folders (e.g. from sync-blocked libraries)
+            if(-not $DryRun) {
+                New-GraphQuery -Uri "$rootUrl/personal/$userComponent/_api/web/GetFolderByServerRelativeUrl('/personal/$userComponent/$libraryName/$FolderName')/Folders?`$top=5000&`$format=json&`$expand=listItem" -Method GET | ForEach-Object {
+                    if($_.UniqueId){
+                        New-GraphQuery -Uri "$rootUrl/personal/$userComponent/_api/web/GetFolderById('$($_.UniqueId)')/DeleteObject()" -Method POST
+                        Write-Log "  Deleted unexpected folder '$($_.Name)' (only shortcuts should exist here)" "WARN" 
+                    }
                 }
             }
             
@@ -910,81 +986,15 @@ try {
                 }
             }
 
-            Write-Log " Currently has $($currentShortCuts.count) shortcuts" "INFO" 
+            Write-Log "  Currently has $($currentShortCuts.count) shortcuts" "INFO" 
 
             $desiredShortcuts = @()
             $successCount = 0
             $skipCount = 0
             $errorCount = 0
 
-            # Check user's effective permissions on each pre-cached document library in parallel
-            Write-Log "  Checking permissions on $($allSiteLibraries.Count) document libraries in parallel (max $ParallelThrottleLimit concurrent)..." "INFO"
-
-            # Build InitialSessionState for permission-check runspaces
-            $permIss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
-            $permIss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('Get-AccessToken', (Get-Command Get-AccessToken).Definition))
-            $permIss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('New-GraphQuery', (Get-Command New-GraphQuery).Definition))
-            $permIss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('Write-Log', (Get-Command Write-Log).Definition))
-            $permIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('ClientId', $ClientId, ''))
-            $permIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('TenantId', $TenantId, ''))
-            $permIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('CertificateThumbprint', $CertificateThumbprint, ''))
-            $permIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('CertificatePath', $CertificatePath, ''))
-            $permIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('CertificatePassword', $CertificatePassword, ''))
-
-            $permPool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $ParallelThrottleLimit, $permIss, $Host)
-            $permPool.Open()
-
-            $permCheckBlock = {
-                param([hashtable]$libInfo, [string]$graphUrl, [string]$idpUrl, [string]$sharepointUrl, [string]$userUPN, [string]$minPermLevel)
-
-                $global:octo = @{
-                    graphUrl       = $graphUrl
-                    idpUrl         = $idpUrl
-                    sharepointUrl  = $sharepointUrl
-                    LCCachedTokens = @{}
-                }
-                [void][System.Reflection.Assembly]::LoadWithPartialName("System.Web")
-
-                $result = [PSCustomObject]@{
-                    HasAccess   = $false
-                    Library     = $null
-                    LogMessages = [System.Collections.Generic.List[hashtable]]::new()
-                }
-
-                try {
-                    $effectivePermissions = New-GraphQuery -Uri "$($libInfo.siteWebUrl)/_api/web/lists/GetById('$($libInfo.listId)')/getUserEffectivePermissions(@u)?@u='i%3A0%23.f%7Cmembership%7C$userUPN'" -Method GET -MaxAttempts 1
-
-                    $hasView = ($effectivePermissions.Low -band 0x1) -ne 0
-                    $hasEdit = ($effectivePermissions.Low -band 0x4) -ne 0
-
-                    if($minPermLevel -eq "Edit") {
-                        if(-not $hasEdit) {
-                            if($hasView) {
-                                $result.LogMessages.Add(@{ Message = "User has only view access on '$($libInfo.listDisplayName)' ($($libInfo.siteWebUrl)), skipping (Edit required)..."; Level = "WARN" })
-                            }
-                            return $result
-                        }
-                    } else {
-                        if(-not $hasView) {
-                            return $result
-                        }
-                    }
-
-                    $result.HasAccess = $true
-                    $result.Library = @{
-                        shortCut = $libInfo.shortcutInfo
-                        siteName = $libInfo.siteDisplayName
-                        listName = $libInfo.listDisplayName
-                    }
-                } catch {
-                    if($_.Exception.Message -like "*401*" -or $_.Exception.Message -like "*403*" -or $_.Exception.Message -like "*404*" -or $_.Exception.StatusCode -in (401,403,"Unauthorized",404,"NotFound")) {
-                        return $result
-                    }
-                    $result.LogMessages.Add(@{ Message = "Failed to check permissions on '$($libInfo.listDisplayName)' ($($libInfo.siteWebUrl)): $($_.Exception.Message)"; Level = "WARN" })
-                }
-
-                return $result
-            }
+            # Check user's effective permissions on each pre-cached document library using the shared pool
+            Write-Log "  Checking permissions on $($allSiteLibraries.Count) libraries (reusing shared pool)..." "INFO"
 
             # Submit all permission checks as parallel jobs
             $permJobs = [System.Collections.Generic.List[hashtable]]::new()
@@ -1017,7 +1027,7 @@ try {
                 for($pi = $permJobs.Count - 1; $pi -ge 0; $pi--) {
                     if($permJobs[$pi].Handle.IsCompleted) {
                         $permCompletedCount++
-                        Write-Progress -Id 1 -ParentId 0 -Activity "Checking permissions" -Status "Completed $permCompletedCount / $permTotalJobs" -PercentComplete ([math]::Min(100, [math]::Round(($permCompletedCount / $permTotalJobs) * 100)))
+                        Write-Progress -Id 1 -ParentId 0 -Activity "Checking permissions for $userUPN" -Status "$permCompletedCount / $permTotalJobs" -PercentComplete ([math]::Min(100, [math]::Round(($permCompletedCount / $permTotalJobs) * 100)))
                         try {
                             $permResult = $permJobs[$pi].PowerShell.EndInvoke($permJobs[$pi].Handle)
                             if($permResult) {
@@ -1034,7 +1044,7 @@ try {
                             }
                             if($permJobs[$pi].PowerShell.Streams.Error.Count -gt 0) {
                                 foreach($err in $permJobs[$pi].PowerShell.Streams.Error) {
-                                    Write-Log "    Runspace permission check error: $($err.Exception.Message)" "WARN"
+                                    Write-Log "    Runspace error: $($err.Exception.Message)" "WARN"
                                 }
                             }
                         } catch {
@@ -1047,10 +1057,7 @@ try {
                 if($permJobs.Count -gt 0) { Start-Sleep -Milliseconds 100 }
             }
 
-            $permPool.Close()
-            $permPool.Dispose()
-
-            Write-Progress -Id 1 -ParentId 0 -Activity "Checking permissions" -Completed
+            Write-Progress -Id 1 -ParentId 0 -Activity "Checking permissions for $userUPN" -Completed
             Write-Log "  User has access to $($desiredShortcuts.Count) document libraries" "SUCCESS"
 
             $scIndex = 0
@@ -1072,8 +1079,14 @@ try {
                     $skipCount++    
                     continue
                 }
+
+                if($DryRun) {
+                    Write-Log "    [DRY RUN] Would create shortcut for '$($desiredShortcut.shortcut.siteUrl)'" "INFO"
+                    $successCount++
+                    continue
+                }
+
                 try {
-                    # Create the shortcut
                     $shortcutBody = @{
                         name = $($desiredShortcut.listName)
                         remoteItem = @{
@@ -1082,10 +1095,10 @@ try {
                         "@microsoft.graph.conflictBehavior" = "rename"
                     } | ConvertTo-Json -Depth 3
             
-                    Write-Log "    Creating shortcut for '$($desiredShortcut.listName)' ($($desiredShortcut.shortcut.siteUrl))..." "INFO"
+                    Write-Log "    Creating shortcut  ($($desiredShortcut.shortcut.siteUrl))..." "INFO"
                     $newShortCut = $Null; $newShortCut = New-GraphQuery -MaxAttempts 3 -Uri "$($global:octo.graphUrl)/v1.0/users/$userId/drive/items/$($targetFolder.id)/children" -Method POST -Body $shortcutBody
             
-                    # Rename the shortcut if link name cleanup patterns apply
+                    # Rename if Graph returned a different name (e.g. conflict suffix)
                     $cleanName = Get-CleanedShortcutName -Name $newShortCut.name
                     $i = 1
                     while($currentShortCuts.Name -contains $cleanName){
@@ -1095,15 +1108,14 @@ try {
                     if($newShortCut.id -and $cleanName -ne $newShortCut.name -and $currentShortCuts.Name -notcontains $cleanName){
                         try {
                             $renameBody = @{ name = $cleanName } | ConvertTo-Json
-                            $Null = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/users/$userId/drive/items/$($newShortCut.id)" -Method PATCH -Body $renameBody
-                            Write-Log "    Renamed shortcut from '$($newShortCut.name)' to '$($cleanName)'" "INFO"
+                            $Null = New-GraphQuery -MaxAttempts 3 -Uri "$($global:octo.graphUrl)/v1.0/users/$userId/drive/items/$($newShortCut.id)" -Method PATCH -Body $renameBody
+                            Write-Log "    Renamed '$($newShortCut.name)' → '$cleanName'" "INFO"
                         } catch {
-                            Write-Log "    Failed to rename shortcut '$($newShortCut.name)': $($_.Exception.Message)" "WARN"
+                            Write-Log "    Failed to rename '$($newShortCut.name)': $($_.Exception.Message)" "WARN"
                         }
                     }            
-                    # Small delay to avoid throttling
                     Start-Sleep -Milliseconds 500
-                    Write-Log "    Successfully created shortcut for '$($desiredShortcut.shortcut.siteUrl)'" "SUCCESS"
+                    Write-Log "    Created shortcut for '$($desiredShortcut.shortcut.siteUrl)'" "SUCCESS"
                     $successCount++
                 }catch{
                     Write-Log "    Failed to create shortcut for '$($desiredShortcut.shortcut.siteUrl)': $($_.Exception.Message)" "ERROR"
@@ -1119,10 +1131,15 @@ try {
                     if(-not $existing.Name) { continue }
                     $cleanedName = Get-CleanedShortcutName -Name $existing.Name
                     if($cleanedName -ne $existing.Name -and $currentShortCuts.Name -notcontains $cleanedName) {
+                        if($DryRun) {
+                            Write-Log "    [DRY RUN] Would rename '$($existing.Name)' → '$cleanedName'" "INFO"
+                            $renameCount++
+                            continue
+                        }
                         try {
                             $renameBody = @{ name = $cleanedName } | ConvertTo-Json
-                            $Null = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/users/$userId/drive/items/$($existing.ID)" -Method PATCH -Body $renameBody
-                            Write-Log "    Renamed '$($existing.Name)' to '$cleanedName'" "SUCCESS"
+                            $Null = New-GraphQuery -MaxAttempts 3 -Uri "$($global:octo.graphUrl)/v1.0/users/$userId/drive/items/$($existing.ID)" -Method PATCH -Body $renameBody
+                            Write-Log "    Renamed '$($existing.Name)' → '$cleanedName'" "SUCCESS"
                             Start-Sleep -Milliseconds 500                    
                             $renameCount++
                         } catch {
@@ -1133,6 +1150,7 @@ try {
             }    
 
             Write-Progress -Id 1 -ParentId 0 -Activity "Creating shortcuts" -Completed
+
             # Delete shortcuts user should no longer have access to
             $deletedCount = 0
             $delIndex = 0
@@ -1149,20 +1167,26 @@ try {
                 }
 
                 if (-not $shouldExist) {
+                    if($DryRun) {
+                        Write-Log "    [DRY RUN] Would delete obsolete shortcut '$($existing.Name)'" "INFO"
+                        $deletedCount++
+                        continue
+                    }
                     try {
-                        Write-Log "    Deleting obsolete shortcut '$($existing.Name)' (ID: $($existing.ID))..." "INFO"
-                        New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/users/$userId/drive/items/$($existing.ID)" -Method DELETE
+                        Write-Log "    Deleting obsolete shortcut '$($existing.Name)'..." "INFO"
+                        New-GraphQuery -MaxAttempts 3 -Uri "$($global:octo.graphUrl)/v1.0/users/$userId/drive/items/$($existing.ID)" -Method DELETE
                         Start-Sleep -Milliseconds 500
                         $deletedCount++
-                        Write-Log "    Successfully deleted obsolete shortcut" "SUCCESS"
+                        Write-Log "    Deleted obsolete shortcut" "SUCCESS"
                     } catch {
-                        Write-Log "    Failed to delete obsolete shortcut '$($existing.Name)': $($_.Exception.Message)" "ERROR"
+                        Write-Log "    Failed to delete '$($existing.Name)': $($_.Exception.Message)" "ERROR"
                         $errorCount++
                     }
                 }
             }
 
             if($delTotal -gt 0) { Write-Progress -Id 1 -ParentId 0 -Activity "Cleaning obsolete shortcuts" -Completed }
+
             # Per-user summary
             Write-Log "  --- User Summary for $userUPN ---" "INFO"
             Write-Log "  Created: $successCount | Renamed: $renameCount | Skipped: $skipCount | Deleted: $deletedCount | Errors: $errorCount" "INFO"
@@ -1181,11 +1205,17 @@ try {
         }
     }
 
+    # Clean up shared permission-check runspace pool
+    $permPool.Close()
+    $permPool.Dispose()
+
     Write-Progress -Id 0 -Activity "Phase 2/2: Processing users" -Completed
+
     # Global summary
-    Write-Log "=== Global Summary ===" "INFO"
+    $modeLabel = if($DryRun) { " (DRY RUN)" } else { "" }
+    Write-Log "=== Global Summary$modeLabel ===" "INFO"
     Write-Log "Users Processed: $($totalStats.UsersProcessed)" "SUCCESS"
-    Write-Log "Users Skipped (no OneDrive/sites): $($totalStats.UsersSkipped)" "WARN"
+    Write-Log "Users Skipped (no OneDrive): $($totalStats.UsersSkipped)" "WARN"
     Write-Log "Users Failed: $($totalStats.UsersFailed)" $(if($totalStats.UsersFailed -gt 0){"ERROR"}else{"SUCCESS"})
     Write-Log "Total Shortcuts Created: $($totalStats.ShortcutsCreated)" "SUCCESS"
     Write-Log "Total Shortcuts Renamed: $($totalStats.ShortcutsRenamed)" "SUCCESS"
