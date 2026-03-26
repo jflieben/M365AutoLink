@@ -405,6 +405,7 @@ function New-GraphQuery {
                     }
 
                     $delay = 0
+                    $isTransientNetwork = $_.Exception.Message -like "*No such host is known*" -or $_.Exception.Message -like "*name or service not known*" -or $_.Exception.Message -like "*network is unreachable*" -or $_.Exception.Message -like "*connection was forcibly closed*" -or $_.Exception.Message -like "*An existing connection was forcibly closed*"
                     if ($_.Exception.Response.StatusCode -eq 429){
                         try {
                             $retryAfter = $_.Exception.Response.Headers.GetValues("Retry-After")
@@ -416,9 +417,13 @@ function New-GraphQuery {
                             }
                         }catch {}
                     }
+                    if($delay -le 0 -and $isTransientNetwork){
+                        $delay = [math]::Min(10, 2 * $attempts)
+                    }
                     if($delay -le 0){
                         $delay = [math]::Pow(5, $attempts)
                     }
+                    Write-Log "[WARNING] Transient error on attempt $attempts/$MaxAttempts, retrying in $($delay)s: $($_.Exception.Message)" -ForegroundColor Yellow
                     Start-Sleep -Seconds (1 + $delay)
                 }     
             }
@@ -455,6 +460,7 @@ function New-GraphQuery {
                         }
                        
                         $delay = 0
+                        $isTransientNetwork = $_.Exception.Message -like "*No such host is known*" -or $_.Exception.Message -like "*name or service not known*" -or $_.Exception.Message -like "*connection was forcibly closed*" -or $_.Exception.Message -like "*An existing connection was forcibly closed*"
                         if ($_.Exception.Response.StatusCode -eq 429){
                             try {
                                 $retryAfter = $_.Exception.Response.Headers.GetValues("Retry-After")
@@ -466,9 +472,13 @@ function New-GraphQuery {
                                 }
                             }catch {}
                         }
+                        if($delay -le 0 -and $isTransientNetwork){
+                            $delay = [math]::Min(10, 2 * $attempts)
+                        }
                         if($delay -le 0){
                             $delay = [math]::Pow(5, $attempts)
                         }
+                        Write-Log "[WARNING] Transient error on attempt $attempts/$MaxAttempts, retrying in $($delay)s: $($_.Exception.Message)" -ForegroundColor Yellow
                         Start-Sleep -Seconds (1 + $delay)
                     }
                 }
