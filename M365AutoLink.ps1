@@ -51,7 +51,7 @@
     After first authentication, the refresh token is cached and all subsequent runs are silent until the token expires
 
 .NOTES
-    Author: Jose Lieben
+    Author: Jos Lieben
     Version: 1.1
     Date: 2026-03-22
     Copyright/License: https://www.lieben.nu/liebensraum/commercial-use/ (Commercial (re)use not allowed without prior written consent by the author, otherwise free to use/modify as long as header are kept intact)

@@ -28,6 +28,7 @@
     - Sites.Read.All          - Read SharePoint site information
     - Files.ReadWrite.All     - Create shortcuts in users' OneDrive
     - User.Read.All           - Read user profiles for target user enumeration
+    - GroupMember.Read.All    - Read group memberships if using Group-based targeting
 
     SharePoint (AppId: 00000003-0000-0ff1-ce00-000000000000):
     - Sites.FullControl.All   - Access SharePoint REST APIs for permission checks
@@ -60,7 +61,7 @@
     4. Az PowerShell module (Connect-AzAccount -Identity)
 
 .NOTES
-    Author: Jose Lieben
+    Author: Jos Lieben
     Version: 3.0
     Date: 2026-03-25
     Copyright/License: https://www.lieben.nu/liebensraum/commercial-use/ (Commercial (re)use not allowed without prior written consent by the author, otherwise free to use/modify as long as header are kept intact)
@@ -148,8 +149,10 @@ $BatchSize = 20
 # Set to $true to cache permission results between runs (dramatically speeds up subsequent runs, but only works on persistent hosts)
 $EnableCache = $false
 
-# Cache location (default: alongside script). Set to a custom path if desired.
-$CachePath = Join-Path (Split-Path $MyInvocation.MyCommand.Path -Parent) "M365AutoLink_PermissionCache.json"
+if($EnableCache){
+    # Cache location (default: alongside script). Set to a custom path if desired.
+    $CachePath = Join-Path (Split-Path $MyInvocation.MyCommand.Path -Parent) "M365AutoLink_PermissionCache.json"
+}
 
 # Maximum age of cached permission results in hours. Entries older than this are re-checked.
 $CacheMaxAgeHours = 24
@@ -368,7 +371,7 @@ function New-GraphQuery {
         try{
             $token = Get-AccessToken -resource $tokenResource
         }catch{
-            Write-Log "Failed to acquire token for '$tokenResource': $_" -Level "ERROR"
+            $null = Write-Log "Failed to acquire token for '$tokenResource': $_" -Level "ERROR"
             throw
         }
         $headers = @{
@@ -397,13 +400,16 @@ function New-GraphQuery {
                         $nextUrl = $Null
                         throw $_
                     }
+                    $is429 = $_.Exception.Response.StatusCode -eq 429 -or $_.Exception.Message -like "*429*"
+                    # 429s always retry indefinitely — do not count against MaxAttempts
+                    if ($is429) { $attempts-- }
                     if ($attempts -ge $MaxAttempts) {
                         Throw $_
                     }
 
                     $delay = 0
                     $isTransientNetwork = $_.Exception.Message -like "*No such host is known*" -or $_.Exception.Message -like "*name or service not known*" -or $_.Exception.Message -like "*network is unreachable*" -or $_.Exception.Message -like "*connection was forcibly closed*" -or $_.Exception.Message -like "*An existing connection was forcibly closed*"
-                    if ($_.Exception.Response.StatusCode -eq 429){
+                    if ($is429){
                         try {
                             $retryAfter = $_.Exception.Response.Headers.GetValues("Retry-After")
                             if ($retryAfter -and $retryAfter.Count -gt 0) {
@@ -413,6 +419,7 @@ function New-GraphQuery {
                                 }
                             }
                         }catch {}
+                        if($delay -le 0) { $delay = [math]::Min(120, [math]::Pow(5, [math]::Max(1, $attempts))) }
                     }
                     if($delay -le 0 -and $isTransientNetwork){
                         $delay = [math]::Min(10, 2 * $attempts)
@@ -420,7 +427,7 @@ function New-GraphQuery {
                     if($delay -le 0){
                         $delay = [math]::Pow(5, $attempts)
                     }
-                    Write-Log "[WARNING] Transient error on attempt $attempts/$MaxAttempts, retrying in $($delay)s: $($_.Exception.Message)" -ForegroundColor Yellow
+                    $null = Write-Log "[WARNING] Transient error on attempt $attempts/$MaxAttempts, retrying in $($delay)s: $($_.Exception.Message)" -ForegroundColor Yellow
                     Start-Sleep -Seconds (1 + $delay)
                 }
             }
@@ -450,6 +457,9 @@ function New-GraphQuery {
                             throw $_
                         }
 
+                        $is429 = $_.Exception.Response.StatusCode -eq 429 -or $_.Exception.Message -like "*429*"
+                        # 429s always retry indefinitely — do not count against MaxAttempts
+                        if ($is429) { $attempts-- }
                         if ($attempts -ge $MaxAttempts) {
                             $nextURL = $null
                             Throw $_
@@ -457,7 +467,7 @@ function New-GraphQuery {
 
                         $delay = 0
                         $isTransientNetwork = $_.Exception.Message -like "*No such host is known*" -or $_.Exception.Message -like "*name or service not known*" -or $_.Exception.Message -like "*network is unreachable*" -or $_.Exception.Message -like "*connection was forcibly closed*" -or $_.Exception.Message -like "*An existing connection was forcibly closed*"
-                        if ($_.Exception.Response.StatusCode -eq 429){
+                        if ($is429){
                             try {
                                 $retryAfter = $_.Exception.Response.Headers.GetValues("Retry-After")
                                 if ($retryAfter -and $retryAfter.Count -gt 0) {
@@ -467,6 +477,7 @@ function New-GraphQuery {
                                     }
                                 }
                             }catch {}
+                            if($delay -le 0) { $delay = [math]::Min(120, [math]::Pow(5, [math]::Max(1, $attempts))) }
                         }
                         if($delay -le 0 -and $isTransientNetwork){
                             $delay = [math]::Min(10, 2 * $attempts)
@@ -474,7 +485,7 @@ function New-GraphQuery {
                         if($delay -le 0){
                             $delay = [math]::Pow(5, $attempts)
                         }
-                        Write-Log "[WARNING] Transient error on attempt $attempts/$MaxAttempts, retrying in $($delay)s: $($_.Exception.Message)" -ForegroundColor Yellow
+                        $null = Write-Log "[WARNING] Transient error on attempt $attempts/$MaxAttempts, retrying in $($delay)s: $($_.Exception.Message)" -ForegroundColor Yellow
                         Start-Sleep -Seconds (1 + $delay)
                     }
                 }
@@ -534,16 +545,25 @@ function New-GraphQuery {
     }
 }
 
+# Detect Azure Automation Account environment (Write-Host is not supported there)
+$global:IsAzureAutomation = ($env:AUTOMATION_ASSET_ACCOUNTID -or $env:AZUREPS_HOST_ENVIRONMENT -like 'AzureAutomation*')
+
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $color = switch($Level) {
-        "ERROR" { "Red" }
-        "WARN"  { "Yellow" }
-        "SUCCESS" { "Green" }
-        default { "White" }
+    $line = "[$timestamp] [$Level] $Message"
+    if($global:IsAzureAutomation) {
+        # Write-Host is not supported in Azure Automation.
+        Write-Output $line
+    } else {
+        $color = switch($Level) {
+            "ERROR" { "Red" }
+            "WARN"  { "Yellow" }
+            "SUCCESS" { "Green" }
+            default { "White" }
+        }
+        Write-Host $line -ForegroundColor $color
     }
-    Write-Host "[$timestamp] [$Level] $Message" -ForegroundColor $color
 }
 
 
@@ -571,7 +591,7 @@ function Load-PermissionCache {
         }
         return $cache
     } catch {
-        Write-Log "  Warning: Could not load permission cache from '$Path': $($_.Exception.Message)" "WARN"
+        $null = Write-Log "  Warning: Could not load permission cache from '$Path': $($_.Exception.Message)" "WARN"
         return @{}
     }
 }
@@ -588,7 +608,7 @@ function Save-PermissionCache {
         }
         $exportObj | ConvertTo-Json -Depth 3 -Compress | Set-Content -Path $Path -Force -ErrorAction Stop
     } catch {
-        Write-Log "  Warning: Could not save permission cache to '$Path': $($_.Exception.Message)" "WARN"
+        $null = Write-Log "  Warning: Could not save permission cache to '$Path': $($_.Exception.Message)" "WARN"
     }
 }
 
@@ -734,10 +754,24 @@ function Invoke-SharePointBatch {
 
             return $results
         } catch {
+            $is429 = $_.Exception.Response.StatusCode -eq 429 -or $_.Exception.Message -like "*429*"
+            # 429s always retry indefinitely — do not count against MaxAttempts
+            if ($is429) { $attempts-- }
             $isTransientNetwork = $_.Exception.Message -like "*No such host is known*" -or $_.Exception.Message -like "*name or service not known*" -or $_.Exception.Message -like "*connection was forcibly closed*"
             if($attempts -ge $MaxAttempts) { throw $_ }
-            $delay = if($isTransientNetwork) { [math]::Min(10, 2 * $attempts) } else { [math]::Pow(5, $attempts) }
-            Write-Log "[WARNING] Batch request to '$SiteUrl' failed on attempt $attempts/$MaxAttempts, retrying in $($delay)s: $($_.Exception.Message)" "WARN"
+            $delay = 0
+            if($is429) {
+                try {
+                    $retryAfter = $_.Exception.Response.Headers.GetValues("Retry-After")
+                    if ($retryAfter -and $retryAfter.Count -gt 0 -and $retryAfter[0] -match '^\d+$') { $delay = [int]$retryAfter[0] }
+                } catch {}
+                if($delay -le 0) { $delay = [math]::Min(120, [math]::Pow(5, [math]::Max(1, $attempts))) }
+            } elseif($isTransientNetwork) {
+                $delay = [math]::Min(10, 2 * $attempts)
+            } else {
+                $delay = [math]::Pow(5, $attempts)
+            }
+            $null = Write-Log "[WARNING] Batch request to '$SiteUrl' failed on attempt $attempts/$MaxAttempts, retrying in $($delay)s: $($_.Exception.Message)" "WARN"
             Start-Sleep -Seconds (1 + $delay)
         }
     }
@@ -751,7 +785,11 @@ try {
     $logDir = [System.IO.Path]::GetDirectoryName($global:octo.LogPath)
     if(!(Test-Path $logDir)){ New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 
-    Start-Transcript -Path $global:octo.LogPath -Force
+    if($global:IsAzureAutomation) {
+        Write-Output "NOTE: Azure Automation detected. Write-Host is not supported in this environment, using Write-Output for all log messages. All logs appear in the Output tab."
+    }else{
+        Start-Transcript -Path $global:octo.LogPath -Force
+    }
 
     Write-Log "=== M365AutoLink Centralized v3.0 (Optimized) Started ===" "INFO"
     Write-Log "Optimizations: SP Batch ($BatchSize/batch) | Adaptive Throttle ($InitialParallelLimit-$MaxParallelLimit) | Cache ($($EnableCache ? 'ON' : 'OFF'), ${CacheMaxAgeHours}h)" "INFO"
@@ -958,6 +996,9 @@ try {
     $currentLimit = $InitialParallelLimit
     $throttleHitCount = 0
     $completedSinceAdjust = 0
+    $phase1Total429s = 0
+    $phase1TotalApiCalls = 0
+    $lastMetricsLog = 0
 
     # Result collections — declared before submission loop for interleaved processing
     $allSiteLibraries = [System.Collections.Generic.List[hashtable]]::new()
@@ -973,8 +1014,8 @@ try {
                 if($jobs[$i].Handle.IsCompleted) {
                     $completedCount++
                     $completedSinceAdjust++
-                    [void]$activeSemaphore.Release()
-                    Write-Progress -Id 0 -Activity "Phase 1: Enumerating sites" -Status "$completedCount / $totalJobs" -PercentComplete ([math]::Min(100, [math]::Round(($completedCount / $totalJobs) * 100)))
+                    if($activeSemaphore.CurrentCount -lt $MaxParallelLimit) { [void]$activeSemaphore.Release() }
+                    Write-Progress -Id 0 -Activity "Phase 1: Enumerating sites" -Status "$completedCount/$totalJobs sites | concurrent: $currentLimit | 429s: $phase1Total429s | libs: $($allSiteLibraries.Count)" -PercentComplete ([math]::Min(100, [math]::Round(($completedCount / $totalJobs) * 100)))
                     try {
                         $jobResult = $jobs[$i].PowerShell.EndInvoke($jobs[$i].Handle)
                         if($jobResult) {
@@ -991,8 +1032,12 @@ try {
                         if($jobs[$i].PowerShell.Streams.Error.Count -gt 0) {
                             foreach($err in $jobs[$i].PowerShell.Streams.Error) {
                                 Write-Log "  Runspace error for '$($jobs[$i].SiteUrl)': $($err.Exception.Message)" "WARN"
-                                if($err.Exception.Message -like "*429*") { $throttleHitCount++ }
+                                if($err.Exception.Message -like "*429*") { $throttleHitCount++; $phase1Total429s++ }
                             }
+                        }
+                        # Count 429 retries from Information stream (Write-Host output from New-GraphQuery retries)
+                        foreach($info in $jobs[$i].PowerShell.Streams.Information) {
+                            if($info.MessageData -like "*429*") { $throttleHitCount++; $phase1Total429s++ }
                         }
                     } catch {
                         Write-Log "  Error collecting result for '$($jobs[$i].SiteUrl)': $($_.Exception.Message)" "WARN"
@@ -1028,8 +1073,8 @@ try {
             if($jobs[$i].Handle.IsCompleted) {
                 $completedCount++
                 $completedSinceAdjust++
-                [void]$activeSemaphore.Release()
-                Write-Progress -Id 0 -Activity "Phase 1: Enumerating sites" -Status "$completedCount / $totalJobs" -PercentComplete ([math]::Min(100, [math]::Round(($completedCount / $totalJobs) * 100)))
+                if($activeSemaphore.CurrentCount -lt $MaxParallelLimit) { [void]$activeSemaphore.Release() }
+                Write-Progress -Id 0 -Activity "Phase 1: Enumerating sites" -Status "$completedCount/$totalJobs sites | concurrent: $currentLimit | 429s: $phase1Total429s | libs: $($allSiteLibraries.Count)" -PercentComplete ([math]::Min(100, [math]::Round(($completedCount / $totalJobs) * 100)))
                 try {
                     $jobResult = $jobs[$i].PowerShell.EndInvoke($jobs[$i].Handle)
                     if($jobResult) {
@@ -1047,8 +1092,12 @@ try {
                     if($jobs[$i].PowerShell.Streams.Error.Count -gt 0) {
                         foreach($err in $jobs[$i].PowerShell.Streams.Error) {
                             Write-Log "  Runspace error for '$($jobs[$i].SiteUrl)': $($err.Exception.Message)" "WARN"
-                            if($err.Exception.Message -like "*429*") { $throttleHitCount++ }
+                            if($err.Exception.Message -like "*429*") { $throttleHitCount++; $phase1Total429s++ }
                         }
+                    }
+                    # Count 429 retries from Information stream (Write-Host output from New-GraphQuery retries)
+                    foreach($info in $jobs[$i].PowerShell.Streams.Information) {
+                        if($info.MessageData -like "*429*") { $throttleHitCount++; $phase1Total429s++ }
                     }
                 } catch {
                     Write-Log "  Error collecting result for '$($jobs[$i].SiteUrl)': $($_.Exception.Message)" "WARN"
@@ -1068,8 +1117,12 @@ try {
                         $currentLimit = $newLimit
                         Write-Log "  Adaptive throttle: reducing to $currentLimit concurrent (429 rate: $([math]::Round($throttleRate * 100))%)" "WARN"
                     } elseif($throttleRate -eq 0 -and $currentLimit -lt $MaxParallelLimit) {
-                        $currentLimit = [math]::Min($MaxParallelLimit, $currentLimit + 2)
-                        [void]$activeSemaphore.Release(2)
+                        $increase = [math]::Min(2, $MaxParallelLimit - $currentLimit)
+                        $currentLimit += $increase
+                        if($increase -gt 0 -and $activeSemaphore.CurrentCount -lt $MaxParallelLimit) {
+                            $safeRelease = [math]::Min($increase, $MaxParallelLimit - $activeSemaphore.CurrentCount)
+                            if($safeRelease -gt 0) { [void]$activeSemaphore.Release($safeRelease) }
+                        }
                         Write-Log "  Adaptive throttle: increasing to $currentLimit concurrent (no 429s)" "INFO"
                     }
                     $throttleHitCount = 0
@@ -1185,7 +1238,7 @@ try {
 
         $results = [System.Collections.Generic.List[hashtable]]::new()
         $logMessages = [System.Collections.Generic.List[hashtable]]::new()
-        $had429 = $false
+        $throttleHits = 0
 
         # Process in batches of $batchSize
         for($bi = 0; $bi -lt $checkPairs.Count; $bi += $batchSize) {
@@ -1236,7 +1289,7 @@ try {
                         } elseif($batchResult.StatusCode -in (401, 403, 404)) {
                             $hasAccess = $false
                         } elseif($batchResult.StatusCode -eq 429) {
-                            $had429 = $true
+                            $throttleHits++
                             # Don't record — will be retried on next run via cache miss
                             $logMessages.Add(@{ Message = "429 throttled for user '$($sub.UserUPN)' on list '$($sub.ListId)' at '$siteWebUrl'"; Level = "WARN" })
                             $resultIndex++
@@ -1253,7 +1306,7 @@ try {
                 }
             } catch {
                 $logMessages.Add(@{ Message = "Batch failed for '$siteWebUrl': $($_.Exception.Message)"; Level = "WARN" })
-                if($_.Exception.Message -like "*429*") { $had429 = $true }
+                if($_.Exception.Message -like "*429*") { $throttleHits++ }
 
                 # Fallback: try individual requests for this chunk
                 foreach($pair in $chunk) {
@@ -1296,9 +1349,9 @@ try {
         }
 
         return [PSCustomObject]@{
-            Results     = $results
-            LogMessages = $logMessages
-            Had429      = $had429
+            Results      = $results
+            LogMessages  = $logMessages
+            ThrottleHits = $throttleHits
         }
     }
 
@@ -1307,6 +1360,9 @@ try {
     $siteTotal = $siteLibGroups.Count
     $totalCacheHits = 0
     $totalBatchChecks = 0
+    $phase2Total429s = 0
+    $phase2CompletedJobs = 0
+    $lastPhase2MetricsLog = 0
 
     $batchJobs = [System.Collections.Generic.List[hashtable]]::new()
 
@@ -1314,7 +1370,7 @@ try {
         $siteIndex++
         $siteLibs = $siteLibGroups[$siteWebUrl]
 
-        Write-Progress -Id 0 -Activity "Phase 2: Checking permissions (site-centric)" -Status "Site $siteIndex / $siteTotal — $siteWebUrl" -PercentComplete ([math]::Min(100, [math]::Round(($siteIndex / $siteTotal) * 100)))
+        Write-Progress -Id 0 -Activity "Phase 2: Checking permissions" -Status "$siteIndex/$siteTotal sites | concurrent: $batchCurrentLimit | batch: $BatchSize | 429s: $phase2Total429s | checks: $totalBatchChecks" -PercentComplete ([math]::Min(100, [math]::Round(($siteIndex / $siteTotal) * 100)))
 
         # Build list of (user, library) pairs that need an actual API check
         $checkPairs = [System.Collections.Generic.List[hashtable]]::new()
@@ -1356,7 +1412,7 @@ try {
             for($ji = $batchJobs.Count - 1; $ji -ge 0; $ji--) {
                 if($batchJobs[$ji].Handle.IsCompleted) {
                     $batchCompletedSinceAdjust++
-                    [void]$batchSemaphore.Release()
+                    if($batchSemaphore.CurrentCount -lt $MaxParallelLimit) { [void]$batchSemaphore.Release() }
                     try {
                         $batchJobResult = $batchJobs[$ji].PowerShell.EndInvoke($batchJobs[$ji].Handle)
                         if($batchJobResult) {
@@ -1364,7 +1420,7 @@ try {
                                 if($bjr.LogMessages) {
                                     foreach($log in $bjr.LogMessages) { Write-Log "  $($log.Message)" $log.Level }
                                 }
-                                if($bjr.Had429) { $batchThrottleHits++ }
+                                if($bjr.ThrottleHits) { $batchThrottleHits += $bjr.ThrottleHits; $phase2Total429s += $bjr.ThrottleHits }
                                 if($bjr.Results) {
                                     foreach($pr in $bjr.Results) {
                                         $permissionCache[$pr.LibKey] = @{ hasAccess = $pr.HasAccess; checkedAt = Get-Date }
@@ -1387,11 +1443,18 @@ try {
                                 Write-Log "  Batch runspace error: $($err.Exception.Message)" "WARN"
                             }
                         }
+                        # Count 429 retries from Information stream (Write-Host output from Invoke-SharePointBatch retries)
+                        foreach($info in $batchJobs[$ji].PowerShell.Streams.Information) {
+                            if($info.MessageData -like "*429*") { $batchThrottleHits++; $phase2Total429s++ }
+                        }
                     } catch {
                         Write-Log "  Error collecting batch result for '$($batchJobs[$ji].SiteUrl)': $($_.Exception.Message)" "WARN"
                     }
                     $batchJobs[$ji].PowerShell.Dispose()
                     $batchJobs.RemoveAt($ji)
+
+                    $phase2CompletedJobs++
+                    Write-Progress -Id 0 -Activity "Phase 2: Checking permissions" -Status "$phase2CompletedJobs/$siteTotal sites | concurrent: $batchCurrentLimit | batch: $BatchSize | 429s: $phase2Total429s | checks: $totalBatchChecks" -PercentComplete ([math]::Min(100, [math]::Round(($phase2CompletedJobs / [math]::Max(1,$siteTotal)) * 100)))
                 }
             }
         }
@@ -1417,7 +1480,7 @@ try {
         for($ji = $batchJobs.Count - 1; $ji -ge 0; $ji--) {
             if($batchJobs[$ji].Handle.IsCompleted) {
                 $batchCompletedSinceAdjust++
-                [void]$batchSemaphore.Release()
+                if($batchSemaphore.CurrentCount -lt $MaxParallelLimit) { [void]$batchSemaphore.Release() }
                 try {
                     $batchJobResult = $batchJobs[$ji].PowerShell.EndInvoke($batchJobs[$ji].Handle)
                     if($batchJobResult) {
@@ -1425,7 +1488,7 @@ try {
                             if($bjr.LogMessages) {
                                 foreach($log in $bjr.LogMessages) { Write-Log "  $($log.Message)" $log.Level }
                             }
-                            if($bjr.Had429) { $batchThrottleHits++ }
+                            if($bjr.ThrottleHits) { $batchThrottleHits += $bjr.ThrottleHits; $phase2Total429s += $bjr.ThrottleHits }
                             if($bjr.Results) {
                                 foreach($pr in $bjr.Results) {
                                     # Update cache
@@ -1450,11 +1513,18 @@ try {
                             Write-Log "  Batch runspace error: $($err.Exception.Message)" "WARN"
                         }
                     }
+                    # Count 429 retries from Information stream (Write-Host output from Invoke-SharePointBatch retries)
+                    foreach($info in $batchJobs[$ji].PowerShell.Streams.Information) {
+                        if($info.MessageData -like "*429*") { $batchThrottleHits++; $phase2Total429s++ }
+                    }
                 } catch {
                     Write-Log "  Error collecting batch result for '$($batchJobs[$ji].SiteUrl)': $($_.Exception.Message)" "WARN"
                 }
                 $batchJobs[$ji].PowerShell.Dispose()
                 $batchJobs.RemoveAt($ji)
+
+                $phase2CompletedJobs++
+                Write-Progress -Id 0 -Activity "Phase 2: Checking permissions" -Status "$phase2CompletedJobs/$siteTotal sites | concurrent: $batchCurrentLimit | batch: $BatchSize | 429s: $phase2Total429s | checks: $totalBatchChecks" -PercentComplete ([math]::Min(100, [math]::Round(($phase2CompletedJobs / [math]::Max(1,$siteTotal)) * 100)))
 
                 # Adaptive throttle adjustment
                 if($batchCompletedSinceAdjust -ge 20) {
@@ -1468,7 +1538,10 @@ try {
                     } elseif($batchThrottleRate -eq 0 -and $batchCurrentLimit -lt $MaxParallelLimit) {
                         $increase = [math]::Min(2, $MaxParallelLimit - $batchCurrentLimit)
                         $batchCurrentLimit += $increase
-                        [void]$batchSemaphore.Release($increase)
+                        if($increase -gt 0 -and $batchSemaphore.CurrentCount -lt $MaxParallelLimit) {
+                            $safeRelease = [math]::Min($increase, $MaxParallelLimit - $batchSemaphore.CurrentCount)
+                            if($safeRelease -gt 0) { [void]$batchSemaphore.Release($safeRelease) }
+                        }
                         Write-Log "  Adaptive batch throttle: increasing to $batchCurrentLimit (no 429s)" "INFO"
                     }
                     $batchThrottleHits = 0
@@ -1483,7 +1556,7 @@ try {
     while($batchJobs.Count -gt 0) {
         for($ji = $batchJobs.Count - 1; $ji -ge 0; $ji--) {
             if($batchJobs[$ji].Handle.IsCompleted) {
-                [void]$batchSemaphore.Release()
+                if($batchSemaphore.CurrentCount -lt $MaxParallelLimit) { [void]$batchSemaphore.Release() }
                 try {
                     $batchJobResult = $batchJobs[$ji].PowerShell.EndInvoke($batchJobs[$ji].Handle)
                     if($batchJobResult) {
@@ -1491,6 +1564,7 @@ try {
                             if($bjr.LogMessages) {
                                 foreach($log in $bjr.LogMessages) { Write-Log "  $($log.Message)" $log.Level }
                             }
+                            if($bjr.ThrottleHits) { $batchThrottleHits += $bjr.ThrottleHits; $phase2Total429s += $bjr.ThrottleHits }
                             if($bjr.Results) {
                                 foreach($pr in $bjr.Results) {
                                     $permissionCache[$pr.LibKey] = @{ hasAccess = $pr.HasAccess; checkedAt = Get-Date }
@@ -1508,11 +1582,18 @@ try {
                             }
                         }
                     }
+                    # Count 429 retries from Information stream (Write-Host output from Invoke-SharePointBatch retries)
+                    foreach($info in $batchJobs[$ji].PowerShell.Streams.Information) {
+                        if($info.MessageData -like "*429*") { $batchThrottleHits++; $phase2Total429s++ }
+                    }
                 } catch {
                     Write-Log "  Error collecting batch result for '$($batchJobs[$ji].SiteUrl)': $($_.Exception.Message)" "WARN"
                 }
                 $batchJobs[$ji].PowerShell.Dispose()
                 $batchJobs.RemoveAt($ji)
+
+                $phase2CompletedJobs++
+                Write-Progress -Id 0 -Activity "Phase 2: Checking permissions" -Status "$phase2CompletedJobs/$siteTotal sites | concurrent: $batchCurrentLimit | batch: $BatchSize | 429s: $phase2Total429s | checks: $totalBatchChecks" -PercentComplete ([math]::Min(100, [math]::Round(($phase2CompletedJobs / [math]::Max(1,$siteTotal)) * 100)))
             }
         }
         if($batchJobs.Count -gt 0) { Start-Sleep -Milliseconds 100 }
@@ -1522,7 +1603,7 @@ try {
     $batchPool.Dispose()
     $batchSemaphore.Dispose()
 
-    Write-Progress -Id 0 -Activity "Phase 2: Checking permissions (site-centric)" -Completed
+    Write-Progress -Id 0 -Activity "Phase 2: Checking permissions" -Completed
 
     # Save updated cache
     if($EnableCache) {
@@ -1557,6 +1638,7 @@ try {
         Warnings         = 0
         Errors           = 0
     }
+    $existingShortcutConflicts = [System.Collections.Generic.List[hashtable]]::new()
 
     $userIndex = 0
     $userTotal = $targetUserList.Count
@@ -1726,8 +1808,9 @@ try {
                     Write-Log "    Created shortcut for '$($desiredShortcut.shortcut.siteUrl)'" "SUCCESS"
                     $successCount++
                 }catch{
-                    if($_.Exception.Message -like '*descendant shortcut exists*') {
-                        Write-Log "    Descendant shortcut already exists for '$($desiredShortcut.shortcut.siteUrl)'" "WARN"
+                    if($_.Exception.Message -like '*descendant shortcut exists*' -or $_.Exception.Message -like '*shortcut already exists*') {
+                        Write-Log "    Existing shortcut conflict for '$($desiredShortcut.shortcut.siteUrl)': $($_.Exception.Message)" "WARN"
+                        $existingShortcutConflicts.Add(@{ User = $userUPN; Url = $desiredShortcut.shortcut.siteUrl })
                         $warnCount++
                     } else {
                         Write-Log "    Failed to create shortcut for '$($desiredShortcut.shortcut.siteUrl)': $($_.Exception.Message)" "ERROR"
@@ -1787,7 +1870,7 @@ try {
                     }
                     try {
                         Write-Log "    Deleting obsolete shortcut '$($existing.Name)'..." "INFO"
-                        New-GraphQuery -MaxAttempts 1 -Uri "$($global:octo.graphUrl)/v1.0/users/$userId/drive/items/$($existing.ID)" -Method DELETE
+                        New-GraphQuery -MaxAttempts 2 -Uri "$($global:octo.graphUrl)/v1.0/users/$userId/drive/items/$($existing.ID)" -Method DELETE
                         Start-Sleep -Milliseconds 200
                         $deletedCount++
                         Write-Log "    Deleted obsolete shortcut" "SUCCESS"
@@ -1819,6 +1902,18 @@ try {
     }
 
     Write-Progress -Id 0 -Activity "Phase 3: Applying shortcuts" -Completed
+
+    # Existing shortcut conflicts table
+    if($existingShortcutConflicts.Count -gt 0) {
+        Write-Log "" "INFO"
+        Write-Log "=== Existing Shortcut Conflicts ($($existingShortcutConflicts.Count)) ===" "WARN"
+        Write-Log ("{0,-45} {1}" -f "User", "URL") "INFO"
+        Write-Log ("{0,-45} {1}" -f "----", "---") "INFO"
+        foreach($conflict in $existingShortcutConflicts) {
+            Write-Log ("{0,-45} {1}" -f $conflict.User, $conflict.Url) "WARN"
+        }
+        Write-Log "" "INFO"
+    }
 
     # Global summary
     $modeLabel = if($DryRun) { " (DRY RUN)" } else { "" }
@@ -1852,7 +1947,9 @@ try {
     Write-Log "  Total runtime: $totalFormatted" "SUCCESS"
 
     Write-Log "=== Script Completed ===" "SUCCESS"
-    Stop-Transcript
+    if(!$global:IsAzureAutomation) {
+        Stop-Transcript
+    }
 } catch {
     Write-Log "Fatal error: $($_.Exception.Message)" "ERROR"
     Write-Log $_.ScriptStackTrace "ERROR"
