@@ -1787,7 +1787,18 @@ try {
                     } | ConvertTo-Json -Depth 3
 
                     Write-Log "    Creating shortcut ($($desiredShortcut.shortcut.siteUrl))..." "INFO"
-                    $newShortCut = $Null; $newShortCut = New-GraphQuery -MaxAttempts 1 -Uri "$($global:octo.graphUrl)/v1.0/users/$userId/drive/items/$($targetFolder.id)/children" -Method POST -Body $shortcutBody
+                    $newShortCut = $Null; $newShortCut = New-GraphQuery -MaxAttempts 1 -Uri "$($global:octo.graphUrl)/v1.0/users/$userId/drive/root/children" -Method POST -Body $shortcutBody
+
+                    # Graph only allows reliable shortcut creation in root; move it into the target folder afterward.
+                    if($newShortCut.id -and $targetFolder.id){
+                        $moveBody = @{
+                            parentReference = @{
+                                id = $targetFolder.id
+                            }
+                        } | ConvertTo-Json -Depth 3
+                        $newShortCut = New-GraphQuery -MaxAttempts 1 -Uri "$($global:octo.graphUrl)/v1.0/users/$userId/drive/items/$($newShortCut.id)" -Method PATCH -Body $moveBody
+                        Write-Log "    Moved shortcut into '$FolderName' folder" "INFO"
+                    }
 
                     $cleanName = Get-CleanedShortcutName -Name $newShortCut.name
                     $i = 1

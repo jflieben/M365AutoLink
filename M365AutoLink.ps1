@@ -772,7 +772,18 @@ try {
             } | ConvertTo-Json -Depth 3
             
             Write-Log "  Creating shortcut..." "INFO"
-            $newShortCut = $Null; $newShortCut = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/me/drive/items/$($targetFolder.id)/children" -Method POST -Body $shortcutBody
+            $newShortCut = $Null; $newShortCut = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/me/drive/root/children" -Method POST -Body $shortcutBody
+
+            # Graph only allows reliable shortcut creation in root; move it into the target folder afterward.
+            if($newShortCut.id -and $targetFolder.id){
+                $moveBody = @{
+                    parentReference = @{
+                        id = $targetFolder.id
+                    }
+                } | ConvertTo-Json -Depth 3
+                $newShortCut = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/me/drive/items/$($newShortCut.id)" -Method PATCH -Body $moveBody
+                Write-Log "  Moved shortcut into '$FolderName' folder" "INFO"
+            }
             
             # Rename the shortcut if the created name differs from our desired name (Graph may append suffix)
             $cleanName = Get-CleanedShortcutName -Name $newShortCut.name
