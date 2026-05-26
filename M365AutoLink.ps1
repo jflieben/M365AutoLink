@@ -114,6 +114,22 @@ $excludedLibrariesByWildcard = @(
     "*preservation hold library*"
 )
 
+# Additional exact title exclusions (case-insensitive) and feature IDs.
+$ExcludedListTitles = @(
+    "Access Requests","App Packages","appdata","appfiles","Apps in Testing","Cache Profiles","Composed Looks","Content and Structure Reports","Content type publishing error log","Converted Forms",
+    "Device Channels","Form Templates","fpdatasources","Get started with Apps for Office and SharePoint","List Template Gallery", "Long Running Operation Status","Maintenance Log Library", "Images", "site collection images",
+    "Master Docs","Master Page Gallery","MicroFeed","NintexFormXml","Quick Deploy Items","Relationships List","Reusable Content","Reporting Metadata", "Reporting Templates", "Search Config List","Site Assets","Preservation Hold Library",
+    "Site Pages", "Solution Gallery","Style Library","Suggested Content Browser Locations","Theme Gallery", "TaxonomyHiddenList","User Information List","Web Part Gallery","wfpub","wfsvc","Workflow History","Workflow Tasks", "Pages"
+)
+
+$ExcludedListFeatureIDs = @(
+    "00000000-0000-0000-0000-000000000000",
+    "a0e5a010-1329-49d4-9e09-f280cdbed37d",
+    "d11bc7d4-96c6-40e3-837d-3eb861805bfa",
+    "00bfea71-c796-4402-9f2f-0eb9a6e71b18",
+    "de12eebe-9114-4a4a-b7da-7585dc36a907"
+)
+
 ##########END CONFIGURATION#############################
 
 #base vars
@@ -190,6 +206,52 @@ function Test-IsExcludedLibraryName {
     }
 
     return $false
+}
+
+function Normalize-GuidString {
+    param([string]$Value)
+
+    if([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    try {
+        return ([guid]$Value).ToString().ToLowerInvariant()
+    } catch {
+        return $Value.Trim('{}').ToLowerInvariant()
+    }
+}
+
+function Get-ListFeatureId {
+    param($ListMetadata)
+
+    $featureIdCandidates = @(
+        $ListMetadata.FeatureId,
+        $ListMetadata.featureid,
+        $ListMetadata.TemplateFeatureId,
+        $ListMetadata.templatefeatureid
+    )
+
+    foreach($candidate in $featureIdCandidates) {
+        $normalized = Normalize-GuidString -Value ([string]$candidate)
+        if(-not [string]::IsNullOrWhiteSpace($normalized)) {
+            return $normalized
+        }
+    }
+
+    return $null
+}
+
+$script:ExcludedListTitleSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach($title in $ExcludedListTitles) {
+    if(-not [string]::IsNullOrWhiteSpace($title)) {
+        [void]$script:ExcludedListTitleSet.Add($title)
+    }
+}
+
+$script:ExcludedFeatureIdSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach($featureId in $ExcludedListFeatureIDs) {
+    $normalizedId = Normalize-GuidString -Value $featureId
+    if(-not [string]::IsNullOrWhiteSpace($normalizedId)) {
+        [void]$script:ExcludedFeatureIdSet.Add($normalizedId)
+    }
 }
 
 function get-AccessToken{    
@@ -726,14 +788,21 @@ function Get-ListMetadataWithFallback {
     $listId = $Library.listId
     $listPath = [string]$Library.listPath
     $siteCollectionUrl = [string]$Library.siteCollectionUrl
-    $serverRelativeListPath = $null
+    $derivedWebUrl = $null
 
     if(-not [string]::IsNullOrWhiteSpace($listPath)) {
         try {
             $listPathUri = [System.Uri]::new($listPath)
-            $serverRelativeListPath = $listPathUri.AbsolutePath
+            $rawPath = [System.Uri]::UnescapeDataString($listPathUri.AbsolutePath)
+            $webPath = $rawPath -replace '/Forms/[^/]+\.aspx$', ''
+            $webSegments = @($webPath.Trim('/').Split('/'))
+            if($webSegments.Count -ge 2) {
+                $derivedWebUrl = "{0}://{1}/{2}" -f $listPathUri.Scheme, $listPathUri.Host, ($webSegments[0..($webSegments.Count - 2)] -join '/')
+            } else {
+                $derivedWebUrl = "{0}://{1}" -f $listPathUri.Scheme, $listPathUri.Host
+            }
         } catch {
-            $serverRelativeListPath = $null
+            $derivedWebUrl = $null
         }
     }
 
@@ -741,7 +810,7 @@ function Get-ListMetadataWithFallback {
         return New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$PrimarySiteUrl/_api/lists/GetById('$listId')" -Method GET
     } catch {
         $isNotFound = $_.Exception.Message -like "*404*" -or $_.Exception.Message -like "*Not Found*"
-        if(-not $isNotFound -or [string]::IsNullOrWhiteSpace($serverRelativeListPath)) {
+        if(-not $isNotFound -or [string]::IsNullOrWhiteSpace($derivedWebUrl)) {
             throw
         }
     }
@@ -751,11 +820,13 @@ function Get-ListMetadataWithFallback {
     if(-not [string]::IsNullOrWhiteSpace($siteCollectionUrl)) {
         $candidateBaseUrls.Add($siteCollectionUrl.TrimEnd('/'))
     }
+    if(-not [string]::IsNullOrWhiteSpace($derivedWebUrl)) {
+        $candidateBaseUrls.Add($derivedWebUrl.TrimEnd('/'))
+    }
 
     foreach($baseUrl in $candidateBaseUrls | Select-Object -Unique) {
         try {
-            $escapedPath = $serverRelativeListPath.Replace("'", "''")
-            return New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$baseUrl/_api/web/GetList('$escapedPath')" -Method GET
+            return New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$baseUrl/_api/lists/GetById('$listId')" -Method GET
         } catch {
             $isNotFound = $_.Exception.Message -like "*404*" -or $_.Exception.Message -like "*Not Found*"
             if(-not $isNotFound) {
@@ -764,7 +835,7 @@ function Get-ListMetadataWithFallback {
         }
     }
 
-    throw "List metadata lookup failed for list '$listId' using both GetById and GetList fallbacks"
+    throw "List metadata lookup failed for list '$listId' using all GetById fallbacks"
 }
 
 
@@ -985,6 +1056,17 @@ try {
             # Exclude catalog/system libraries and known non-user libraries.
             if($listMetaData.IsCatalog -eq $true -or $listMetaData.IsSystemList -eq $true -or (Test-IsExcludedLibraryName -ListName $listDisplayName)) {
                 Write-Log "  $listDisplayName is a system/catalog library, skipping..." "WARN"
+                continue
+            }
+
+            if($script:ExcludedListTitleSet.Contains($listDisplayName)) {
+                Write-Log "  $listDisplayName is an excluded system title, skipping..." "WARN"
+                continue
+            }
+
+            $listFeatureId = Get-ListFeatureId -ListMetadata $listMetaData
+            if($listFeatureId -and $script:ExcludedFeatureIdSet.Contains($listFeatureId)) {
+                Write-Log "  $listDisplayName uses excluded FeatureId '$listFeatureId', skipping..." "WARN"
                 continue
             }
 
