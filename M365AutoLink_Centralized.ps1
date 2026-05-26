@@ -133,7 +133,7 @@ $minFileCount = 0
 # "Edit" = create shortcut only when user has Edit (contribute) or higher permissions
 $MinimumPermissionLevel = "Edit"
 
-# --- Performance tuning (Optimized version) ---
+# --- Performance tuning ---
 
 # Initial concurrency for site enumeration AND permission check runspaces
 # The adaptive throttle will scale this up/down based on 429 rate
@@ -142,26 +142,35 @@ $InitialParallelLimit = 10
 # Absolute maximum concurrent threads (adaptive throttle ceiling)
 $MaxParallelLimit = 25
 
-# SharePoint REST $batch size (max sub-requests per batch call, Microsoft limit is 20)
-$BatchSize = 20
+# SharePoint REST $batch size (max sub-requests per batch call, Microsoft limit is 100)
+$BatchSize = 25
 
-# Cross-run cache settings
-# Set to $true to cache permission results between runs (dramatically speeds up subsequent runs, but only works on persistent hosts)
-$EnableCache = $false
+# Concurrency for create/delete shortcut mutations in Phase 3
+$ShortcutActionParallelLimit = 8
 
-if($EnableCache){
-    # Cache location (default: alongside script). Set to a custom path if desired.
-    $CachePath = Join-Path (Split-Path $MyInvocation.MyCommand.Path -Parent) "M365AutoLink_PermissionCache.json"
-}
-
-# Maximum age of cached permission results in hours. Entries older than this are re-checked.
-$CacheMaxAgeHours = 24
-
-# Set to $true to ignore the cache completely and do a full scan (useful after major permission changes)
-$ForceFullScan = $false
+# Retry attempts for Graph mutation calls (create/move/rename/delete)
+$GraphMutationMaxAttempts = 5
 
 # Dry-run mode: when $true, no shortcuts are created, deleted, or renamed
-$DryRun = $false
+$DryRun = $true
+
+# Optional optimization: recursively pre-resolve site/list owners and members to skip expensive
+# getUserEffectivePermissions calls for users that are already known to have access.
+# Disabled by default to preserve existing behavior unless explicitly enabled.
+$EnableRecursivePermissionPreCheck = $true
+
+# When recursive pre-check is enabled, treat broad SharePoint "Everyone/All users" claims as allow-all.
+$PreCheckIncludeEveryoneClaims = $true
+
+# Optional diagnostics for recursive pre-check (site/list pre-allow and fallback counts).
+$PreCheckVerboseDiagnostics = $false
+
+# Safety guards for recursive principal expansion.
+$PreCheckMaxRecursionDepth = 8
+$PreCheckMaxExpandedPrincipals = 5000
+
+# Optional test limiter: when > 0, only process first N filtered sites.
+$MaxSitesToProcessForTesting = 0
 
 ##########END CONFIGURATION#############################
 
@@ -169,6 +178,7 @@ $DryRun = $false
 #base vars
 $global:octo = @{}
 $global:octo.LCCachedTokens = @{}
+$global:octo.EntraGroupTargetMemberCache = @{}
 $logDir = if($env:APPDATA) { "$env:APPDATA\M365AutoLink" } elseif($env:TEMP) { "$env:TEMP\M365AutoLink" } else { ".\M365AutoLink" }
 $global:octo.LogPath = Join-Path $logDir "lastRun.log"
 
@@ -208,6 +218,312 @@ function Get-CleanedShortcutName {
         $cleanedName = $Name.Trim()
     }
     return $cleanedName
+}
+
+function New-CaseInsensitiveStringSet {
+    return ,([System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase))
+}
+
+function Ensure-StringSet {
+    param([object]$Set)
+    if($null -eq $Set -or $Set -isnot [System.Collections.Generic.HashSet[string]]) {
+        return ,(New-CaseInsensitiveStringSet)
+    }
+    return ,$Set
+}
+
+function Get-PrincipalIdentityKey {
+    param([object]$Principal)
+    if($null -eq $Principal) { return "null-principal" }
+    $loginName = $null
+    $principalId = $null
+    try { $loginName = [string]$Principal.LoginName } catch {}
+    try { $principalId = [string]$Principal.Id } catch {}
+
+    if(-not [string]::IsNullOrWhiteSpace($loginName)) { return "login:$($loginName.ToLowerInvariant())" }
+    if(-not [string]::IsNullOrWhiteSpace($principalId)) { return "id:$principalId" }
+    return "unknown:$([guid]::NewGuid().ToString())"
+}
+
+function Get-UpnFromLoginName {
+    param([string]$LoginName)
+    if([string]::IsNullOrWhiteSpace($LoginName)) { return $null }
+
+    $lower = $LoginName.ToLowerInvariant()
+    if($lower -like "*|membership|*") {
+        return ($lower -split "\|")[-1]
+    }
+    if($lower -match '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
+        return $lower
+    }
+    return $null
+}
+
+function Get-EntraGroupIdFromLoginName {
+    param([string]$LoginName)
+    if([string]::IsNullOrWhiteSpace($LoginName)) { return $null }
+
+    $guidRegex = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+    $m = [regex]::Match($LoginName, $guidRegex)
+    if($m.Success) { return $m.Value.ToLowerInvariant() }
+    return $null
+}
+
+function Test-IsSpecialAllUsersPrincipal {
+    param([string]$LoginName)
+    if([string]::IsNullOrWhiteSpace($LoginName)) { return $false }
+
+    $normalized = $LoginName.ToLowerInvariant()
+    if($normalized -like "*spo-grid-all-users*") { return $true }
+    if($normalized -like "*rolemanager|spo-grid-all-users*") { return $true }
+    if($normalized -like "*everyone*") { return $true }
+    if($normalized -like "*all users*") { return $true }
+    if($normalized -like "c:0*.s|true") { return $true }
+    if($normalized -like "c:0(.s|true") { return $true }
+    return $false
+}
+
+function Test-RoleBindingAllowsAccess {
+    param(
+        [object]$RoleBindings,
+        [string]$MinimumPermissionLevel
+    )
+
+    if(-not $RoleBindings) { return $false }
+    $bindings = @($RoleBindings)
+    if($bindings.Count -eq 0) { return $false }
+
+    foreach($binding in $bindings) {
+        $allowView = $false
+        $allowEdit = $false
+
+        try {
+            if($binding.BasePermissions -and $null -ne $binding.BasePermissions.Low) {
+                $lowVal = [long]$binding.BasePermissions.Low
+                $allowView = ($lowVal -band 0x1) -ne 0
+                $allowEdit = ($lowVal -band 0x4) -ne 0
+            }
+        } catch {}
+
+        if(-not $allowView -and -not $allowEdit) {
+            $roleName = ""
+            try { $roleName = [string]$binding.Name } catch {}
+            $roleName = $roleName.ToLowerInvariant()
+
+            if($roleName -like "*full control*" -or $roleName -like "*owner*" -or $roleName -like "*design*" -or $roleName -like "*edit*" -or $roleName -like "*contribute*" -or $roleName -like "*approve*") {
+                $allowEdit = $true
+                $allowView = $true
+            } elseif($roleName -like "*read*" -or $roleName -like "*view*") {
+                $allowView = $true
+            }
+        }
+
+        if($MinimumPermissionLevel -eq "Edit" -and $allowEdit) { return $true }
+        if($MinimumPermissionLevel -ne "Edit" -and ($allowView -or $allowEdit)) { return $true }
+    }
+
+    return $false
+}
+
+function Add-ResolvedTargetUserToSet {
+    param(
+        [string]$CandidateUpn,
+        [string]$CandidateId,
+        [hashtable]$TargetUserByUpn,
+        [hashtable]$TargetUserById,
+        [System.Collections.Generic.HashSet[string]]$OutputSet
+    )
+
+    if(-not [string]::IsNullOrWhiteSpace($CandidateUpn)) {
+        $k = $CandidateUpn.ToLowerInvariant()
+        if($TargetUserByUpn.ContainsKey($k)) {
+            [void]$OutputSet.Add($TargetUserByUpn[$k])
+            return $true
+        }
+    }
+    if(-not [string]::IsNullOrWhiteSpace($CandidateId)) {
+        $idKey = $CandidateId.ToLowerInvariant()
+        if($TargetUserById.ContainsKey($idKey)) {
+            [void]$OutputSet.Add($TargetUserById[$idKey])
+            return $true
+        }
+    }
+    return $false
+}
+
+function Resolve-EntraGroupTargetUsers {
+    param(
+        [string]$GroupId,
+        [hashtable]$TargetUserByUpn,
+        [hashtable]$TargetUserById,
+        [hashtable]$EntraGroupCache,
+        [hashtable]$PreCheckStats
+    )
+
+    $resultSet = New-CaseInsensitiveStringSet
+    if([string]::IsNullOrWhiteSpace($GroupId)) { return $resultSet }
+
+    $groupKey = $GroupId.ToLowerInvariant()
+    if($EntraGroupCache.ContainsKey($groupKey)) {
+        $PreCheckStats.CacheHits++
+        $cachedUpns = @($EntraGroupCache[$groupKey])
+        foreach($u in $cachedUpns) { [void]$resultSet.Add($u) }
+        return $resultSet
+    }
+
+    $PreCheckStats.CacheMisses++
+    try {
+        $members = @(New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/groups/$groupKey/transitiveMembers?`$select=id,userPrincipalName" -Method GET -MaxAttempts 3)
+        foreach($member in $members) {
+            if($member.'@odata.type' -ne '#microsoft.graph.user') { continue }
+            $memberUpn = $null
+            try { $memberUpn = [string]$member.userPrincipalName } catch {}
+            $memberId = $null
+            try { $memberId = [string]$member.id } catch {}
+            [void](Add-ResolvedTargetUserToSet -CandidateUpn $memberUpn -CandidateId $memberId -TargetUserByUpn $TargetUserByUpn -TargetUserById $TargetUserById -OutputSet $resultSet)
+        }
+    } catch {
+        Write-Log "Recursive pre-check: failed to resolve Entra group '$groupKey': $($_.Exception.Message)" "WARN"
+    }
+
+    # Cache only compact string list for this run to keep memory footprint low.
+    $EntraGroupCache[$groupKey] = @($resultSet)
+    return @($resultSet)
+}
+
+function Resolve-PrincipalToTargetUsersRecursive {
+    param(
+        [string]$SiteWebUrl,
+        [object]$Principal,
+        [hashtable]$TargetUserByUpn,
+        [hashtable]$TargetUserById,
+        [System.Collections.Generic.HashSet[string]]$OutputSet,
+        [System.Collections.Generic.HashSet[string]]$VisitedPrincipalKeys,
+        [System.Collections.Generic.HashSet[string]]$VisitedSpGroupIds,
+        [hashtable]$State,
+        [hashtable]$EntraGroupCache,
+        [hashtable]$PreCheckStats,
+        [bool]$IncludeEveryoneClaims,
+        [int]$Depth,
+        [int]$MaxDepth,
+        [int]$MaxExpandedPrincipals
+    )
+
+    if($Depth -gt $MaxDepth) {
+        $PreCheckStats.RecursionCutoffs++
+        return
+    }
+
+    if($null -eq $Principal) {
+        return
+    }
+
+    if($State.ExpandedPrincipals -ge $MaxExpandedPrincipals) {
+        $PreCheckStats.RecursionCutoffs++
+        return
+    }
+    $State.ExpandedPrincipals++
+
+    $principalKey = Get-PrincipalIdentityKey -Principal $Principal
+    if($VisitedPrincipalKeys.Contains($principalKey)) { return }
+    [void]$VisitedPrincipalKeys.Add($principalKey)
+
+    $loginName = ""
+    $principalType = 0
+    $principalId = $null
+    try { $loginName = [string]$Principal.LoginName } catch {}
+    try { $principalType = [int]$Principal.PrincipalType } catch {}
+    try { $principalId = [string]$Principal.Id } catch {}
+
+    if($IncludeEveryoneClaims -and (Test-IsSpecialAllUsersPrincipal -LoginName $loginName)) {
+        $State.AllowAllUsers = $true
+        return
+    }
+
+    $principalUpn = $null
+    try { $principalUpn = [string]$Principal.UserPrincipalName } catch {}
+    if([string]::IsNullOrWhiteSpace($principalUpn)) {
+        try { $principalUpn = [string]$Principal.Email } catch {}
+    }
+    if([string]::IsNullOrWhiteSpace($principalUpn)) {
+        $principalUpn = Get-UpnFromLoginName -LoginName $loginName
+    }
+    [void](Add-ResolvedTargetUserToSet -CandidateUpn $principalUpn -CandidateId $principalId -TargetUserByUpn $TargetUserByUpn -TargetUserById $TargetUserById -OutputSet $OutputSet)
+
+    $entraGroupId = Get-EntraGroupIdFromLoginName -LoginName $loginName
+    if(-not [string]::IsNullOrWhiteSpace($entraGroupId)) {
+        $groupUsers = Resolve-EntraGroupTargetUsers -GroupId $entraGroupId -TargetUserByUpn $TargetUserByUpn -TargetUserById $TargetUserById -EntraGroupCache $EntraGroupCache -PreCheckStats $PreCheckStats
+        foreach($upn in $groupUsers) { [void]$OutputSet.Add($upn) }
+    }
+
+    # SharePoint group bit flag = 8
+    $isSpGroup = ($principalType -band 8) -ne 0
+    if($isSpGroup -and -not [string]::IsNullOrWhiteSpace($principalId)) {
+        $spGroupKey = $principalId.ToLowerInvariant()
+        if($VisitedSpGroupIds.Contains($spGroupKey)) { return }
+        [void]$VisitedSpGroupIds.Add($spGroupKey)
+
+        try {
+            $groupMembers = @(New-GraphQuery -Uri "$SiteWebUrl/_api/web/sitegroups/GetById($principalId)/Users?`$select=Id,LoginName,PrincipalType,UserPrincipalName,Email" -Method GET -MaxAttempts 3)
+            foreach($member in $groupMembers) {
+                Resolve-PrincipalToTargetUsersRecursive -SiteWebUrl $SiteWebUrl -Principal $member -TargetUserByUpn $TargetUserByUpn -TargetUserById $TargetUserById -OutputSet $OutputSet -VisitedPrincipalKeys $VisitedPrincipalKeys -VisitedSpGroupIds $VisitedSpGroupIds -State $State -EntraGroupCache $EntraGroupCache -PreCheckStats $PreCheckStats -IncludeEveryoneClaims $IncludeEveryoneClaims -Depth ($Depth + 1) -MaxDepth $MaxDepth -MaxExpandedPrincipals $MaxExpandedPrincipals
+            }
+        } catch {
+            Write-Log "Recursive pre-check: failed to enumerate SharePoint group '$principalId' on '$SiteWebUrl': $($_.Exception.Message)" "WARN"
+        }
+    }
+}
+
+function Get-ScopeAllowedTargetUsers {
+    param(
+        [string]$SiteWebUrl,
+        [ValidateSet('Web','List')]
+        [string]$ScopeType,
+        [string]$ListId,
+        [string]$MinimumPermissionLevel,
+        [hashtable]$TargetUserByUpn,
+        [hashtable]$TargetUserById,
+        [hashtable]$EntraGroupCache,
+        [hashtable]$PreCheckStats,
+        [bool]$IncludeEveryoneClaims,
+        [int]$MaxDepth,
+        [int]$MaxExpandedPrincipals
+    )
+
+    $allowedUsers = New-CaseInsensitiveStringSet
+    $state = @{ AllowAllUsers = $false; ExpandedPrincipals = 0 }
+    $visitedPrincipalKeys = New-CaseInsensitiveStringSet
+    $visitedSpGroupIds = New-CaseInsensitiveStringSet
+
+    $roleUri = if($ScopeType -eq 'Web') {
+        "$SiteWebUrl/_api/web/RoleAssignments?`$expand=Member,RoleDefinitionBindings"
+    } else {
+        "$SiteWebUrl/_api/web/lists/GetById('$ListId')/RoleAssignments?`$expand=Member,RoleDefinitionBindings"
+    }
+
+    try {
+        $roleAssignments = @(New-GraphQuery -Uri $roleUri -Method GET -MaxAttempts 3)
+        foreach($ra in $roleAssignments) {
+            if($null -eq $ra) { continue }
+
+            $roleBindings = $null
+            $member = $null
+            try { $roleBindings = $ra.RoleDefinitionBindings } catch {}
+            try { $member = $ra.Member } catch {}
+
+            if(-not (Test-RoleBindingAllowsAccess -RoleBindings $roleBindings -MinimumPermissionLevel $MinimumPermissionLevel)) { continue }
+            if($null -eq $member) { continue }
+
+            Resolve-PrincipalToTargetUsersRecursive -SiteWebUrl $SiteWebUrl -Principal $member -TargetUserByUpn $TargetUserByUpn -TargetUserById $TargetUserById -OutputSet $allowedUsers -VisitedPrincipalKeys $visitedPrincipalKeys -VisitedSpGroupIds $visitedSpGroupIds -State $state -EntraGroupCache $EntraGroupCache -PreCheckStats $PreCheckStats -IncludeEveryoneClaims $IncludeEveryoneClaims -Depth 0 -MaxDepth $MaxDepth -MaxExpandedPrincipals $MaxExpandedPrincipals
+        }
+    } catch {
+        Write-Log "Recursive pre-check: failed to read $ScopeType role assignments on '$SiteWebUrl': $($_.Exception.Message)" "WARN"
+    }
+
+    return [PSCustomObject]@{
+        AllowedUsers  = $allowedUsers
+        AllowAllUsers = [bool]$state.AllowAllUsers
+    }
 }
 
 function Get-AccessToken {
@@ -396,13 +712,17 @@ function New-GraphQuery {
                     $Data = $Null; $Data = (Invoke-RestMethod -Uri $nextURL -Method $Method -Headers $headers -Body $Body -ContentType $ContentType -Verbose:$False -ErrorAction Stop -UserAgent "ISV|LiebenConsultancy|M365AutoLink|3.0")
                     $attempts = $MaxAttempts
                 }catch {
-                    if($_.Exception.Message -like "*404*" -or $_.Exception.Message -like "*Request_ResourceNotFound*" -or $_.Exception.Message -like "*Resource*does not exist*" -or $_.Exception.Message -like "*403*" -or $_.Exception.StatusCode -in (401,403,"Unauthorized",404,"NotFound")){
+                    if($_.Exception.Message -like "*404*" -or $_.Exception.Message -like "*Request_ResourceNotFound*" -or $_.Exception.Message -like "*Resource*does not exist*" -or $_.Exception.Message -like "*403*" -or $_.Exception.Message -like "*409*" -or $_.Exception.StatusCode -in (401,403,409,"Unauthorized",404,"NotFound","Conflict")){
                         $nextUrl = $Null
                         throw $_
                     }
-                    $is429 = $_.Exception.Response.StatusCode -eq 429 -or $_.Exception.Message -like "*429*"
+                    $statusCode = $null
+                    try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+                    $is429 = $statusCode -eq 429 -or $_.Exception.Message -like "*429*"
+                    $is5xx = $statusCode -in 500,502,503,504 -or $_.Exception.Message -like "*500*" -or $_.Exception.Message -like "*502*" -or $_.Exception.Message -like "*503*" -or $_.Exception.Message -like "*504*"
                     # 429s always retry indefinitely — do not count against MaxAttempts
                     if ($is429) { $attempts-- }
+                    if ($is5xx -and $attempts -lt $MaxAttempts) { $attempts-- }
                     if ($attempts -ge $MaxAttempts) {
                         Throw $_
                     }
@@ -421,13 +741,17 @@ function New-GraphQuery {
                         }catch {}
                         if($delay -le 0) { $delay = [math]::Min(120, [math]::Pow(5, [math]::Max(1, $attempts))) }
                     }
+                    if($delay -le 0 -and $is5xx){
+                        $delay = [math]::Min(120, [math]::Pow(2, [math]::Max(1, $attempts)) + (Get-Random -Minimum 1 -Maximum 6))
+                    }
                     if($delay -le 0 -and $isTransientNetwork){
                         $delay = [math]::Min(10, 2 * $attempts)
                     }
                     if($delay -le 0){
                         $delay = [math]::Pow(5, $attempts)
                     }
-                    $null = Write-Log "[WARNING] Transient error on attempt $attempts/$MaxAttempts, retrying in $($delay)s: $($_.Exception.Message)" -ForegroundColor Yellow
+                    $apiFamily = if($isSharePoint) { 'SharePoint' } else { 'Graph' }
+                    $null = Write-Log "[$apiFamily] [WARNING] Transient error on attempt $attempts/$MaxAttempts, retrying in $($delay)s: $($_.Exception.Message)" -ForegroundColor Yellow
                     Start-Sleep -Seconds (1 + $delay)
                 }
             }
@@ -452,14 +776,18 @@ function New-GraphQuery {
                         $Data = $Null; $Data = (Invoke-RestMethod -Uri $nextURL -Method $Method -Headers $headers -ContentType $ContentType -Verbose:$False -ErrorAction Stop -UserAgent "ISV|LiebenConsultancy|M365AutoLink|3.0")
                         $attempts = $MaxAttempts
                     }catch {
-                        if(($_.Exception -and $_.Exception.StatusCode -and $_.Exception.StatusCode -in (401,403,"Unauthorized",404,"NotFound")) -or ($_.Exception.Message -like "*404*" -or $_.Exception.Message -like "*403*" -or $_.Exception.Message -like "*Request_ResourceNotFound*" -or $_.Exception.Message -like "*Resource*does not exist*")){
+                        if(($_.Exception -and $_.Exception.StatusCode -and $_.Exception.StatusCode -in (401,403,409,"Unauthorized",404,"NotFound","Conflict")) -or ($_.Exception.Message -like "*404*" -or $_.Exception.Message -like "*403*" -or $_.Exception.Message -like "*409*" -or $_.Exception.Message -like "*Request_ResourceNotFound*" -or $_.Exception.Message -like "*Resource*does not exist*")){
                             $nextUrl = $Null
                             throw $_
                         }
 
-                        $is429 = $_.Exception.Response.StatusCode -eq 429 -or $_.Exception.Message -like "*429*"
+                        $statusCode = $null
+                        try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+                        $is429 = $statusCode -eq 429 -or $_.Exception.Message -like "*429*"
+                        $is5xx = $statusCode -in 500,502,503,504 -or $_.Exception.Message -like "*500*" -or $_.Exception.Message -like "*502*" -or $_.Exception.Message -like "*503*" -or $_.Exception.Message -like "*504*"
                         # 429s always retry indefinitely — do not count against MaxAttempts
                         if ($is429) { $attempts-- }
+                        if ($is5xx -and $attempts -lt $MaxAttempts) { $attempts-- }
                         if ($attempts -ge $MaxAttempts) {
                             $nextURL = $null
                             Throw $_
@@ -479,13 +807,17 @@ function New-GraphQuery {
                             }catch {}
                             if($delay -le 0) { $delay = [math]::Min(120, [math]::Pow(5, [math]::Max(1, $attempts))) }
                         }
+                        if($delay -le 0 -and $is5xx){
+                            $delay = [math]::Min(120, [math]::Pow(2, [math]::Max(1, $attempts)) + (Get-Random -Minimum 1 -Maximum 6))
+                        }
                         if($delay -le 0 -and $isTransientNetwork){
                             $delay = [math]::Min(10, 2 * $attempts)
                         }
                         if($delay -le 0){
                             $delay = [math]::Pow(5, $attempts)
                         }
-                        $null = Write-Log "[WARNING] Transient error on attempt $attempts/$MaxAttempts, retrying in $($delay)s: $($_.Exception.Message)" -ForegroundColor Yellow
+                        $apiFamily = if($nextURL -match "sharepoint") { 'SharePoint' } else { 'Graph' }
+                        $null = Write-Log "[$apiFamily] [WARNING] Transient error on attempt $attempts/$MaxAttempts, retrying in $($delay)s: $($_.Exception.Message)" -ForegroundColor Yellow
                         Start-Sleep -Seconds (1 + $delay)
                     }
                 }
@@ -506,6 +838,11 @@ function New-GraphQuery {
                             }
                         }
                     }
+                }
+
+                if($null -eq $Data) {
+                    $nextURL = $null
+                    continue
                 }
 
                 $pageItems = $null
@@ -552,6 +889,15 @@ function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $line = "[$timestamp] [$Level] $Message"
+    if($global:IsAzureAutomation -and $global:octo -and $global:octo.RunspaceLogBuffer) {
+        $global:octo.RunspaceLogBuffer.Add(@{
+            Timestamp = $timestamp
+            Level     = $Level
+            Message   = $Message
+            Line      = $line
+        })
+        return
+    }
     if($global:IsAzureAutomation) {
         # Write-Host is not supported in Azure Automation.
         Write-Output $line
@@ -566,56 +912,6 @@ function Write-Log {
     }
 }
 
-
-#endregion
-
-#region Cache Functions
-
-function Load-PermissionCache {
-    param([string]$Path, [int]$MaxAgeHours)
-    $cache = @{}
-    if(-not (Test-Path $Path)) { return $cache }
-    try {
-        $rawJson = Get-Content -Path $Path -Raw -ErrorAction Stop
-        $rawData = $rawJson | ConvertFrom-Json -ErrorAction Stop
-        $cutoff = (Get-Date).AddHours(-$MaxAgeHours)
-        foreach($prop in $rawData.PSObject.Properties) {
-            $entry = $prop.Value
-            $checkedAt = [datetime]::Parse($entry.checkedAt)
-            if($checkedAt -gt $cutoff) {
-                $cache[$prop.Name] = @{
-                    hasAccess = [bool]$entry.hasAccess
-                    checkedAt = $checkedAt
-                }
-            }
-        }
-        return $cache
-    } catch {
-        $null = Write-Log "  Warning: Could not load permission cache from '$Path': $($_.Exception.Message)" "WARN"
-        return @{}
-    }
-}
-
-function Save-PermissionCache {
-    param([hashtable]$Cache, [string]$Path)
-    try {
-        $exportObj = [ordered]@{}
-        foreach($key in $Cache.Keys) {
-            $exportObj[$key] = @{
-                hasAccess = $Cache[$key].hasAccess
-                checkedAt = $Cache[$key].checkedAt.ToString("o")
-            }
-        }
-        $exportObj | ConvertTo-Json -Depth 3 -Compress | Set-Content -Path $Path -Force -ErrorAction Stop
-    } catch {
-        $null = Write-Log "  Warning: Could not save permission cache to '$Path': $($_.Exception.Message)" "WARN"
-    }
-}
-
-function Get-CacheKey {
-    param([string]$UserUPN, [string]$SiteWebUrl, [string]$ListId)
-    return "$($UserUPN)|$($SiteWebUrl)|$($ListId)"
-}
 
 #endregion
 
@@ -721,10 +1017,20 @@ function Invoke-SharePointBatch {
                     }
                 }
 
-                # Fallback: if segment splitting didn't isolate JSON, search the raw part with regex
+                # Fallback: if segment splitting didn't isolate JSON, extract payload from first JSON token onward
                 if($null -eq $jsonBody) {
-                    if($part -match '(\{[^{}]*("High"|"Low"|"GetUserEffectivePermissions"|"error"|"value")[^{}]*\})') {
-                        $jsonBody = $Matches[1]
+                    $firstBrace = $part.IndexOf('{')
+                    $firstBracket = $part.IndexOf('[')
+                    $startIdx = -1
+                    if($firstBrace -ge 0 -and $firstBracket -ge 0) {
+                        $startIdx = [math]::Min($firstBrace, $firstBracket)
+                    } elseif($firstBrace -ge 0) {
+                        $startIdx = $firstBrace
+                    } elseif($firstBracket -ge 0) {
+                        $startIdx = $firstBracket
+                    }
+                    if($startIdx -ge 0) {
+                        $jsonBody = $part.Substring($startIdx).Trim()
                     }
                 }
 
@@ -771,7 +1077,7 @@ function Invoke-SharePointBatch {
             } else {
                 $delay = [math]::Pow(5, $attempts)
             }
-            $null = Write-Log "[WARNING] Batch request to '$SiteUrl' failed on attempt $attempts/$MaxAttempts, retrying in $($delay)s: $($_.Exception.Message)" "WARN"
+            $null = Write-Log "[SharePoint] [WARNING] Batch request to '$SiteUrl' failed on attempt $attempts/$MaxAttempts, retrying in $($delay)s: $($_.Exception.Message)" "WARN"
             Start-Sleep -Seconds (1 + $delay)
         }
     }
@@ -792,9 +1098,8 @@ try {
     }
 
     Write-Log "=== M365AutoLink Centralized v3.0 (Optimized) Started ===" "INFO"
-    Write-Log "Optimizations: SP Batch ($BatchSize/batch) | Adaptive Throttle ($InitialParallelLimit-$MaxParallelLimit) | Cache ($($EnableCache ? 'ON' : 'OFF'), ${CacheMaxAgeHours}h)" "INFO"
+    Write-Log "Optimizations: SP Batch ($BatchSize/batch) | Adaptive Throttle ($InitialParallelLimit-$MaxParallelLimit) | Shortcut Actions ($ShortcutActionParallelLimit threads)" "INFO"
     if($DryRun) { Write-Log "*** DRY RUN MODE — no changes will be made ***" "WARN" }
-    if($ForceFullScan) { Write-Log "*** FORCE FULL SCAN — cache ignored ***" "WARN" }
 
     [void] [System.Reflection.Assembly]::LoadWithPartialName("System.Web")
 
@@ -890,6 +1195,15 @@ try {
     }
     Write-Log "Pre-filtered to $($filteredSites.Count) sites after inclusion/exclusion patterns" "INFO"
 
+    if($MaxSitesToProcessForTesting -gt 0 -and $filteredSites.Count -gt $MaxSitesToProcessForTesting) {
+        $limitedSites = [System.Collections.Generic.List[object]]::new()
+        for($i = 0; $i -lt $MaxSitesToProcessForTesting; $i++) {
+            $limitedSites.Add($filteredSites[$i])
+        }
+        $filteredSites = $limitedSites
+        Write-Log "Test limiter active: restricting run to first $MaxSitesToProcessForTesting filtered sites" "WARN"
+    }
+
     # Enumerate document libraries in parallel using adaptive throttle
     Write-Log "Enumerating document libraries (adaptive throttle: $InitialParallelLimit initial, $MaxParallelLimit max)..." "INFO"
 
@@ -905,6 +1219,8 @@ try {
 
     $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $MaxParallelLimit, $iss, $Host)
     $pool.Open()
+
+    try {
 
     $graphUrlValue = $global:octo.graphUrl
     $idpUrlValue = $global:octo.idpUrl
@@ -926,6 +1242,7 @@ try {
             idpUrl         = $idpUrl
             sharepointUrl  = $sharepointUrl
             LCCachedTokens = $seedTokens
+            RunspaceLogBuffer = [System.Collections.Generic.List[hashtable]]::new()
         }
         [void][System.Reflection.Assembly]::LoadWithPartialName("System.Web")
 
@@ -968,10 +1285,14 @@ try {
                     continue
                 }
 
+                $libKey = "$($siteInfo.webUrl)|$($list.id)"
+
                 $result.Libraries.Add(@{
+                    libKey          = $libKey
                     siteId          = $siteInfo.id
                     siteDisplayName = $siteInfo.displayName
                     siteWebUrl      = $siteInfo.webUrl
+                    siteGroupId     = $result.GroupId
                     listId          = $list.id
                     listDisplayName = $list.displayName
                     shortcutInfo    = @{
@@ -988,6 +1309,12 @@ try {
             $result.LogMessages.Add(@{ Message = "Failed to process site '$($siteInfo.webUrl)': $($_.Exception.Message)"; Level = "WARN" })
         }
 
+        if($global:octo.RunspaceLogBuffer -and $global:octo.RunspaceLogBuffer.Count -gt 0) {
+            foreach($entry in $global:octo.RunspaceLogBuffer) {
+                $result.LogMessages.Add($entry)
+            }
+        }
+
         return $result
     }
 
@@ -995,6 +1322,8 @@ try {
     $activeSemaphore = [System.Threading.SemaphoreSlim]::new($InitialParallelLimit, $MaxParallelLimit)
     $currentLimit = $InitialParallelLimit
     $throttleHitCount = 0
+    $graphThrottleHitCount = 0
+    $sharePointThrottleHitCount = 0
     $completedSinceAdjust = 0
     $phase1Total429s = 0
     $phase1TotalApiCalls = 0
@@ -1022,6 +1351,10 @@ try {
                             foreach($r in $jobResult) {
                                 if($r.LogMessages) {
                                     foreach($log in $r.LogMessages) { Write-Log "  $($log.Message)" $log.Level }
+                                    foreach($log in $r.LogMessages) {
+                                        if($log.Message -match '\[Graph\].*429') { $throttleHitCount++; $graphThrottleHitCount++; $phase1Total429s++ }
+                                        elseif($log.Message -match '\[SharePoint\].*429') { $throttleHitCount++; $sharePointThrottleHitCount++; $phase1Total429s++ }
+                                    }
                                 }
                                 if($r.Libraries -and $r.Libraries.Count -gt 0) {
                                     $allSiteLibraries.AddRange([hashtable[]]$r.Libraries)
@@ -1035,10 +1368,7 @@ try {
                                 if($err.Exception.Message -like "*429*") { $throttleHitCount++; $phase1Total429s++ }
                             }
                         }
-                        # Count 429 retries from Information stream (Write-Host output from New-GraphQuery retries)
-                        foreach($info in $jobs[$i].PowerShell.Streams.Information) {
-                            if($info.MessageData -like "*429*") { $throttleHitCount++; $phase1Total429s++ }
-                        }
+                        # Count 429 retries from buffered log messages returned by the runspace
                     } catch {
                         Write-Log "  Error collecting result for '$($jobs[$i].SiteUrl)': $($_.Exception.Message)" "WARN"
                     }
@@ -1081,6 +1411,10 @@ try {
                         foreach($r in $jobResult) {
                             if($r.LogMessages) {
                                 foreach($log in $r.LogMessages) { Write-Log "  $($log.Message)" $log.Level }
+                                foreach($log in $r.LogMessages) {
+                                    if($log.Message -match '\[Graph\].*429') { $throttleHitCount++; $graphThrottleHitCount++; $phase1Total429s++ }
+                                    elseif($log.Message -match '\[SharePoint\].*429') { $throttleHitCount++; $sharePointThrottleHitCount++; $phase1Total429s++ }
+                                }
                             }
                             if($r.Libraries -and $r.Libraries.Count -gt 0) {
                                 $allSiteLibraries.AddRange([hashtable[]]$r.Libraries)
@@ -1095,10 +1429,7 @@ try {
                             if($err.Exception.Message -like "*429*") { $throttleHitCount++; $phase1Total429s++ }
                         }
                     }
-                    # Count 429 retries from Information stream (Write-Host output from New-GraphQuery retries)
-                    foreach($info in $jobs[$i].PowerShell.Streams.Information) {
-                        if($info.MessageData -like "*429*") { $throttleHitCount++; $phase1Total429s++ }
-                    }
+                    # Buffered logs already accounted for above.
                 } catch {
                     Write-Log "  Error collecting result for '$($jobs[$i].SiteUrl)': $($_.Exception.Message)" "WARN"
                 }
@@ -1107,15 +1438,18 @@ try {
 
                 # Adaptive throttle adjustment every 50 completed jobs
                 if($completedSinceAdjust -ge 50) {
-                    $throttleRate = $throttleHitCount / $completedSinceAdjust
-                    if($throttleRate -gt 0.1 -and $currentLimit -gt 2) {
-                        $newLimit = [math]::Max(2, [math]::Floor($currentLimit * 0.5))
+                    $graphThrottleRate = $graphThrottleHitCount / $completedSinceAdjust
+                    $sharePointThrottleRate = $sharePointThrottleHitCount / $completedSinceAdjust
+                    $throttleRate = ($graphThrottleRate + $sharePointThrottleRate)
+                    if(($graphThrottleRate -gt 0.1 -or $sharePointThrottleRate -gt 0.1) -and $currentLimit -gt 2) {
+                        $reductionFactor = if($graphThrottleRate -gt 0.1 -and $sharePointThrottleRate -gt 0.1) { 0.5 } else { 0.75 }
+                        $newLimit = [math]::Max(2, [math]::Floor($currentLimit * $reductionFactor))
                         $reduction = $currentLimit - $newLimit
                         for($r = 0; $r -lt $reduction; $r++) {
                             [void]$activeSemaphore.Wait(0)
                         }
                         $currentLimit = $newLimit
-                        Write-Log "  Adaptive throttle: reducing to $currentLimit concurrent (429 rate: $([math]::Round($throttleRate * 100))%)" "WARN"
+                        Write-Log "  Adaptive throttle: reducing to $currentLimit concurrent (Graph 429: $([math]::Round($graphThrottleRate * 100))%, SharePoint 429: $([math]::Round($sharePointThrottleRate * 100))%)" "WARN"
                     } elseif($throttleRate -eq 0 -and $currentLimit -lt $MaxParallelLimit) {
                         $increase = [math]::Min(2, $MaxParallelLimit - $currentLimit)
                         $currentLimit += $increase
@@ -1126,6 +1460,8 @@ try {
                         Write-Log "  Adaptive throttle: increasing to $currentLimit concurrent (no 429s)" "INFO"
                     }
                     $throttleHitCount = 0
+                    $graphThrottleHitCount = 0
+                    $sharePointThrottleHitCount = 0
                     $completedSinceAdjust = 0
                 }
             }
@@ -1133,11 +1469,12 @@ try {
         if($jobs.Count -gt 0) { Start-Sleep -Milliseconds 100 }
     }
 
-    $pool.Close()
-    $pool.Dispose()
-    $activeSemaphore.Dispose()
-
     Write-Progress -Id 0 -Activity "Phase 1: Enumerating sites" -Completed
+
+    } finally {
+        if($pool) { $pool.Close(); $pool.Dispose() }
+        if($activeSemaphore) { $activeSemaphore.Dispose() }
+    }
 
     # Deduplicate libraries (Graph pagination or runspace collection can produce duplicates)
     $beforeDedup = $allSiteLibraries.Count
@@ -1153,6 +1490,7 @@ try {
     }
 
     Write-Log "Pre-cached $($allSiteLibraries.Count) document libraries across $filteredSiteCount sites" "SUCCESS"
+    Write-Log "Phase 1 throttling: Graph 429s=$graphThrottleHitCount | SharePoint 429s=$sharePointThrottleHitCount" "INFO"
     Write-Log "Minimum permission level for shortcuts: $MinimumPermissionLevel" "INFO"
 
     $phaseTimings['Phase 1: Site & library discovery'] = $phaseStopwatch.Elapsed
@@ -1162,13 +1500,6 @@ try {
     # ============================================================
     $phaseStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     Write-Log "--- Phase 2: Building permission matrix (site-centric, batched) ---" "INFO"
-
-    # Load cache if enabled
-    $permissionCache = @{}
-    if($EnableCache -and -not $ForceFullScan) {
-        $permissionCache = Load-PermissionCache -Path $CachePath -MaxAgeHours $CacheMaxAgeHours
-        Write-Log "Loaded $($permissionCache.Count) cached permission entries (max age: ${CacheMaxAgeHours}h)" "INFO"
-    }
 
     # Group libraries by site for batching
     $siteLibGroups = @{}
@@ -1185,6 +1516,33 @@ try {
     $permissionMatrix = @{} # "userUPN" → List of library hashtables (shortcut info)
     foreach($u in $targetUserList) {
         $permissionMatrix[$u.userPrincipalName] = [System.Collections.Generic.List[hashtable]]::new()
+    }
+
+    $targetUserByUpn = @{}
+    $targetUserById = @{}
+    foreach($u in $targetUserList) {
+        if(-not [string]::IsNullOrWhiteSpace($u.userPrincipalName)) {
+            $targetUserByUpn[$u.userPrincipalName.ToLowerInvariant()] = $u.userPrincipalName
+        }
+        if(-not [string]::IsNullOrWhiteSpace($u.id)) {
+            $targetUserById[$u.id.ToLowerInvariant()] = $u.userPrincipalName
+        }
+    }
+
+    $preCheckStats = @{
+        SiteScopeHits    = 0
+        ListScopeHits    = 0
+        PreAllowedPairs  = 0
+        FallbackPairs    = 0
+        CacheHits        = 0
+        CacheMisses      = 0
+        RecursionCutoffs = 0
+    }
+
+    if($EnableRecursivePermissionPreCheck) {
+        Write-Log "Recursive pre-check enabled: site/list owner-member expansion + Entra group caching" "INFO"
+    } else {
+        Write-Log "Recursive pre-check disabled: using full getUserEffectivePermissions matrix path" "INFO"
     }
 
     # Adaptive throttle for batch requests (reset for Phase 2)
@@ -1206,6 +1564,8 @@ try {
     $batchPool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $MaxParallelLimit, $batchIss, $Host)
     $batchPool.Open()
     $batchSemaphore = [System.Threading.SemaphoreSlim]::new($InitialParallelLimit, $MaxParallelLimit)
+
+    try {
 
     # Pre-fetch tokens for Phase 2 runspaces
     $graphToken2 = Get-AccessToken -resource $global:octo.graphUrl
@@ -1233,6 +1593,7 @@ try {
             idpUrl         = $idpUrl
             sharepointUrl  = $sharepointUrl
             LCCachedTokens = $seedTokens
+            RunspaceLogBuffer = [System.Collections.Generic.List[hashtable]]::new()
         }
         [void][System.Reflection.Assembly]::LoadWithPartialName("System.Web")
 
@@ -1290,10 +1651,26 @@ try {
                             $hasAccess = $false
                         } elseif($batchResult.StatusCode -eq 429) {
                             $throttleHits++
-                            # Don't record — will be retried on next run via cache miss
-                            $logMessages.Add(@{ Message = "429 throttled for user '$($sub.UserUPN)' on list '$($sub.ListId)' at '$siteWebUrl'"; Level = "WARN" })
-                            $resultIndex++
-                            continue
+                            $logMessages.Add(@{ Message = "429 throttled for user '$($sub.UserUPN)' on list '$($sub.ListId)' at '$siteWebUrl' - retrying individually"; Level = "WARN" })
+
+                            # Retry this specific check immediately (bounded by New-GraphQuery retry behavior)
+                            try {
+                                $encodedUPN = "i%3A0%23.f%7Cmembership%7C$($sub.UserUPN)"
+                                $effectivePermissions = New-GraphQuery -Uri "$siteWebUrl/_api/web/lists/GetById('$($sub.ListId)')/getUserEffectivePermissions(@u)?@u='$encodedUPN'" -Method GET -MaxAttempts 3
+                                $permData = $effectivePermissions
+                                if($null -ne $permData.d) { $permData = $permData.d }
+                                if($null -ne $permData.GetUserEffectivePermissions) { $permData = $permData.GetUserEffectivePermissions }
+                                if($null -ne $permData.Low) {
+                                    $hasView = ([long]$permData.Low -band 0x1) -ne 0
+                                    $hasEdit = ([long]$permData.Low -band 0x4) -ne 0
+                                    $hasAccess = if($minPermLevel -eq "Edit") { $hasEdit } else { $hasView }
+                                } else {
+                                    $hasAccess = $false
+                                }
+                            } catch {
+                                $logMessages.Add(@{ Message = "Individual retry after 429 failed for '$($sub.UserUPN)' on '$($sub.ListId)': $($_.Exception.Message)"; Level = "WARN" })
+                                $hasAccess = $false
+                            }
                         }
 
                         $results.Add(@{
@@ -1358,48 +1735,148 @@ try {
     # Now process site by site: for each site, determine which (user, library) pairs need checking
     $siteIndex = 0
     $siteTotal = $siteLibGroups.Count
-    $totalCacheHits = 0
     $totalBatchChecks = 0
     $phase2Total429s = 0
     $phase2CompletedJobs = 0
-    $lastPhase2MetricsLog = 0
 
     $batchJobs = [System.Collections.Generic.List[hashtable]]::new()
 
     foreach($siteWebUrl in $siteLibGroups.Keys) {
         $siteIndex++
         $siteLibs = $siteLibGroups[$siteWebUrl]
+        $sitePreAllowedPairCount = 0
+        $siteFallbackPairCount = 0
 
         Write-Progress -Id 0 -Activity "Phase 2: Checking permissions" -Status "$siteIndex/$siteTotal sites | concurrent: $batchCurrentLimit | batch: $BatchSize | 429s: $phase2Total429s | checks: $totalBatchChecks" -PercentComplete ([math]::Min(100, [math]::Round(($siteIndex / $siteTotal) * 100)))
 
-        # Build list of (user, library) pairs that need an actual API check
+        # Build list of (user, library) pairs that need an actual API check.
+        # Optional pre-check can short-circuit known access from recursive owner/member expansion.
         $checkPairs = [System.Collections.Generic.List[hashtable]]::new()
+        $sitePreAllowedUsers = Ensure-StringSet -Set (New-CaseInsensitiveStringSet)
+        $siteAllowAllUsers = $false
+
+        if($EnableRecursivePermissionPreCheck) {
+            $siteScope = Get-ScopeAllowedTargetUsers -SiteWebUrl $siteWebUrl -ScopeType Web -ListId $null -MinimumPermissionLevel $MinimumPermissionLevel -TargetUserByUpn $targetUserByUpn -TargetUserById $targetUserById -EntraGroupCache $global:octo.EntraGroupTargetMemberCache -PreCheckStats $preCheckStats -IncludeEveryoneClaims $PreCheckIncludeEveryoneClaims -MaxDepth $PreCheckMaxRecursionDepth -MaxExpandedPrincipals $PreCheckMaxExpandedPrincipals
+            if($siteScope) {
+                $sitePreAllowedUsers = Ensure-StringSet -Set $sitePreAllowedUsers
+                if($siteScope.AllowAllUsers) { $siteAllowAllUsers = $true }
+                foreach($upn in @($siteScope.AllowedUsers)) { [void]$sitePreAllowedUsers.Add($upn) }
+                $siteScopeResolvedCount = @($siteScope.AllowedUsers).Count
+                if($siteScope.AllowAllUsers -or $siteScopeResolvedCount -gt 0) { $preCheckStats.SiteScopeHits++ }
+                if($PreCheckVerboseDiagnostics) {
+                    Write-Log "Pre-check source '$siteWebUrl' [site-roles]: allowAll=$($siteScope.AllowAllUsers), resolvedUsers=$siteScopeResolvedCount" "INFO"
+                }
+            }
+
+            $siteGroupId = $null
+            foreach($sLib in $siteLibs) {
+                if(-not [string]::IsNullOrWhiteSpace($sLib.siteGroupId)) {
+                    $siteGroupId = $sLib.siteGroupId
+                    break
+                }
+            }
+
+            if(-not [string]::IsNullOrWhiteSpace($siteGroupId)) {
+                $sitePreAllowedUsers = Ensure-StringSet -Set $sitePreAllowedUsers
+                $groupMembers = Resolve-EntraGroupTargetUsers -GroupId $siteGroupId -TargetUserByUpn $targetUserByUpn -TargetUserById $targetUserById -EntraGroupCache $global:octo.EntraGroupTargetMemberCache -PreCheckStats $preCheckStats
+                foreach($upn in $groupMembers) { [void]$sitePreAllowedUsers.Add($upn) }
+                if($groupMembers.Count -gt 0) { $preCheckStats.SiteScopeHits++ }
+                if($PreCheckVerboseDiagnostics) {
+                    Write-Log "Pre-check source '$siteWebUrl' [site-group-members]: groupId=$siteGroupId, resolvedUsers=$($groupMembers.Count)" "INFO"
+                }
+
+                try {
+                    $groupOwners = @(New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/groups/$siteGroupId/owners?`$select=id,userPrincipalName" -Method GET -MaxAttempts 2)
+                    $ownerResolved = 0
+                    foreach($owner in $groupOwners) {
+                        $ownerUpn = $null
+                        try { $ownerUpn = [string]$owner.userPrincipalName } catch {}
+                        $ownerId = $null
+                        try { $ownerId = [string]$owner.id } catch {}
+                        if(Add-ResolvedTargetUserToSet -CandidateUpn $ownerUpn -CandidateId $ownerId -TargetUserByUpn $targetUserByUpn -TargetUserById $targetUserById -OutputSet $sitePreAllowedUsers) { $ownerResolved++ }
+
+                        $ownerType = ""
+                        try { $ownerType = [string]$owner.'@odata.type' } catch {}
+                        if($ownerType -eq '#microsoft.graph.group' -and -not [string]::IsNullOrWhiteSpace($ownerId)) {
+                            $nestedOwnerGroupMembers = Resolve-EntraGroupTargetUsers -GroupId $ownerId -TargetUserByUpn $targetUserByUpn -TargetUserById $targetUserById -EntraGroupCache $global:octo.EntraGroupTargetMemberCache -PreCheckStats $preCheckStats
+                            foreach($upn in $nestedOwnerGroupMembers) { [void]$sitePreAllowedUsers.Add($upn) }
+                            $ownerResolved += $nestedOwnerGroupMembers.Count
+                        }
+                    }
+                    if($PreCheckVerboseDiagnostics) {
+                        Write-Log "Pre-check source '$siteWebUrl' [site-group-owners]: ownersProcessed=$(@($groupOwners).Count), resolvedUsers=$ownerResolved" "INFO"
+                    }
+                } catch {
+                    Write-Log "Recursive pre-check: failed to read owners for site group '$siteGroupId': $($_.Exception.Message)" "WARN"
+                }
+            }
+        }
 
         foreach($lib in $siteLibs) {
-            foreach($user in $targetUserList) {
-                $cacheKey = Get-CacheKey -UserUPN $user.userPrincipalName -SiteWebUrl $siteWebUrl -ListId $lib.listId
+            $libKey = if(-not [string]::IsNullOrWhiteSpace($lib.libKey)) { $lib.libKey } else { "$($lib.siteWebUrl)|$($lib.listId)" }
 
-                # Check cross-run cache first (P4)
-                if($EnableCache -and -not $ForceFullScan -and $permissionCache.ContainsKey($cacheKey)) {
-                    $totalCacheHits++
-                    if($permissionCache[$cacheKey].hasAccess) {
-                        $permissionMatrix[$user.userPrincipalName].Add(@{
-                            shortCut = $lib.shortcutInfo
-                            siteName = $lib.siteDisplayName
-                            listName = $lib.listDisplayName
-                        })
+            $libPreAllowedUsers = New-CaseInsensitiveStringSet
+            $sitePreAllowedUsers = Ensure-StringSet -Set $sitePreAllowedUsers
+            $libPreAllowedUsers = Ensure-StringSet -Set $libPreAllowedUsers
+            foreach($upn in $sitePreAllowedUsers) { [void]$libPreAllowedUsers.Add($upn) }
+            $libAllowAllUsers = $siteAllowAllUsers
+
+            if($EnableRecursivePermissionPreCheck -and -not $siteAllowAllUsers) {
+                $listScope = Get-ScopeAllowedTargetUsers -SiteWebUrl $siteWebUrl -ScopeType List -ListId $lib.listId -MinimumPermissionLevel $MinimumPermissionLevel -TargetUserByUpn $targetUserByUpn -TargetUserById $targetUserById -EntraGroupCache $global:octo.EntraGroupTargetMemberCache -PreCheckStats $preCheckStats -IncludeEveryoneClaims $PreCheckIncludeEveryoneClaims -MaxDepth $PreCheckMaxRecursionDepth -MaxExpandedPrincipals $PreCheckMaxExpandedPrincipals
+                if($listScope) {
+                    $libPreAllowedUsers = Ensure-StringSet -Set $libPreAllowedUsers
+                    if($listScope.AllowAllUsers) { $libAllowAllUsers = $true }
+                    foreach($upn in @($listScope.AllowedUsers)) { [void]$libPreAllowedUsers.Add($upn) }
+                    $listScopeResolvedCount = @($listScope.AllowedUsers).Count
+                    if($listScope.AllowAllUsers -or $listScopeResolvedCount -gt 0) { $preCheckStats.ListScopeHits++ }
+                    if($PreCheckVerboseDiagnostics) {
+                        Write-Log "Pre-check source '$siteWebUrl' [list-roles:$($lib.listId)]: allowAll=$($listScope.AllowAllUsers), resolvedUsers=$listScopeResolvedCount" "INFO"
                     }
+                }
+            }
+
+            foreach($user in $targetUserList) {
+                $userUPN = $user.userPrincipalName
+                $isPreAllowedForLib = $false
+
+                if($EnableRecursivePermissionPreCheck) {
+                    if($libAllowAllUsers) {
+                        $isPreAllowedForLib = $true
+                    } elseif(
+                        -not [string]::IsNullOrWhiteSpace($userUPN) -and
+                        $null -ne $libPreAllowedUsers -and
+                        $libPreAllowedUsers -is [System.Collections.Generic.HashSet[string]]
+                    ) {
+                        $isPreAllowedForLib = $libPreAllowedUsers.Contains($userUPN)
+                    }
+                }
+
+                if($isPreAllowedForLib) {
+                    $permissionMatrix[$userUPN].Add(@{
+                        shortCut = $lib.shortcutInfo
+                        siteName = $lib.siteDisplayName
+                        listName = $lib.listDisplayName
+                    })
+                    $preCheckStats.PreAllowedPairs++
+                    $sitePreAllowedPairCount++
                     continue
                 }
 
-                # Need actual API check
                 $checkPairs.Add(@{
-                    userUPN = $user.userPrincipalName
+                    userUPN = $userUPN
                     listId  = $lib.listId
-                    libKey  = $cacheKey
+                    libKey  = $libKey
                     libInfo = $lib
                 })
+                if($EnableRecursivePermissionPreCheck) {
+                    $preCheckStats.FallbackPairs++
+                    $siteFallbackPairCount++
+                }
             }
+        }
+
+        if($EnableRecursivePermissionPreCheck -and $PreCheckVerboseDiagnostics) {
+            Write-Log "Pre-check diagnostics '$siteWebUrl': pre-allowed=$sitePreAllowedPairCount, fallback=$siteFallbackPairCount, siteAllowAll=$siteAllowAllUsers" "INFO"
         }
 
         if($checkPairs.Count -eq 0) { continue }
@@ -1423,7 +1900,6 @@ try {
                                 if($bjr.ThrottleHits) { $batchThrottleHits += $bjr.ThrottleHits; $phase2Total429s += $bjr.ThrottleHits }
                                 if($bjr.Results) {
                                     foreach($pr in $bjr.Results) {
-                                        $permissionCache[$pr.LibKey] = @{ hasAccess = $pr.HasAccess; checkedAt = Get-Date }
                                         if($pr.HasAccess) {
                                             $matchingPair = $batchJobs[$ji].CheckPairs | Where-Object { $_.libKey -eq $pr.LibKey } | Select-Object -First 1
                                             if($matchingPair -and $matchingPair.libInfo) {
@@ -1491,8 +1967,6 @@ try {
                             if($bjr.ThrottleHits) { $batchThrottleHits += $bjr.ThrottleHits; $phase2Total429s += $bjr.ThrottleHits }
                             if($bjr.Results) {
                                 foreach($pr in $bjr.Results) {
-                                    # Update cache
-                                    $permissionCache[$pr.LibKey] = @{ hasAccess = $pr.HasAccess; checkedAt = Get-Date }
                                     if($pr.HasAccess) {
                                         # Find the lib info from checkPairs
                                         $matchingPair = $batchJobs[$ji].CheckPairs | Where-Object { $_.libKey -eq $pr.LibKey } | Select-Object -First 1
@@ -1515,7 +1989,8 @@ try {
                     }
                     # Count 429 retries from Information stream (Write-Host output from Invoke-SharePointBatch retries)
                     foreach($info in $batchJobs[$ji].PowerShell.Streams.Information) {
-                        if($info.MessageData -like "*429*") { $batchThrottleHits++; $phase2Total429s++ }
+                        if($info.MessageData -like "*[SharePoint]*429*") { $batchThrottleHits++; $phase2Total429s++ }
+                        elseif($info.MessageData -like "*429*") { $batchThrottleHits++; $phase2Total429s++ }
                     }
                 } catch {
                     Write-Log "  Error collecting batch result for '$($batchJobs[$ji].SiteUrl)': $($_.Exception.Message)" "WARN"
@@ -1567,7 +2042,6 @@ try {
                             if($bjr.ThrottleHits) { $batchThrottleHits += $bjr.ThrottleHits; $phase2Total429s += $bjr.ThrottleHits }
                             if($bjr.Results) {
                                 foreach($pr in $bjr.Results) {
-                                    $permissionCache[$pr.LibKey] = @{ hasAccess = $pr.HasAccess; checkedAt = Get-Date }
                                     if($pr.HasAccess) {
                                         $matchingPair = $batchJobs[$ji].CheckPairs | Where-Object { $_.libKey -eq $pr.LibKey } | Select-Object -First 1
                                         if($matchingPair -and $matchingPair.libInfo) {
@@ -1584,7 +2058,8 @@ try {
                     }
                     # Count 429 retries from Information stream (Write-Host output from Invoke-SharePointBatch retries)
                     foreach($info in $batchJobs[$ji].PowerShell.Streams.Information) {
-                        if($info.MessageData -like "*429*") { $batchThrottleHits++; $phase2Total429s++ }
+                        if($info.MessageData -like "*[SharePoint]*429*") { $batchThrottleHits++; $phase2Total429s++ }
+                        elseif($info.MessageData -like "*429*") { $batchThrottleHits++; $phase2Total429s++ }
                     }
                 } catch {
                     Write-Log "  Error collecting batch result for '$($batchJobs[$ji].SiteUrl)': $($_.Exception.Message)" "WARN"
@@ -1599,26 +2074,24 @@ try {
         if($batchJobs.Count -gt 0) { Start-Sleep -Milliseconds 100 }
     }
 
-    $batchPool.Close()
-    $batchPool.Dispose()
-    $batchSemaphore.Dispose()
-
     Write-Progress -Id 0 -Activity "Phase 2: Checking permissions" -Completed
 
-    # Save updated cache
-    if($EnableCache) {
-        Save-PermissionCache -Cache $permissionCache -Path $CachePath
-        Write-Log "Saved $($permissionCache.Count) permission entries to cache" "SUCCESS"
+    } finally {
+        if($batchPool) { $batchPool.Close(); $batchPool.Dispose() }
+        if($batchSemaphore) { $batchSemaphore.Dispose() }
     }
 
     $totalPairs = $targetUserList.Count * $allSiteLibraries.Count
     Write-Log "Permission matrix complete:" "SUCCESS"
     Write-Log "  Total user×library pairs: $totalPairs" "INFO"
-    Write-Log "  Cache hits (skipped): $totalCacheHits" "INFO"
     Write-Log "  Actual API checks (batched): $totalBatchChecks" "INFO"
-    $savingsPercent = if($totalPairs -gt 0) { [math]::Round(($totalCacheHits / $totalPairs) * 100, 1) } else { 0 }
-    Write-Log "  API calls saved: $savingsPercent%" "SUCCESS"
-
+    if($EnableRecursivePermissionPreCheck) {
+        Write-Log "  Pre-allowed pairs (site/list/group recursion): $($preCheckStats.PreAllowedPairs)" "INFO"
+        Write-Log "  Fallback pairs (effective permission API): $($preCheckStats.FallbackPairs)" "INFO"
+        Write-Log "  Scope hits - site: $($preCheckStats.SiteScopeHits), list: $($preCheckStats.ListScopeHits)" "INFO"
+        Write-Log "  Entra group cache - hits: $($preCheckStats.CacheHits), misses: $($preCheckStats.CacheMisses), entries: $($global:octo.EntraGroupTargetMemberCache.Count)" "INFO"
+        Write-Log "  Recursion cutoffs (depth/node guards): $($preCheckStats.RecursionCutoffs)" "INFO"
+    }
     $phaseTimings['Phase 2: Permission matrix'] = $phaseStopwatch.Elapsed
 
     # ============================================================
@@ -1699,13 +2172,49 @@ try {
                 $targetFolder = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/users/$userId/drive/root:/$($FolderName)?`$expand=listItem" -Method "GET"
             }
 
+            if(-not $targetFolder -or -not $targetFolder.listItem -or [string]::IsNullOrWhiteSpace($targetFolder.listItem.webUrl)) {
+                Write-Log "  Could not resolve OneDrive folder webUrl metadata, skipping user..." "WARN"
+                $totalStats.UsersSkipped++
+                continue
+            }
+
             # Determine root OneDrive URL
             $urlParts = $targetFolder.listItem.webUrl -split "/personal/"
+            if($urlParts.Count -lt 2) {
+                Write-Log "  Unexpected OneDrive URL format '$($targetFolder.listItem.webUrl)', skipping user..." "WARN"
+                $totalStats.UsersSkipped++
+                continue
+            }
             $rootUrl = $urlParts[0]
-            $userComponent = $urlParts[1].Split('/')[0]
-            $libraryName = $urlParts[1].Split('/')[1]
+            $relativeParts = $urlParts[1].Split('/')
+            if($relativeParts.Count -lt 2 -or [string]::IsNullOrWhiteSpace($relativeParts[0]) -or [string]::IsNullOrWhiteSpace($relativeParts[1])) {
+                Write-Log "  Could not parse OneDrive personal path components from '$($targetFolder.listItem.webUrl)', skipping user..." "WARN"
+                $totalStats.UsersSkipped++
+                continue
+            }
+            $userComponent = $relativeParts[0]
+            $libraryName = $relativeParts[1]
+
+            if(-not $targetFolder.parentReference -or [string]::IsNullOrWhiteSpace($targetFolder.parentReference.siteId)) {
+                Write-Log "  Missing parentReference.siteId for OneDrive folder, skipping user..." "WARN"
+                $totalStats.UsersSkipped++
+                continue
+            }
 
             $docLibrary = (New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/sites/$($targetFolder.parentReference.siteId)/lists" -Method "GET") | Where-Object { $_.list.template -eq "mySiteDocumentLibrary" -and !$_.list.hidden}
+            $docLibrary = @($docLibrary) | Select-Object -First 1
+            if(-not $docLibrary -or [string]::IsNullOrWhiteSpace($docLibrary.id)) {
+                Write-Log "  Could not resolve personal document library metadata, skipping user..." "WARN"
+                $totalStats.UsersSkipped++
+                continue
+            }
+
+            $graphTokenPhase3 = Get-AccessToken -resource $global:octo.graphUrl
+            $spTokenPhase3 = Get-AccessToken -resource $global:octo.sharepointUrl
+            $preSeededTokensPhase3 = @{
+                $global:octo.graphUrl = @{ accessToken = $graphTokenPhase3; validFrom = Get-Date }
+                $global:octo.sharepointUrl = @{ accessToken = $spTokenPhase3; validFrom = Get-Date }
+            }
 
             $currentShortCuts = @()
 
@@ -1723,15 +2232,73 @@ try {
                 }
             }
 
-            foreach($shortCut in $folderContents){
-                $shortCutMetaData = (New-GraphQuery -Uri "$rootUrl/personal/$userComponent/_api/web/lists('$($docLibrary.id)')/GetItemByUniqueId('$($shortCut.UniqueId)')?`$expand=FieldValuesAsText" -Method GET -MaxAttempts 5)
-                $currentShortCuts += @{
-                    "ID" = $shortCut.uniqueId
-                    "Name" = $shortCutMetaData.FieldValuesAsText.FileLeafRef
-                    "targetSiteId" = $shortCutMetaData.FieldValuesAsText.A2ODRemoteItemSiteId
-                    "targetWebId" = $shortCutMetaData.FieldValuesAsText.A2ODRemoteItemWebId
-                    "targetListId" = $shortCutMetaData.FieldValuesAsText.A2ODRemoteItemListId
-                    "targetItemUniqueId" = $shortCutMetaData.FieldValuesAsText.A2ODRemoteItemUniqueId
+            if(@($folderContents).Count -gt 0) {
+                $shortcutsWithIds = @($folderContents | Where-Object { $_.UniqueId })
+                for($si = 0; $si -lt $shortcutsWithIds.Count; $si += $BatchSize) {
+                    $chunk = @($shortcutsWithIds[$si..([math]::Min($si + $BatchSize - 1, $shortcutsWithIds.Count - 1))])
+                    $metaRequests = [System.Collections.Generic.List[object]]::new()
+                    foreach($sc in $chunk) {
+                        $metaRequests.Add(@{
+                            ShortcutId  = [string]$sc.UniqueId
+                            RelativeUrl = "_api/web/lists('$($docLibrary.id)')/GetItemByUniqueId('$($sc.UniqueId)')?`$expand=FieldValuesAsText"
+                        })
+                    }
+
+                    try {
+                        $metaBatchResults = Invoke-SharePointBatch -SiteUrl "$rootUrl/personal/$userComponent" -SubRequests $metaRequests.ToArray() -MaxAttempts 3
+                        for($ri = 0; $ri -lt $metaRequests.Count; $ri++) {
+                            $req = $metaRequests[$ri]
+                            $batchResult = if($ri -lt $metaBatchResults.Count) { $metaBatchResults[$ri] } else { $null }
+                            if($batchResult -and $batchResult.StatusCode -eq 200 -and $batchResult.Data) {
+                                $metaData = $batchResult.Data
+                                if($null -ne $metaData.d) { $metaData = $metaData.d }
+                                $fv = $metaData.FieldValuesAsText
+                                if($fv) {
+                                    $currentShortCuts += @{
+                                        "ID" = $req.ShortcutId
+                                        "Name" = $fv.FileLeafRef
+                                        "targetSiteId" = $fv.A2ODRemoteItemSiteId
+                                        "targetWebId" = $fv.A2ODRemoteItemWebId
+                                        "targetListId" = $fv.A2ODRemoteItemListId
+                                        "targetItemUniqueId" = $fv.A2ODRemoteItemUniqueId
+                                    }
+                                    continue
+                                }
+                            }
+
+                            # Fallback for failed/empty batch entries
+                            try {
+                                $shortCutMetaData = New-GraphQuery -Uri "$rootUrl/personal/$userComponent/_api/web/lists('$($docLibrary.id)')/GetItemByUniqueId('$($req.ShortcutId)')?`$expand=FieldValuesAsText" -Method GET -MaxAttempts 3
+                                $currentShortCuts += @{
+                                    "ID" = $req.ShortcutId
+                                    "Name" = $shortCutMetaData.FieldValuesAsText.FileLeafRef
+                                    "targetSiteId" = $shortCutMetaData.FieldValuesAsText.A2ODRemoteItemSiteId
+                                    "targetWebId" = $shortCutMetaData.FieldValuesAsText.A2ODRemoteItemWebId
+                                    "targetListId" = $shortCutMetaData.FieldValuesAsText.A2ODRemoteItemListId
+                                    "targetItemUniqueId" = $shortCutMetaData.FieldValuesAsText.A2ODRemoteItemUniqueId
+                                }
+                            } catch {
+                                Write-Log "  Failed to resolve shortcut metadata for item '$($req.ShortcutId)': $($_.Exception.Message)" "WARN"
+                            }
+                        }
+                    } catch {
+                        Write-Log "  Shortcut metadata batch failed, falling back to individual calls: $($_.Exception.Message)" "WARN"
+                        foreach($req in $metaRequests) {
+                            try {
+                                $shortCutMetaData = New-GraphQuery -Uri "$rootUrl/personal/$userComponent/_api/web/lists('$($docLibrary.id)')/GetItemByUniqueId('$($req.ShortcutId)')?`$expand=FieldValuesAsText" -Method GET -MaxAttempts 3
+                                $currentShortCuts += @{
+                                    "ID" = $req.ShortcutId
+                                    "Name" = $shortCutMetaData.FieldValuesAsText.FileLeafRef
+                                    "targetSiteId" = $shortCutMetaData.FieldValuesAsText.A2ODRemoteItemSiteId
+                                    "targetWebId" = $shortCutMetaData.FieldValuesAsText.A2ODRemoteItemWebId
+                                    "targetListId" = $shortCutMetaData.FieldValuesAsText.A2ODRemoteItemListId
+                                    "targetItemUniqueId" = $shortCutMetaData.FieldValuesAsText.A2ODRemoteItemUniqueId
+                                }
+                            } catch {
+                                Write-Log "  Failed to resolve shortcut metadata for item '$($req.ShortcutId)': $($_.Exception.Message)" "WARN"
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1749,89 +2316,186 @@ try {
             $skipCount = 0
             $warnCount = 0
             $errorCount = 0
+            $renameCount = 0
+
+            # Build target maps once for faster matching
+            $existingTargetKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach($existing in $currentShortCuts) {
+                $null = $existingTargetKeys.Add("$($existing.targetSiteId)|$($existing.targetWebId)|$($existing.targetListId)")
+            }
+
+            $desiredTargetKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach($desired in $desiredShortcuts) {
+                $null = $desiredTargetKeys.Add("$($desired.shortcut.siteId)|$($desired.shortcut.webId)|$($desired.shortcut.listId)")
+            }
+
+            $shortcutsToCreate = @($desiredShortcuts | Where-Object {
+                -not $existingTargetKeys.Contains("$($_.shortcut.siteId)|$($_.shortcut.webId)|$($_.shortcut.listId)")
+            })
+            $skipCount = [math]::Max(0, $desiredShortcuts.Count - $shortcutsToCreate.Count)
+
+            $shortcutsToDelete = @($currentShortCuts | Where-Object {
+                -not $desiredTargetKeys.Contains("$($_.targetSiteId)|$($_.targetWebId)|$($_.targetListId)")
+            })
+
+            # Safety guard: never allow a full wipe of this folder in one run.
+            # This protects against upstream metadata regressions that could mark all existing shortcuts as obsolete.
+            if($shortcutsToDelete.Count -gt 0 -and $shortcutsToDelete.Count -eq $currentShortCuts.Count) {
+                Write-Log "  Mass-delete protection triggered: calculated deletion of all $($currentShortCuts.Count) current shortcuts. Skipping deletion for this user." "WARN"
+                $warnCount++
+                $shortcutsToDelete = @()
+            }
 
             # Create missing shortcuts
-            $scIndex = 0
-            $scTotal = $desiredShortcuts.Count
-            foreach($desiredShortcut in $desiredShortcuts) {
-                $scIndex++
-                Write-Progress -Id 1 -ParentId 0 -Activity "Creating shortcuts" -Status "Shortcut $scIndex / $scTotal" -PercentComplete ([math]::Min(100, [math]::Max(1, [math]::Round(($scIndex / [math]::Max(1,$scTotal)) * 100))))
-
-                # Check if shortcut already exists
-                $exists = $false
-                foreach($existing in $currentShortCuts) {
-                    if ($existing.targetSiteId -eq $desiredShortcut.shortcut.siteId -and $existing.targetWebId -eq $desiredShortcut.shortcut.webId -and $existing.targetListId -eq $desiredShortcut.shortcut.listId) {
-                        $exists = $true
-                        break
-                    }
-                }
-
-                if ($exists) {
-                    $skipCount++
-                    continue
-                }
-
-                if($DryRun) {
+            if($DryRun) {
+                foreach($desiredShortcut in $shortcutsToCreate) {
                     Write-Log "    [DRY RUN] Would create shortcut for '$($desiredShortcut.shortcut.siteUrl)'" "INFO"
                     $successCount++
-                    continue
                 }
+            } elseif($shortcutsToCreate.Count -gt 0) {
+                $createIss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+                $createIss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('Get-AccessToken', (Get-Command Get-AccessToken).Definition))
+                $createIss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('New-GraphQuery', (Get-Command New-GraphQuery).Definition))
+                $createIss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('Write-Log', (Get-Command Write-Log).Definition))
+                $createIss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('Get-CleanedShortcutName', (Get-Command Get-CleanedShortcutName).Definition))
+                $createIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('ClientId', $ClientId, ''))
+                $createIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('TenantId', $TenantId, ''))
+                $createIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('CertificateThumbprint', $CertificateThumbprint, ''))
+                $createIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('CertificatePath', $CertificatePath, ''))
+                $createIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('CertificatePassword', $CertificatePassword, ''))
+                $createIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('linkNameReplacements', $linkNameReplacements, ''))
+                $createPool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, [math]::Max(1, $ShortcutActionParallelLimit), $createIss, $Host)
+                $createPool.Open()
 
                 try {
-                    $shortcutBody = @{
-                        name = $($desiredShortcut.listName)
-                        remoteItem = @{
-                            sharepointIds = $desiredShortcut.shortcut
+
+                $createBlock = {
+                    param([hashtable]$desiredShortcut, [string]$userId, [string]$targetFolderId, [string]$folderName, [string]$graphUrl, [string]$idpUrl, [string]$sharepointUrl, [hashtable]$seedTokens, [int]$maxAttempts)
+
+                    $global:octo = @{ graphUrl = $graphUrl; idpUrl = $idpUrl; sharepointUrl = $sharepointUrl; LCCachedTokens = $seedTokens }
+                    $global:octo.RunspaceLogBuffer = [System.Collections.Generic.List[hashtable]]::new()
+                    [void][System.Reflection.Assembly]::LoadWithPartialName("System.Web")
+
+                    try {
+                        $shortcutBody = @{
+                            name = $($desiredShortcut.listName)
+                            remoteItem = @{ sharepointIds = $desiredShortcut.shortcut }
+                            "@microsoft.graph.conflictBehavior" = "rename"
+                        } | ConvertTo-Json -Depth 5
+
+                        $newShortCut = New-GraphQuery -MaxAttempts $maxAttempts -Uri "$graphUrl/v1.0/users/$userId/drive/root/children" -Method POST -Body $shortcutBody
+
+                        if($newShortCut.id -and $targetFolderId) {
+                            $moveBody = @{ parentReference = @{ id = $targetFolderId } } | ConvertTo-Json -Depth 3
+                            $newShortCut = New-GraphQuery -MaxAttempts $maxAttempts -Uri "$graphUrl/v1.0/users/$userId/drive/items/$($newShortCut.id)" -Method PATCH -Body $moveBody
                         }
-                        "@microsoft.graph.conflictBehavior" = "rename"
-                    } | ConvertTo-Json -Depth 3
 
-                    Write-Log "    Creating shortcut ($($desiredShortcut.shortcut.siteUrl))..." "INFO"
-                    $newShortCut = $Null; $newShortCut = New-GraphQuery -MaxAttempts 1 -Uri "$($global:octo.graphUrl)/v1.0/users/$userId/drive/root/children" -Method POST -Body $shortcutBody
-
-                    # Graph only allows reliable shortcut creation in root; move it into the target folder afterward.
-                    if($newShortCut.id -and $targetFolder.id){
-                        $moveBody = @{
-                            parentReference = @{
-                                id = $targetFolder.id
+                        $renamed = $false
+                        if($newShortCut.id) {
+                            $cleanName = Get-CleanedShortcutName -Name $newShortCut.name
+                            if($cleanName -and $cleanName -ne $newShortCut.name) {
+                                $renameSucceeded = $false
+                                for($i = 0; $i -lt 6; $i++) {
+                                    $candidateName = if($i -eq 0) { $cleanName } else { "$cleanName`_$i" }
+                                    try {
+                                        $renameBody = @{ name = $candidateName } | ConvertTo-Json
+                                        $null = New-GraphQuery -MaxAttempts $maxAttempts -Uri "$graphUrl/v1.0/users/$userId/drive/items/$($newShortCut.id)" -Method PATCH -Body $renameBody
+                                        $renameSucceeded = $true
+                                        $renamed = ($candidateName -ne $newShortCut.name)
+                                        break
+                                    } catch {
+                                        $renameMsg = $_.Exception.Message
+                                        $isNameConflict = $renameMsg -like '*already exists*' -or $renameMsg -like '*nameAlreadyExists*' -or $renameMsg -like '*Conflict*'
+                                        if(-not $isNameConflict -or $i -ge 5) {
+                                            throw
+                                        }
+                                    }
+                                }
+                                if(-not $renameSucceeded) {
+                                    return [PSCustomObject]@{ Status = 'Warning'; Url = $desiredShortcut.shortcut.siteUrl; Message = "Rename attempt did not complete for '$($desiredShortcut.shortcut.siteUrl)'"; Renamed = $false }
+                                }
                             }
-                        } | ConvertTo-Json -Depth 3
-                        $newShortCut = New-GraphQuery -MaxAttempts 1 -Uri "$($global:octo.graphUrl)/v1.0/users/$userId/drive/items/$($newShortCut.id)" -Method PATCH -Body $moveBody
-                        Write-Log "    Moved shortcut into '$FolderName' folder" "INFO"
-                    }
+                        }
 
-                    $cleanName = Get-CleanedShortcutName -Name $newShortCut.name
-                    $i = 1
-                    while($currentShortCuts.Name -contains $cleanName){
-                        $cleanName = "$($cleanName)_$($i)"
-                        $i++
+                        return [PSCustomObject]@{ Status = 'Created'; Url = $desiredShortcut.shortcut.siteUrl; Message = "Created shortcut for '$($desiredShortcut.shortcut.siteUrl)'"; Renamed = $renamed; LogMessages = @($global:octo.RunspaceLogBuffer) }
+                    } catch {
+                        $msg = $_.Exception.Message
+                        if($msg -like '*descendant shortcut exists*' -or $msg -like '*shortcut already exists*') {
+                            return [PSCustomObject]@{ Status = 'Conflict'; Url = $desiredShortcut.shortcut.siteUrl; Message = $msg; Renamed = $false; LogMessages = @($global:octo.RunspaceLogBuffer) }
+                        }
+                        return [PSCustomObject]@{ Status = 'Error'; Url = $desiredShortcut.shortcut.siteUrl; Message = $msg; Renamed = $false; LogMessages = @($global:octo.RunspaceLogBuffer) }
                     }
-                    if($newShortCut.id -and $cleanName -ne $newShortCut.name -and $currentShortCuts.Name -notcontains $cleanName){
-                        try {
-                            $renameBody = @{ name = $cleanName } | ConvertTo-Json
-                            $Null = New-GraphQuery -MaxAttempts 1 -Uri "$($global:octo.graphUrl)/v1.0/users/$userId/drive/items/$($newShortCut.id)" -Method PATCH -Body $renameBody
-                            Write-Log "    Renamed '$($newShortCut.name)' → '$cleanName'" "INFO"
-                        } catch {
-                            Write-Log "    Failed to rename '$($newShortCut.name)': $($_.Exception.Message)" "WARN"
+                }
+
+                $createJobs = [System.Collections.Generic.List[hashtable]]::new()
+                foreach($desiredShortcut in $shortcutsToCreate) {
+                    $ps = [powershell]::Create()
+                    $ps.RunspacePool = $createPool
+                    [void]$ps.AddScript($createBlock)
+                    [void]$ps.AddParameter('desiredShortcut', $desiredShortcut)
+                    [void]$ps.AddParameter('userId', $userId)
+                    [void]$ps.AddParameter('targetFolderId', $targetFolder.id)
+                    [void]$ps.AddParameter('folderName', $FolderName)
+                    [void]$ps.AddParameter('graphUrl', $global:octo.graphUrl)
+                    [void]$ps.AddParameter('idpUrl', $global:octo.idpUrl)
+                    [void]$ps.AddParameter('sharepointUrl', $global:octo.sharepointUrl)
+                    [void]$ps.AddParameter('seedTokens', $preSeededTokensPhase3)
+                    [void]$ps.AddParameter('maxAttempts', $GraphMutationMaxAttempts)
+                    $createJobs.Add(@{ PowerShell = $ps; Handle = $ps.BeginInvoke() })
+                }
+
+                $createCompleted = 0
+                while($createJobs.Count -gt 0) {
+                    for($ci = $createJobs.Count - 1; $ci -ge 0; $ci--) {
+                        if($createJobs[$ci].Handle.IsCompleted) {
+                            $createCompleted++
+                            Write-Progress -Id 1 -ParentId 0 -Activity "Creating shortcuts" -Status "$createCompleted / $($shortcutsToCreate.Count)" -PercentComplete ([math]::Min(100, [math]::Round(($createCompleted / [math]::Max(1,$shortcutsToCreate.Count)) * 100)))
+                            try {
+                                $createResults = $createJobs[$ci].PowerShell.EndInvoke($createJobs[$ci].Handle)
+                                foreach($result in $createResults) {
+                                    if($result.LogMessages) {
+                                        foreach($log in $result.LogMessages) { Write-Log "    $($log.Message)" $log.Level }
+                                    }
+                                    switch($result.Status) {
+                                        'Created' {
+                                            $successCount++
+                                            if($result.Renamed) { $renameCount++ }
+                                            Write-Log "    $($result.Message)" "SUCCESS"
+                                        }
+                                        'Conflict' {
+                                            $warnCount++
+                                            Write-Log "    Existing shortcut conflict for '$($result.Url)': $($result.Message)" "WARN"
+                                            $existingShortcutConflicts.Add(@{ User = $userUPN; Url = $result.Url })
+                                        }
+                                        'Warning' {
+                                            $warnCount++
+                                            Write-Log "    $($result.Message)" "WARN"
+                                        }
+                                        default {
+                                            $errorCount++
+                                            Write-Log "    Failed to create shortcut for '$($result.Url)': $($result.Message)" "ERROR"
+                                        }
+                                    }
+                                }
+                            } catch {
+                                $errorCount++
+                                Write-Log "    Failed to collect create result: $($_.Exception.Message)" "ERROR"
+                            }
+                            $createJobs[$ci].PowerShell.Dispose()
+                            $createJobs.RemoveAt($ci)
                         }
                     }
-                    Start-Sleep -Milliseconds 200
-                    Write-Log "    Created shortcut for '$($desiredShortcut.shortcut.siteUrl)'" "SUCCESS"
-                    $successCount++
-                }catch{
-                    if($_.Exception.Message -like '*descendant shortcut exists*' -or $_.Exception.Message -like '*shortcut already exists*') {
-                        Write-Log "    Existing shortcut conflict for '$($desiredShortcut.shortcut.siteUrl)': $($_.Exception.Message)" "WARN"
-                        $existingShortcutConflicts.Add(@{ User = $userUPN; Url = $desiredShortcut.shortcut.siteUrl })
-                        $warnCount++
-                    } else {
-                        Write-Log "    Failed to create shortcut for '$($desiredShortcut.shortcut.siteUrl)': $($_.Exception.Message)" "ERROR"
-                        $errorCount++
-                    }
+                    if($createJobs.Count -gt 0) { Start-Sleep -Milliseconds 100 }
+                }
+
+                Write-Progress -Id 1 -ParentId 0 -Activity "Creating shortcuts" -Completed
+
+                } finally {
+                    if($createPool) { $createPool.Close(); $createPool.Dispose() }
                 }
             }
 
             # Rename existing shortcuts if link name cleanup patterns apply
-            $renameCount = 0
             if($linkNameReplacements.Count -gt 0) {
                 Write-Log "  Checking existing shortcuts for name cleanup..." "INFO"
                 foreach($existing in $currentShortCuts) {
@@ -1845,7 +2509,7 @@ try {
                         }
                         try {
                             $renameBody = @{ name = $cleanedName } | ConvertTo-Json
-                            $Null = New-GraphQuery -MaxAttempts 1 -Uri "$($global:octo.graphUrl)/v1.0/users/$userId/drive/items/$($existing.ID)" -Method PATCH -Body $renameBody
+                            $Null = New-GraphQuery -MaxAttempts $GraphMutationMaxAttempts -Uri "$($global:octo.graphUrl)/v1.0/users/$userId/drive/items/$($existing.ID)" -Method PATCH -Body $renameBody
                             Write-Log "    Renamed '$($existing.Name)' → '$cleanedName'" "SUCCESS"
                             Start-Sleep -Milliseconds 200
                             $renameCount++
@@ -1860,39 +2524,93 @@ try {
 
             # Delete shortcuts user should no longer have access to
             $deletedCount = 0
-            $delIndex = 0
-            $delTotal = $currentShortCuts.Count
-            foreach($existing in $currentShortCuts) {
-                $delIndex++
-                if($delTotal -gt 0) { Write-Progress -Id 1 -ParentId 0 -Activity "Cleaning obsolete shortcuts" -Status "$delIndex / $delTotal" -PercentComplete ([math]::Min(100, [math]::Round(($delIndex / $delTotal) * 100))) }
-                $shouldExist = $false
-                foreach($desired in $desiredShortcuts) {
-                    if ($existing.targetSiteId -eq $desired.shortcut.siteId -and $existing.targetWebId -eq $desired.shortcut.webId -and $existing.targetListId -eq $desired.shortcut.listId) {
-                        $shouldExist = $true
-                        break
+            if($DryRun) {
+                foreach($existing in $shortcutsToDelete) {
+                    Write-Log "    [DRY RUN] Would delete obsolete shortcut '$($existing.Name)'" "INFO"
+                    $deletedCount++
+                }
+            } elseif($shortcutsToDelete.Count -gt 0) {
+                $deleteIss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+                $deleteIss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('Get-AccessToken', (Get-Command Get-AccessToken).Definition))
+                $deleteIss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('New-GraphQuery', (Get-Command New-GraphQuery).Definition))
+                $deleteIss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new('Write-Log', (Get-Command Write-Log).Definition))
+                $deleteIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('ClientId', $ClientId, ''))
+                $deleteIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('TenantId', $TenantId, ''))
+                $deleteIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('CertificateThumbprint', $CertificateThumbprint, ''))
+                $deleteIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('CertificatePath', $CertificatePath, ''))
+                $deleteIss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('CertificatePassword', $CertificatePassword, ''))
+                $deletePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, [math]::Max(1, $ShortcutActionParallelLimit), $deleteIss, $Host)
+                $deletePool.Open()
+
+                try {
+
+                $deleteBlock = {
+                    param([hashtable]$existingShortcut, [string]$userId, [string]$graphUrl, [string]$idpUrl, [string]$sharepointUrl, [hashtable]$seedTokens, [int]$maxAttempts)
+
+                    $global:octo = @{ graphUrl = $graphUrl; idpUrl = $idpUrl; sharepointUrl = $sharepointUrl; LCCachedTokens = $seedTokens }
+                    $global:octo.RunspaceLogBuffer = [System.Collections.Generic.List[hashtable]]::new()
+                    [void][System.Reflection.Assembly]::LoadWithPartialName("System.Web")
+
+                    try {
+                        $null = New-GraphQuery -MaxAttempts $maxAttempts -Uri "$graphUrl/v1.0/users/$userId/drive/items/$($existingShortcut.ID)" -Method DELETE
+                        return [PSCustomObject]@{ Status = 'Deleted'; Name = $existingShortcut.Name; Message = "Deleted obsolete shortcut '$($existingShortcut.Name)'"; LogMessages = @($global:octo.RunspaceLogBuffer) }
+                    } catch {
+                        return [PSCustomObject]@{ Status = 'Error'; Name = $existingShortcut.Name; Message = $_.Exception.Message; LogMessages = @($global:octo.RunspaceLogBuffer) }
                     }
                 }
 
-                if (-not $shouldExist) {
-                    if($DryRun) {
-                        Write-Log "    [DRY RUN] Would delete obsolete shortcut '$($existing.Name)'" "INFO"
-                        $deletedCount++
-                        continue
+                $deleteJobs = [System.Collections.Generic.List[hashtable]]::new()
+                foreach($existing in $shortcutsToDelete) {
+                    $ps = [powershell]::Create()
+                    $ps.RunspacePool = $deletePool
+                    [void]$ps.AddScript($deleteBlock)
+                    [void]$ps.AddParameter('existingShortcut', $existing)
+                    [void]$ps.AddParameter('userId', $userId)
+                    [void]$ps.AddParameter('graphUrl', $global:octo.graphUrl)
+                    [void]$ps.AddParameter('idpUrl', $global:octo.idpUrl)
+                    [void]$ps.AddParameter('sharepointUrl', $global:octo.sharepointUrl)
+                    [void]$ps.AddParameter('seedTokens', $preSeededTokensPhase3)
+                    [void]$ps.AddParameter('maxAttempts', $GraphMutationMaxAttempts)
+                    $deleteJobs.Add(@{ PowerShell = $ps; Handle = $ps.BeginInvoke() })
+                }
+
+                $deleteCompleted = 0
+                while($deleteJobs.Count -gt 0) {
+                    for($di = $deleteJobs.Count - 1; $di -ge 0; $di--) {
+                        if($deleteJobs[$di].Handle.IsCompleted) {
+                            $deleteCompleted++
+                            Write-Progress -Id 1 -ParentId 0 -Activity "Cleaning obsolete shortcuts" -Status "$deleteCompleted / $($shortcutsToDelete.Count)" -PercentComplete ([math]::Min(100, [math]::Round(($deleteCompleted / [math]::Max(1,$shortcutsToDelete.Count)) * 100)))
+                            try {
+                                $deleteResults = $deleteJobs[$di].PowerShell.EndInvoke($deleteJobs[$di].Handle)
+                                foreach($result in $deleteResults) {
+                                    if($result.LogMessages) {
+                                        foreach($log in $result.LogMessages) { Write-Log "    $($log.Message)" $log.Level }
+                                    }
+                                    if($result.Status -eq 'Deleted') {
+                                        $deletedCount++
+                                        Write-Log "    $($result.Message)" "SUCCESS"
+                                    } else {
+                                        $errorCount++
+                                        Write-Log "    Failed to delete '$($result.Name)': $($result.Message)" "ERROR"
+                                    }
+                                }
+                            } catch {
+                                $errorCount++
+                                Write-Log "    Failed to collect delete result: $($_.Exception.Message)" "ERROR"
+                            }
+                            $deleteJobs[$di].PowerShell.Dispose()
+                            $deleteJobs.RemoveAt($di)
+                        }
                     }
-                    try {
-                        Write-Log "    Deleting obsolete shortcut '$($existing.Name)'..." "INFO"
-                        New-GraphQuery -MaxAttempts 2 -Uri "$($global:octo.graphUrl)/v1.0/users/$userId/drive/items/$($existing.ID)" -Method DELETE
-                        Start-Sleep -Milliseconds 200
-                        $deletedCount++
-                        Write-Log "    Deleted obsolete shortcut" "SUCCESS"
-                    } catch {
-                        Write-Log "    Failed to delete '$($existing.Name)': $($_.Exception.Message)" "ERROR"
-                        $errorCount++
-                    }
+                    if($deleteJobs.Count -gt 0) { Start-Sleep -Milliseconds 100 }
+                }
+
+                Write-Progress -Id 1 -ParentId 0 -Activity "Cleaning obsolete shortcuts" -Completed
+
+                } finally {
+                    if($deletePool) { $deletePool.Close(); $deletePool.Dispose() }
                 }
             }
-
-            if($delTotal -gt 0) { Write-Progress -Id 1 -ParentId 0 -Activity "Cleaning obsolete shortcuts" -Completed }
 
             Write-Log "  --- User Summary for $userUPN ---" "INFO"
             Write-Log "  Created: $successCount | Renamed: $renameCount | Skipped: $skipCount | Deleted: $deletedCount | Warnings: $warnCount | Errors: $errorCount" "INFO"
@@ -1941,8 +2659,13 @@ try {
     Write-Log "" "INFO"
     Write-Log "=== Performance Summary ===" "INFO"
     Write-Log "Total user×library pairs: $totalPairs" "INFO"
-    Write-Log "Cache hits: $totalCacheHits | API checks: $totalBatchChecks" "INFO"
-    Write-Log "API calls saved: $savingsPercent%" "SUCCESS"
+    if($EnableRecursivePermissionPreCheck) {
+        Write-Log "  Pre-allowed pairs (site/list/group recursion): $($preCheckStats.PreAllowedPairs)" "INFO"
+        Write-Log "  Fallback pairs (effective permission API): $($preCheckStats.FallbackPairs)" "INFO"
+        Write-Log "  Scope hits - site: $($preCheckStats.SiteScopeHits), list: $($preCheckStats.ListScopeHits)" "INFO"
+        Write-Log "  Entra group cache - hits: $($preCheckStats.CacheHits), misses: $($preCheckStats.CacheMisses), entries: $($global:octo.EntraGroupTargetMemberCache.Count)" "INFO"
+        Write-Log "  Recursion cutoffs (depth/node guards): $($preCheckStats.RecursionCutoffs)" "INFO"
+    }    
 
     $phaseTimings['Phase 3: Applying shortcuts'] = $phaseStopwatch.Elapsed
     $scriptStopwatch.Stop()
