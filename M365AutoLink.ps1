@@ -76,11 +76,14 @@ $DryRun = $false
 #the default list is recommended
 #e.g. https://contoso.sharepoint.com/sites/HR*" would exclude all sites where the name starts with HR"
 $excludedSitesByWildcard = @(
+    "*/groupforanswersinvivaengagedonotdelete*"
     "*/sites/Streamvideo*"
     "*/portals/personal/*"
     "*/sites/AllCompany*"
     "*/personal/*"
     "*/contentstorage/*"
+    "*/sites/contentTypeHub*"
+    "*/sites/pwa"
 )
 #if you define included site, only sites matching one of the patterns you enter will be linked. Use a * to match 1 or more characters
 #e.g. https://contoso.sharepoint.com/sites/HR*" would include all sites where the name starts with HR"
@@ -99,6 +102,17 @@ $linkNameReplacements = @(
 #below variables can be used to filter based on the number of existing files in the target location before creating a link
 $maxFileCount = 300000
 $minFileCount = 0
+
+#system libraries that should never become OneDrive shortcuts even if returned by search
+$excludedLibrariesByWildcard = @(
+    "*style library*"
+    "*stijlbibliotheek*"
+    "*site assets*"
+    "*siteactiva*"
+    "*site pages*"
+    "*form templates*"
+    "*preservation hold library*"
+)
 
 ##########END CONFIGURATION#############################
 
@@ -146,6 +160,36 @@ function Get-CleanedShortcutName {
         $cleanedName = $Name.Trim() # fallback to original if cleaning produces empty string
     }
     return $cleanedName
+}
+
+function Get-SafeDriveItemName {
+    param([string]$Name)
+
+    $safeName = $Name
+    # OneDrive/SharePoint invalid filename characters.
+    $safeName = $safeName -replace '[\\/:*?"<>|]', '-'
+    $safeName = $safeName.Trim()
+    $safeName = $safeName.TrimEnd('.')
+
+    if([string]::IsNullOrWhiteSpace($safeName)) {
+        $safeName = "Unnamed Shortcut"
+    }
+
+    return $safeName
+}
+
+function Test-IsExcludedLibraryName {
+    param([string]$ListName)
+
+    if([string]::IsNullOrWhiteSpace($ListName)) { return $false }
+    foreach($pattern in $excludedLibrariesByWildcard) {
+        $wildcardPattern = "^" + [regex]::Escape($pattern) -replace "\\\*", ".*"
+        if($ListName.ToLowerInvariant() -match $wildcardPattern) {
+            return $true
+        }
+    }
+
+    return $false
 }
 
 function get-AccessToken{    
@@ -395,18 +439,29 @@ function New-GraphQuery {
                     $Data = $Null; $Data = (Invoke-RestMethod -Uri $nextURL -Method $Method -Headers $headers -Body $Body -ContentType $ContentType -Verbose:$False -ErrorAction Stop -UserAgent "ISV|LiebenConsultancy|M365AutoLink|1.0")
                     $attempts = $MaxAttempts
                 }catch {
-                    if($_.Exception.Message -like "*404*" -or $_.Exception.Message -like "*Request_ResourceNotFound*" -or $_.Exception.Message -like "*Resource*does not exist*" -or $_.Exception.Message -like "*403*" -or $_.Exception.StatusCode -in (401,403,"Unauthorized",404,"NotFound")){
-                        Write-Debug "Not retrying 404 or 401"
+                    $statusCode = $null
+                    try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+                    $is429 = $statusCode -eq 429 -or $_.Exception.Message -like "*429*"
+                    $isTransientNetwork = $_.Exception.Message -like "*No such host is known*" -or $_.Exception.Message -like "*name or service not known*" -or $_.Exception.Message -like "*network is unreachable*" -or $_.Exception.Message -like "*connection was forcibly closed*" -or $_.Exception.Message -like "*An existing connection was forcibly closed*"
+
+                    # Fail fast on all HTTP errors except 429 (including 500/403/404).
+                    if($null -ne $statusCode -and -not $is429){
                         $nextUrl = $Null
                         throw $_
-                    }  
+                    }
+
+                    # Retry only throttling or transport-level transient failures.
+                    if(-not $is429 -and -not $isTransientNetwork){
+                        $nextUrl = $Null
+                        throw $_
+                    }
+
                     if ($attempts -ge $MaxAttempts) { 
                         Throw $_
                     }
 
                     $delay = 0
-                    $isTransientNetwork = $_.Exception.Message -like "*No such host is known*" -or $_.Exception.Message -like "*name or service not known*" -or $_.Exception.Message -like "*network is unreachable*" -or $_.Exception.Message -like "*connection was forcibly closed*" -or $_.Exception.Message -like "*An existing connection was forcibly closed*"
-                    if ($_.Exception.Response.StatusCode -eq 429){
+                    if ($is429){
                         try {
                             $retryAfter = $_.Exception.Response.Headers.GetValues("Retry-After")
                             if ($retryAfter -and $retryAfter.Count -gt 0) {
@@ -416,12 +471,12 @@ function New-GraphQuery {
                                 }
                             }
                         }catch {}
+                        if($delay -le 0){
+                            $delay = [math]::Min(15, 2 * [math]::Max(1, $attempts))
+                        }
                     }
                     if($delay -le 0 -and $isTransientNetwork){
-                        $delay = [math]::Min(10, 2 * $attempts)
-                    }
-                    if($delay -le 0){
-                        $delay = [math]::Pow(5, $attempts)
+                        $delay = [math]::Min(5, $attempts)
                     }
                     Write-Log "[WARNING] Transient error on attempt $attempts/$MaxAttempts, retrying in $($delay)s: $($_.Exception.Message)" -ForegroundColor Yellow
                     Start-Sleep -Seconds (1 + $delay)
@@ -448,8 +503,19 @@ function New-GraphQuery {
                         $Data = $Null; $Data = (Invoke-RestMethod -Uri $nextURL -Method $Method -Headers $headers -ContentType $ContentType -Verbose:$False -ErrorAction Stop -UserAgent "ISV|LiebenConsultancy|M365AutoLink|1.0")
                         $attempts = $MaxAttempts
                     }catch {                 
-                        if(($_.Exception -and $_.Exception.StatusCode -and $_.Exception.StatusCode -in (401,403,"Unauthorized",404,"NotFound")) -or ($_.Exception.Message -like "*404*" -or $_.Exception.Message -like "*403*" -or $_.Exception.Message -like "*Request_ResourceNotFound*" -or $_.Exception.Message -like "*Resource*does not exist*")){
-                            Write-Debug "Not retrying $($_.Exception.StatusCode)"
+                        $statusCode = $null
+                        try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+                        $is429 = $statusCode -eq 429 -or $_.Exception.Message -like "*429*"
+                        $isTransientNetwork = $_.Exception.Message -like "*No such host is known*" -or $_.Exception.Message -like "*name or service not known*" -or $_.Exception.Message -like "*network is unreachable*" -or $_.Exception.Message -like "*connection was forcibly closed*" -or $_.Exception.Message -like "*An existing connection was forcibly closed*"
+
+                        # Fail fast on all HTTP errors except 429 (including 500/403/404).
+                        if($null -ne $statusCode -and -not $is429){
+                            $nextUrl = $Null
+                            throw $_
+                        }
+
+                        # Retry only throttling or transport-level transient failures.
+                        if(-not $is429 -and -not $isTransientNetwork){
                             $nextUrl = $Null
                             throw $_
                         }
@@ -460,8 +526,7 @@ function New-GraphQuery {
                         }
                        
                         $delay = 0
-                        $isTransientNetwork = $_.Exception.Message -like "*No such host is known*" -or $_.Exception.Message -like "*name or service not known*" -or $_.Exception.Message -like "*connection was forcibly closed*" -or $_.Exception.Message -like "*An existing connection was forcibly closed*"
-                        if ($_.Exception.Response.StatusCode -eq 429){
+                        if ($is429){
                             try {
                                 $retryAfter = $_.Exception.Response.Headers.GetValues("Retry-After")
                                 if ($retryAfter -and $retryAfter.Count -gt 0) {
@@ -471,12 +536,12 @@ function New-GraphQuery {
                                     }
                                 }
                             }catch {}
+                            if($delay -le 0){
+                                $delay = [math]::Min(15, 2 * [math]::Max(1, $attempts))
+                            }
                         }
                         if($delay -le 0 -and $isTransientNetwork){
-                            $delay = [math]::Min(10, 2 * $attempts)
-                        }
-                        if($delay -le 0){
-                            $delay = [math]::Pow(5, $attempts)
+                            $delay = [math]::Min(5, $attempts)
                         }
                         Write-Log "[WARNING] Transient error on attempt $attempts/$MaxAttempts, retrying in $($delay)s: $($_.Exception.Message)" -ForegroundColor Yellow
                         Start-Sleep -Seconds (1 + $delay)
@@ -553,6 +618,155 @@ function Write-Log {
     Write-Host "[$timestamp] [$Level] $Message" -ForegroundColor $color
 }
 
+function Convert-SearchRowToMap {
+    param([Parameter(Mandatory = $true)]$Row)
+
+    $rowMap = @{}
+    $cells = @()
+
+    if($Row.PSObject.Properties['Cells']) {
+        $cells = @($Row.Cells)
+    } elseif($Row.PSObject.Properties['cells']) {
+        $cells = @($Row.cells)
+    }
+
+    foreach($cell in $cells) {
+        $key = $cell.Key
+        if([string]::IsNullOrWhiteSpace($key)) { $key = $cell.key }
+        if([string]::IsNullOrWhiteSpace($key)) { continue }
+
+        $value = $cell.Value
+        if($null -eq $value) { $value = $cell.value }
+
+        $rowMap[$key] = $value
+    }
+
+    return $rowMap
+}
+
+function Get-SearchResultRows {
+    param([Parameter(Mandatory = $true)]$SearchResponse)
+
+    $rows = @()
+
+    if($SearchResponse.PSObject.Properties['PrimaryQueryResult']) {
+        $rows = @($SearchResponse.PrimaryQueryResult.RelevantResults.Table.Rows)
+    } elseif($SearchResponse.PSObject.Properties['d']) {
+        $rows = @($SearchResponse.d.query.PrimaryQueryResult.RelevantResults.Table.Rows.results)
+    }
+
+    return @($rows)
+}
+
+function Get-SharePointDocumentLibrariesFromSearch {
+    param([Parameter(Mandatory = $true)][string]$SearchRootUrl)
+
+    $rowLimit = 500
+    $startRow = 0
+    $foundLibraries = [System.Collections.Generic.List[hashtable]]::new()
+
+    while($true) {
+        $queryText = [System.Web.HttpUtility]::UrlEncode("contentclass:STS_List_DocumentLibrary")
+        $selectProperties = [System.Web.HttpUtility]::UrlEncode("Title,Path,ListId,SiteId,WebId,SPWebUrl,SPSiteUrl,SiteName")
+        $queryUri = "$SearchRootUrl/_api/search/query?querytext='$queryText'&trimduplicates=false&rowlimit=$rowLimit&startrow=$startRow&selectproperties='$selectProperties'"
+
+        $searchResponse = New-GraphQuery -resource $global:octo.sharepointUrl -Uri $queryUri -Method GET -MaxAttempts 3
+        $rows = @(Get-SearchResultRows -SearchResponse $searchResponse)
+
+        if(@($rows).Count -eq 0) {
+            break
+        }
+
+        foreach($row in $rows) {
+            $map = Convert-SearchRowToMap -Row $row
+
+            $listId = [string]$map.ListId
+            $siteId = [string]$map.SiteId
+            $webId = [string]$map.WebId
+            $siteWebUrl = [string]$map.SPWebUrl
+            if([string]::IsNullOrWhiteSpace($siteWebUrl)) {
+                $siteWebUrl = [string]$map.SPSiteUrl
+            }
+            if([string]::IsNullOrWhiteSpace($siteWebUrl)) {
+                $siteWebUrl = [string]$map.Path
+            }
+
+            if([string]::IsNullOrWhiteSpace($listId) -or [string]::IsNullOrWhiteSpace($siteId) -or [string]::IsNullOrWhiteSpace($webId) -or [string]::IsNullOrWhiteSpace($siteWebUrl)) {
+                continue
+            }
+
+            $foundLibraries.Add(@{
+                listId = $listId.Trim("{}")
+                siteId = $siteId.Trim("{}")
+                webId = $webId.Trim("{}")
+                siteWebUrl = $siteWebUrl.TrimEnd('/')
+                siteCollectionUrl = [string]$map.SPSiteUrl
+                siteName = [string]$map.SiteName
+                listName = [string]$map.Title
+                listPath = [string]$map.Path
+            })
+        }
+
+        if(@($rows).Count -lt $rowLimit) {
+            break
+        }
+
+        $startRow += $rowLimit
+    }
+
+    return @($foundLibraries)
+}
+
+function Get-ListMetadataWithFallback {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Library,
+        [Parameter(Mandatory = $true)][string]$PrimarySiteUrl
+    )
+
+    $listId = $Library.listId
+    $listPath = [string]$Library.listPath
+    $siteCollectionUrl = [string]$Library.siteCollectionUrl
+    $serverRelativeListPath = $null
+
+    if(-not [string]::IsNullOrWhiteSpace($listPath)) {
+        try {
+            $listPathUri = [System.Uri]::new($listPath)
+            $serverRelativeListPath = $listPathUri.AbsolutePath
+        } catch {
+            $serverRelativeListPath = $null
+        }
+    }
+
+    try {
+        return New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$PrimarySiteUrl/_api/lists/GetById('$listId')" -Method GET
+    } catch {
+        $isNotFound = $_.Exception.Message -like "*404*" -or $_.Exception.Message -like "*Not Found*"
+        if(-not $isNotFound -or [string]::IsNullOrWhiteSpace($serverRelativeListPath)) {
+            throw
+        }
+    }
+
+    $candidateBaseUrls = [System.Collections.Generic.List[string]]::new()
+    $candidateBaseUrls.Add($PrimarySiteUrl)
+    if(-not [string]::IsNullOrWhiteSpace($siteCollectionUrl)) {
+        $candidateBaseUrls.Add($siteCollectionUrl.TrimEnd('/'))
+    }
+
+    foreach($baseUrl in $candidateBaseUrls | Select-Object -Unique) {
+        try {
+            $escapedPath = $serverRelativeListPath.Replace("'", "''")
+            return New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$baseUrl/_api/web/GetList('$escapedPath')" -Method GET
+        } catch {
+            $isNotFound = $_.Exception.Message -like "*404*" -or $_.Exception.Message -like "*Not Found*"
+            if(-not $isNotFound) {
+                throw
+            }
+        }
+    }
+
+    throw "List metadata lookup failed for list '$listId' using both GetById and GetList fallbacks"
+}
+
 
 #endregion
 
@@ -571,27 +785,6 @@ try {
 
     # Pre populate the token cache
     $token = Get-AccessToken -resource $global:octo.graphUrl
-    
-    # Get all sites the user has access to
-    Write-Log "Retrieving accessible sites..." "INFO"
-    $sites = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/sites?search=*" -Method "GET"
-    
-    if (!$sites -or $sites.Count -eq 0) {
-        Write-Log "No sites found for this user" "WARN"
-        Exit 0
-    }
-    
-    Write-Log "Found $($sites.Count) sites" "SUCCESS"
-
-    Write-Log "Will apply the following exclusion patterns:" "INFO"
-    foreach($pattern in $excludedSitesByWildcard){
-        Write-Log "  - $pattern" "INFO"
-    }
-
-    Write-Log "Will apply the following inclusion patterns later (if defined):" "INFO"
-    foreach($pattern in $includedSitesByWildcard){
-        Write-Log "  - $pattern" "INFO"
-    }
     
     # Check if target folder exists, create if not
     Write-Log "Checking for '$FolderName' folder in OneDrive..." "INFO"
@@ -623,6 +816,31 @@ try {
     $rootUrl = $urlParts[0]
     $userComponent = $urlParts[1].Split('/')[0]
     $libraryName = $urlParts[1].Split('/')[1]
+
+    $rootUri = [System.Uri]::new($rootUrl)
+    $tenantHost = $rootUri.Host -replace '(^[^.]+)-my(\.)', '$1$2'
+    $searchRootUrl = "$($rootUri.Scheme)://$tenantHost"
+
+    Write-Log "Discovering document libraries with SharePoint Search..." "INFO"
+    Write-Log "Search root: $searchRootUrl" "INFO"
+    $discoveredLibraries = @(Get-SharePointDocumentLibrariesFromSearch -SearchRootUrl $searchRootUrl)
+
+    if(!$discoveredLibraries -or $discoveredLibraries.Count -eq 0) {
+        Write-Log "No searchable document libraries found for this user" "WARN"
+        Exit 0
+    }
+
+    Write-Log "Discovered $($discoveredLibraries.Count) document library search hits" "SUCCESS"
+
+    Write-Log "Will apply the following exclusion patterns:" "INFO"
+    foreach($pattern in $excludedSitesByWildcard){
+        Write-Log "  - $pattern" "INFO"
+    }
+
+    Write-Log "Will apply the following inclusion patterns later (if defined):" "INFO"
+    foreach($pattern in $includedSitesByWildcard){
+        Write-Log "  - $pattern" "INFO"
+    }
 
     $docLibrary = (New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/sites/$($targetFolder.parentReference.siteId)/lists" -Method "GET") | Where-Object { $_.list.template -eq "mySiteDocumentLibrary" -and !$_.list.hidden}
 
@@ -661,79 +879,158 @@ try {
     $skipCount = 0
     $errorCount = 0
     
-    Write-Log "Checking your access per site to determine desired shortcuts..." "INFO" 
-    foreach($site in $sites) {
-        Write-Log "Checking site: $($site.webUrl) ($($site.id))..." "INFO"        
-        if($null -ne $site.webUrl){
+    Write-Log "Evaluating discovered libraries against site and library rules..." "INFO"
+    $siteEvaluationCache = @{}
+    $seenLibraryKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach($library in $discoveredLibraries) {
+        $siteUrl = $library.siteWebUrl
+        if([string]::IsNullOrWhiteSpace($siteUrl)) { continue }
+
+        if(-not $siteEvaluationCache.ContainsKey($siteUrl)) {
+            Write-Log "Checking site: $siteUrl..." "INFO"
+
+            $siteState = @{
+                Include = $false
+                SkipReason = $null
+                SiteName = $library.siteName
+            }
+
             $isExcluded = $false
             foreach($pattern in $excludedSitesByWildcard){
                 $wildcardPattern = "^" + [regex]::Escape($pattern) -replace "\\\*",".*"
-                if($site.webUrl -match $wildcardPattern){
-                    Write-Log "  Site URL '$($site.webUrl)' matches exclusion pattern '$pattern', skipping..." "WARN"
+                if($siteUrl -match $wildcardPattern){
+                    Write-Log "  Site URL '$siteUrl' matches exclusion pattern '$pattern', skipping..." "WARN"
                     $isExcluded = $true
                     break
                 }
             }
             if($isExcluded){
+                $siteState.SkipReason = "Excluded by wildcard pattern"
+                $siteEvaluationCache[$siteUrl] = $siteState
                 continue
             }
+
             $isIncluded = $false
             foreach($pattern in $includedSitesByWildcard){
                 $wildcardPattern = "^" + [regex]::Escape($pattern) -replace "\\\*",".*"
-                if($site.webUrl -match $wildcardPattern){
+                if($siteUrl -match $wildcardPattern){
                     $isIncluded = $true
                     break
                 }
             }
             if(-not $isIncluded){
-                Write-Log "  Site URL '$($site.webUrl)' does not match any inclusion pattern, skipping..." "WARN"
+                Write-Log "  Site URL '$siteUrl' does not match any inclusion pattern, skipping..." "WARN"
+                $siteState.SkipReason = "Not included by wildcard pattern"
+                $siteEvaluationCache[$siteUrl] = $siteState
+                continue
+            }
+
+            try {
+            # Get more site info to determine if the site is archived or read-only or other blocking properties using the sharepoint API
+                $siteDetails = New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$siteUrl/_api/site" -Method "GET" -MaxAttempts 1
+                if($siteDetails.WriteLocked -or $siteDetails.ReadOnly){
+                Write-Log "  Site is locked or read only, skipping..." "WARN"
+                    $siteState.SkipReason = "Site locked/read-only"
+                    $siteEvaluationCache[$siteUrl] = $siteState
+                    continue
+                }
+
+                if([string]::IsNullOrWhiteSpace($siteState.SiteName)) {
+                    $siteState.SiteName = [string]$siteDetails.Title
+                }
+
+                $siteState.Include = $true
+                $siteEvaluationCache[$siteUrl] = $siteState
+            } catch {
+                Write-Log "  Failed to evaluate site '$siteUrl': $($_.Exception.Message)" "ERROR"
+                $siteState.SkipReason = "Site evaluation error"
+                $siteEvaluationCache[$siteUrl] = $siteState
+                $errorCount++
                 continue
             }
         }
+
+        $cachedSiteState = $siteEvaluationCache[$siteUrl]
+        if(-not $cachedSiteState.Include) {
+            continue
+        }
+
+        $libraryKey = "$($library.siteId)|$($library.webId)|$($library.listId)"
+        if($seenLibraryKeys.Contains($libraryKey)) {
+            continue
+        }
+
         try {
-            # Get more site info to determine if the site is archived or read-only or other blocking properties using the sharepoint API
-            $siteDetails = New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$($site.webUrl)/_api/site" -Method "GET" -MaxAttempts 1
-            if($siteDetails.WriteLocked -or $siteDetails.ReadOnly){
-                Write-Log "  Site is locked or read only, skipping..." "WARN"
+            $listMetaData = Get-ListMetadataWithFallback -Library $library -PrimarySiteUrl $siteUrl
+
+            $listDisplayName = [string]$listMetaData.Title
+            if([string]::IsNullOrWhiteSpace($listDisplayName)) {
+                $listDisplayName = [string]$library.listName
+            }
+
+            if($listMetaData.Hidden){
+                Write-Log "  $listDisplayName is hidden, skipping..." "WARN"
                 continue
             }
 
-            # Get the default document libraries
-            $lists = (New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/sites/$($site.id)/lists" -Method "GET" -MaxAttempts 3) | Where-Object { $_.list.template -eq "documentLibrary" -and !$_.list.hidden}
+            # Only include classic document libraries (BaseTemplate 101).
+            $baseTemplate = $null
+            try { $baseTemplate = [int]$listMetaData.BaseTemplate } catch {}
+            if($null -ne $baseTemplate -and $baseTemplate -ne 101) {
+                Write-Log "  $listDisplayName is not a standard document library (BaseTemplate=$baseTemplate), skipping..." "WARN"
+                continue
+            }
 
-            foreach($list in $lists){
-                # Get ItemCount and other relevant filterable criteria for this list
-                $listMetaData = New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$($site.webUrl)/_api/lists/GetById('$($list.id)')" -Method GET
-                if($listMetaData.Hidden){
-                    Write-Log "  $($list.displayName) is hidden, skipping..." "WARN"
-                    continue
-                }
+            # Exclude catalog/system libraries and known non-user libraries.
+            if($listMetaData.IsCatalog -eq $true -or $listMetaData.IsSystemList -eq $true -or (Test-IsExcludedLibraryName -ListName $listDisplayName)) {
+                Write-Log "  $listDisplayName is a system/catalog library, skipping..." "WARN"
+                continue
+            }
 
-                if($listMetaData.ItemCount -gt $maxFileCount){
-                    Write-Log "  $($list.displayName) has more than $($maxFileCount) files, skipping..." "WARN"
-                    continue
-                }
+            # Skip libraries that are not suitable for OneDrive shortcuts.
+            if($listMetaData.ForceCheckout -eq $true -or $listMetaData.ExcludeFromOfflineClient -eq $true){
+                Write-Log "  $listDisplayName requires lockout/check-out settings, skipping..." "WARN"
+                continue
+            }
 
-                if($listMetaData.ItemCount -lt $minFileCount){
-                    Write-Log "  $($list.displayName) has less than $($minFileCount) files, skipping..." "WARN"
-                    continue
+            if($listMetaData.ItemCount -gt $maxFileCount){
+                Write-Log "  $listDisplayName has more than $($maxFileCount) files, skipping..." "WARN"
+                continue
+            }
+
+            if($listMetaData.ItemCount -lt $minFileCount){
+                Write-Log "  $listDisplayName has less than $($minFileCount) files, skipping..." "WARN"
+                continue
+            }
+
+            [void]$seenLibraryKeys.Add($libraryKey)
+
+            $resolvedListName = $library.listName
+            if([string]::IsNullOrWhiteSpace($resolvedListName)) {
+                $resolvedListName = $listDisplayName
+            }
+            $resolvedListName = Get-SafeDriveItemName -Name $resolvedListName
+
+            $resolvedSiteName = $cachedSiteState.SiteName
+            if([string]::IsNullOrWhiteSpace($resolvedSiteName)) {
+                $resolvedSiteName = $siteUrl
+            }
+
+            # Extract SharePoint IDs from search results and parent site context.
+            $desiredShortcuts += @{
+                shortCut = @{
+                    siteId = $library.siteId
+                    siteUrl = $siteUrl
+                    webId = $library.webId
+                    listId = $library.listId
+                    listItemUniqueId = "root"
                 }
-                
-                # Extract SharePoint IDs from the site
-                $desiredShortcuts += @{
-                    shortCut = @{
-                        siteId = $site.id.Split(',')[1]
-                        siteUrl = $site.webUrl
-                        webId = $site.id.Split(',')[2]  # webId is the second part of composite siteId
-                        listId = $list.id
-                        listItemUniqueId = "root"
-                    }
-                    siteName = $site.displayName
-                    listName = $list.displayName
-                }
+                siteName = $resolvedSiteName
+                    listName = $resolvedListName
             }
         }catch{
-            Write-Log "  Failed to retrieve lists for site '$($site.id)': $($_.Exception.Message)" "ERROR"
+            Write-Log "  Failed to evaluate library '$($library.listName)' on '$siteUrl': $($_.Exception.Message)" "ERROR"
             $errorCount++
             continue
         }
@@ -763,8 +1060,13 @@ try {
 
         try {
             # Create the shortcut
+            $safeShortcutName = Get-SafeDriveItemName -Name $desiredShortcut.listName
+            if($safeShortcutName -ne $desiredShortcut.listName) {
+                Write-Log "  Sanitized shortcut name '$($desiredShortcut.listName)' to '$safeShortcutName'" "WARN"
+            }
+
             $shortcutBody = @{
-                name = $($desiredShortcut.listName)
+                name = $safeShortcutName
                 remoteItem = @{
                     sharepointIds = $desiredShortcut.shortcut
                 }
@@ -786,7 +1088,7 @@ try {
             }
             
             # Rename the shortcut if the created name differs from our desired name (Graph may append suffix)
-            $cleanName = Get-CleanedShortcutName -Name $newShortCut.name
+            $cleanName = Get-SafeDriveItemName -Name (Get-CleanedShortcutName -Name $newShortCut.name)
             if($newShortCut.id -and $cleanName -ne $newShortCut.name -and $currentShortCuts.Name -notcontains $cleanName){
                 try {
                     $renameBody = @{ name = $cleanName } | ConvertTo-Json
@@ -811,7 +1113,7 @@ try {
         Write-Log "Checking existing shortcuts for name cleanup..." "INFO"
         foreach($existing in $currentShortCuts) {
             if(-not $existing.Name) { continue }
-            $cleanedName = Get-CleanedShortcutName -Name $existing.Name
+            $cleanedName = Get-SafeDriveItemName -Name (Get-CleanedShortcutName -Name $existing.Name)
             if($cleanedName -ne $existing.Name -and $currentShortCuts.Name -notcontains $cleanedName) {
                 if($DryRun) {
                     Write-Log "  [DRY RUN] Would rename '$($existing.Name)' to '$cleanedName'" "INFO"
