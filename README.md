@@ -21,6 +21,11 @@ There are two versions of the script:
 - **Centralized Mode**: Process multiple users from a single server-side run without requiring user interaction.
 - **Permission-Aware**: Only creates shortcuts for libraries the user actually has access to (View or Edit).
 - **Automatic Cleanup**: Removes obsolete shortcuts when a user loses access to a site.
+- **Safety Filtering**: Automatically skips document libraries that require check-out.
+- **Dry Run Support**: Preview all create/rename/delete actions without changing OneDrive.
+- **High-Scale Optimizations**: Adaptive throttling, SharePoint REST batching, and parallel shortcut actions.
+- **Tray Workflow**: Optional system tray mode keeps the script alive so you can run it again, manage exclusions, view existing shortcuts, or open the log without restarting it.
+- **Launch Persistence**: Optional script-owned launch modes can create Desktop and Start Menu shortcuts, or an at-logon startup method when enabled in the script.
 
 ---
 
@@ -36,6 +41,8 @@ There are two versions of the script:
    ```
 5. Wait for the Onedrive client to sync down the new links
 
+If tray mode is enabled, you can keep the script running and use the tray icon to **Run now**, manage excluded sites, view shortcuts, open the log, or exit.
+
 ## Configuration
 You can edit the `##########START CONFIGURATION##########` block at the top of the script to customize:
 - `$FolderName`: The name of the folder created in OneDrive (Default: "AutoLink").
@@ -44,6 +51,11 @@ You can edit the `##########START CONFIGURATION##########` block at the top of t
 - `$maxFileCount`: Only create a link if the site has less than this amount of files.
 - `$minFileCount`: Only create a link if the site has more than this amount of files.
 - `$linkNameReplacements`: An array of find/replace patterns applied to shortcut names after creation (see [Link Name Cleanup](#link-name-cleanup)).
+
+Tray and persistence settings are script-owned rather than user-facing config:
+- `$EnableSystemTrayIcon`: Shows the tray icon and tray menu.
+- `$KeepRunningInTray`: Keeps the process alive after a run so tray actions remain available.
+- `$LaunchModes`: Controls optional Desktop, Start Menu, and AtLogon persistence behavior.
 
 ## Authentication & Permissions
 
@@ -97,7 +109,7 @@ The centralized version runs with **application permissions** (no user interacti
 
 ## How It Works
 1. **Pre-fetches all tenant sites** via `sites/getAllSites` and enumerates their document libraries.
-2. **Filters** sites using include/exclude wildcard patterns, file count limits, and archived/locked status.
+2. **Filters** sites/libraries using include/exclude wildcard patterns, file count limits, archived/locked status and check-out requirements.
 3. **For each target user**: checks the user's effective SharePoint permissions on every pre-cached library using `getUserEffectivePermissions`, then creates/updates/deletes OneDrive shortcuts accordingly.
 
 This means shortcuts are only created for libraries the user actually has permissions on — including sites shared via direct permissions, not just group membership.
@@ -109,15 +121,40 @@ Edit the `##########START CONFIGURATION##########` block at the top of the scrip
 |---|---|---|
 | `$FolderName` | Name of the OneDrive folder for shortcuts | `"AutoLink"` |
 | `$CloudType` | Cloud environment: `global`, `usgov`, `usdod`, `china` | `"global"` |
-| `$TargetMode` | Which users to process: `"Group"`, `"UserList"`, or `"All"` | `"UserList"` |
-| `$TargetGroupId` | M365 Group Object ID (when `$TargetMode = "Group"`) | `""` |
+| `$ClientId` | App registration client ID for certificate auth fallback | *(see script)* |
+| `$TenantId` | Tenant ID/domain for certificate auth fallback | *(see script)* |
+| `$CertificateThumbprint` | Certificate thumbprint for cert-based auth | *(see script)* |
+| `$CertificatePath` | Path to `.pfx` (alternative to thumbprint) | `""` |
+| `$CertificatePassword` | PFX password (if needed) | `""` |
+| `$TargetMode` | Which users to process: `"Group"`, `"UserList"`, or `"All"` | `"Group"` |
+| `$TargetGroupId` | M365 Group Object ID (when `$TargetMode = "Group"`) | *(see script)* |
 | `$TargetUsers` | Array of UPNs (when `$TargetMode = "UserList"`) | `@()` |
-| `$MinimumPermissionLevel` | `"View"` = read access is enough, `"Edit"` = require contribute/edit | `"View"` |
+| `$MinimumPermissionLevel` | `"View"` = read access is enough, `"Edit"` = require contribute/edit | `"Edit"` |
 | `$excludedSitesByWildcard` | URL patterns to exclude from linking | *(see script)* |
 | `$includedSitesByWildcard` | URL patterns to include | `"https://*.sharepoint.com/sites/*"` |
+| `$onlyConnectedSites` | Only process M365 group-connected sites | `$false` |
 | `$maxFileCount` | Skip libraries with more files than this | `300000` |
 | `$minFileCount` | Skip libraries with fewer files than this | `0` |
 | `$linkNameReplacements` | Find/replace patterns for shortcut names | *(see [Link Name Cleanup](#link-name-cleanup))* |
+| `$InitialParallelLimit` | Initial runspace concurrency for phases 1/2 | `10` |
+| `$MaxParallelLimit` | Max adaptive concurrency ceiling | `25` |
+| `$BatchSize` | SharePoint REST `$batch` chunk size | `25` |
+| `$ShortcutActionParallelLimit` | Parallel create/delete shortcut operations | `8` |
+| `$GraphMutationMaxAttempts` | Retry attempts for Graph create/move/rename/delete calls | `5` |
+| `$DryRun` | Preview mode, no writes/deletes/renames | `$true` |
+| `$EnableRecursivePermissionPreCheck` | Resolve recursive site/list/group memberships before API matrix fallback | `$true` |
+| `$PreCheckIncludeEveryoneClaims` | Treat broad Everyone/All users claims as allow-all in pre-check | `$true` |
+| `$PreCheckVerboseDiagnostics` | Verbose diagnostics for recursive pre-check behavior | `$false` |
+| `$PreCheckMaxRecursionDepth` | Max recursion depth for principal expansion | `8` |
+| `$PreCheckMaxExpandedPrincipals` | Safety cap for expanded principals during recursion | `5000` |
+| `$MaxSitesToProcessForTesting` | Optional limiter for first N filtered sites | `0` |
+
+### Library Compatibility Rules
+The centralized script intentionally skips certain libraries because OneDrive shortcuts are known to behave inconsistently for them:
+- Libraries with **required check-out enabled** (`ForceCheckout = true`)
+- Libraries with **custom columns** (detected as non-base, non-hidden, non-sealed, non-readonly fields)
+
+Skipped libraries are logged in `lastRun.log` with a warning so you can review exactly what was excluded.
 
 ### Authentication
 
