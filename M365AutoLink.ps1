@@ -1737,19 +1737,14 @@ function New-GraphQuery {
 
                 if($resource -like "*sharepoint.com*"){
                     if($Data -and $Data.PSObject.TypeNames -notcontains "System.Management.Automation.PSCustomObject"){
-                        try {
-                            $Data = $Data | ConvertFrom-Json -AsHashtable
-                        } catch {
-                            # Fallback for PS5.1 duplicate key issues (e.g. 'Id' and 'ID')
-                            $Null = Add-Type -AssemblyName System.Web.Extensions
-                            $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
-                            $serializer.MaxJsonLength = 2147483647
-                            $jsonContent = $serializer.DeserializeObject($Data)
-                            if ($jsonContent -is [System.Collections.IDictionary]) {
-                                $Data = New-Object Hashtable $jsonContent
-                            } else {
-                                $Data = $jsonContent
-                            }
+                        $Null = Add-Type -AssemblyName System.Web.Extensions
+                        $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+                        $serializer.MaxJsonLength = 2147483647
+                        $jsonContent = $serializer.DeserializeObject($Data)
+                        if ($jsonContent -is [System.Collections.IDictionary]) {
+                            $Data = New-Object Hashtable $jsonContent
+                        } else {
+                            $Data = $jsonContent
                         }
                     }
                 }
@@ -2008,7 +2003,9 @@ function Initialize-TrayIcon {
     if(-not $EnableSystemTrayIcon -or $script:traySync) { return }
 
     try {
-        $script:traySync = [hashtable]::Synchronized(@{
+        # Keep a plain hashtable here to avoid long-running UI lock contention on synchronized hashtables.
+        # Keys are fixed at initialization; only value updates happen across threads.
+        $script:traySync = @{
             Text            = "M365AutoLink - Starting"
             ProgressPercent = 0
             ProgressText    = "Idle"
@@ -2031,7 +2028,7 @@ function Initialize-TrayIcon {
             HelpLink        = $TrayHelpLink
             CopyrightText   = $TrayCopyrightText
             CopyrightLink   = $TrayCopyrightLink
-        })
+        }
 
         $script:trayRunspace = [runspacefactory]::CreateRunspace()
         $script:trayRunspace.ApartmentState = "STA"
@@ -2093,25 +2090,35 @@ function Initialize-TrayIcon {
 
             $remapItem = New-Object Windows.Forms.ToolStripMenuItem("Run now")
             $remapItem.Add_Click({
-                if(-not $sync.IsRunning) {
-                    $sync.RequestRerun = $true
-                }
+                try {
+                    if(-not $sync.IsRunning) {
+                        $sync.RequestRerun = $true
+                    }
+                } catch {}
             })
 
             $manageExclusionsItem = New-Object Windows.Forms.ToolStripMenuItem("Manage excluded sites")
             $manageExclusionsItem.Add_Click({
-                if(-not $sync.IsRunning) {
-                    $sync.RequestManageExclusions = $true
-                    $icon.ShowBalloonTip(1500, "M365AutoLink", "Opening site exclusions...", [Windows.Forms.ToolTipIcon]::Info)
+                try {
+                    if(-not $sync.IsRunning) {
+                        $sync.RequestManageExclusions = $true
+                        $icon.ShowBalloonTip(1500, "M365AutoLink", "Opening site exclusions...", [Windows.Forms.ToolTipIcon]::Info)
+                    }
+                } catch {
+                    try { $icon.ShowBalloonTip(2000, "M365AutoLink", "Tray action failed. Please try again.", [Windows.Forms.ToolTipIcon]::Warning) } catch {}
                 }
             })
             $manageExclusionsItem.Enabled = $false
 
             $showExistingItem = New-Object Windows.Forms.ToolStripMenuItem("Show shortcuts")
             $showExistingItem.Add_Click({
-                if($sync.HasCompletedRun) {
-                    $sync.RequestShowExisting = $true
-                    $icon.ShowBalloonTip(1500, "M365AutoLink", "Opening shortcuts...", [Windows.Forms.ToolTipIcon]::Info)
+                try {
+                    if($sync.HasCompletedRun) {
+                        $sync.RequestShowExisting = $true
+                        $icon.ShowBalloonTip(1500, "M365AutoLink", "Opening shortcuts...", [Windows.Forms.ToolTipIcon]::Info)
+                    }
+                } catch {
+                    try { $icon.ShowBalloonTip(2000, "M365AutoLink", "Tray action failed. Please try again.", [Windows.Forms.ToolTipIcon]::Warning) } catch {}
                 }
             })
             $showExistingItem.Enabled = $false
@@ -2154,36 +2161,40 @@ function Initialize-TrayIcon {
             $timer = New-Object Windows.Forms.Timer
             $timer.Interval = 250
             $timer.Add_Tick({
-                if($sync.ExitRequested) {
-                    $timer.Stop()
-                    $icon.Visible = $false
-                    $icon.Dispose()
-                    [Windows.Forms.Application]::ExitThread()
-                    return
-                }
-
-                $tipText = "M365AutoLink"
-                if($tipText.Length -gt 63) { $tipText = $tipText.Substring(0, 63) }
-                $icon.Text = $tipText
-
-                if($sync.IsRunning) {
-                    $remapItem.Enabled = $false
-                    $manageExclusionsItem.Enabled = $false
-                    $showExistingItem.Enabled = $false
-                } else {
-                    $remapItem.Enabled = $true
-                    $manageExclusionsItem.Enabled = [bool]$sync.HasMappedSites
-                    $showExistingItem.Enabled = [bool]$sync.HasCompletedRun
-                }
-
-                if($sync.ShowBalloon) {
-                    $sync.ShowBalloon = $false
-                    $tipIcon = switch ($sync.BalloonIcon) {
-                        "Warning" { [Windows.Forms.ToolTipIcon]::Warning }
-                        "Error"   { [Windows.Forms.ToolTipIcon]::Error }
-                        default    { [Windows.Forms.ToolTipIcon]::Info }
+                try {
+                    if($sync.ExitRequested) {
+                        $timer.Stop()
+                        $icon.Visible = $false
+                        $icon.Dispose()
+                        [Windows.Forms.Application]::ExitThread()
+                        return
                     }
-                    $icon.ShowBalloonTip(3000, $sync.BalloonTitle, $sync.BalloonMsg, $tipIcon)
+
+                    $tipText = "M365AutoLink"
+                    if($tipText.Length -gt 63) { $tipText = $tipText.Substring(0, 63) }
+                    $icon.Text = $tipText
+
+                    if($sync.IsRunning) {
+                        $remapItem.Enabled = $false
+                        $manageExclusionsItem.Enabled = $false
+                        $showExistingItem.Enabled = $false
+                    } else {
+                        $remapItem.Enabled = $true
+                        $manageExclusionsItem.Enabled = [bool]$sync.HasMappedSites
+                        $showExistingItem.Enabled = [bool]$sync.HasCompletedRun
+                    }
+
+                    if($sync.ShowBalloon) {
+                        $sync.ShowBalloon = $false
+                        $tipIcon = switch ($sync.BalloonIcon) {
+                            "Warning" { [Windows.Forms.ToolTipIcon]::Warning }
+                            "Error"   { [Windows.Forms.ToolTipIcon]::Error }
+                            default    { [Windows.Forms.ToolTipIcon]::Info }
+                        }
+                        $icon.ShowBalloonTip(3000, $sync.BalloonTitle, $sync.BalloonMsg, $tipIcon)
+                    }
+                } catch {
+                    # Never let a timer tick exception kill tray responsiveness.
                 }
             })
             $timer.Start()
