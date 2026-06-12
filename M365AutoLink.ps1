@@ -160,10 +160,6 @@ $global:octo.LogPath = "$env:APPDATA\M365AutoLink\lastRun.log"
 $script:traySync = $null
 $script:trayRunspace = $null
 $script:trayPS = $null
-$script:progressForm = $null
-$script:progressBarFill = $null
-$script:progressBarLabel = $null
-$script:progressBarTrackWidth = 0
 $script:userConfig = $null
 $script:lastMappedSiteOptions = @()
 $script:lastAlreadyExistingShortcuts = @()
@@ -207,7 +203,7 @@ function Get-CleanedShortcutName {
     }
     $cleanedName = $cleanedName.Trim()
     if([string]::IsNullOrWhiteSpace($cleanedName)){
-        $cleanedName = $Name.Trim() # fallback to original if cleaning produces empty string
+        $cleanedName = $Name.Trim()
     }
     return $cleanedName
 }
@@ -743,10 +739,10 @@ function Invoke-GraphRaw {
     $headers = @{ Authorization = "Bearer $token" }
 
     if($PSBoundParameters.ContainsKey('Body')) {
-        return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -Body $Body -ContentType $ContentType -ErrorAction Stop -UserAgent "ISV|LiebenConsultancy|M365AutoLink|1.0"
+        return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -Body $Body -ContentType $ContentType -ErrorAction Stop -TimeoutSec 120 -UserAgent "ISV|LiebenConsultancy|M365AutoLink|1.0"
     }
 
-    return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -ErrorAction Stop -UserAgent "ISV|LiebenConsultancy|M365AutoLink|1.0"
+    return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -ErrorAction Stop -TimeoutSec 120 -UserAgent "ISV|LiebenConsultancy|M365AutoLink|1.0"
 }
 
 function Get-OneDriveFolder {
@@ -1385,7 +1381,7 @@ function get-AccessToken{
         [Switch]$returnHeader
     )   
 
-    # Try to load refresh token from disk (completely silent)
+    # Try to load refresh token from disk
     if(!$global:octo.LCRefreshToken -and (Test-Path $global:octo.TokenCachePath)){
         try {
             $global:octo.LCRefreshToken = (Import-Clixml $global:octo.TokenCachePath).GetNetworkCredential().Password
@@ -1396,7 +1392,7 @@ function get-AccessToken{
         }     
     }
 
-    # Use cached refresh token (completely silent)
+    # Use cached refresh token
     if($global:octo.LCRefreshToken){
         try {
             $response = Invoke-RestMethod "$($global:octo.idpUrl)/common/oauth2/token" -Method POST -Body "resource=$([System.Web.HttpUtility]::UrlEncode($resource))&grant_type=refresh_token&refresh_token=$($global:octo.LCRefreshToken)&client_id=$($global:octo.LCClientId)" -ErrorAction Stop -Verbose:$false
@@ -1427,12 +1423,11 @@ function get-AccessToken{
         }
     }
 
-    # Browser-based authentication (sometimes interactive)
+    # Browser-based authentication
     if(!$global:octo.LCRefreshToken){
         $global:octo.LCRefreshToken = Get-BrowserAuthorizationCode
     }
 
-    # Now get the access token for the requested resource
     if(!$global:octo.LCCachedTokens.$resource){
         $global:octo.LCCachedTokens.$resource = @{ "validFrom" = Get-Date; "accessToken" = $Null }
     }
@@ -1801,150 +1796,13 @@ function Write-Log {
 }
 
 function Initialize-ProgressBar {
-    if(-not $ShowProgressBar -or $script:progressForm) { return }
-
-    try {
-        [void][System.Reflection.Assembly]::LoadWithPartialName("System.Drawing")
-        [void][System.Reflection.Assembly]::LoadWithPartialName("System.Windows.Forms")
-
-        $w = 360
-        $h = 50
-        $pad = 8
-        $iconBox = 24
-        $trackH = 5
-        $script:progressBarTrackWidth = $w - ($pad * 2) - $iconBox - 8
-
-        $form = New-Object Windows.Forms.Form
-        $form.Text = "M365AutoLink"
-        $form.Size = New-Object Drawing.Size($w, $h)
-        $form.MaximumSize = $form.Size
-        $form.MinimumSize = $form.Size
-        $form.BackColor = [Drawing.Color]::FromArgb(33, 37, 43)
-        $form.ControlBox = $false
-        $form.FormBorderStyle = "None"
-        $form.ShowInTaskbar = $false
-        $form.StartPosition = "Manual"
-        $form.TopMost = $true
-        $form.Opacity = 0.90
-
-        $radius = 8
-        $gp = New-Object Drawing.Drawing2D.GraphicsPath
-        $gp.AddArc(0, 0, $radius * 2, $radius * 2, 180, 90)
-        $gp.AddArc($w - $radius * 2 - 1, 0, $radius * 2, $radius * 2, 270, 90)
-        $gp.AddArc($w - $radius * 2 - 1, $h - $radius * 2 - 1, $radius * 2, $radius * 2, 0, 90)
-        $gp.AddArc(0, $h - $radius * 2 - 1, $radius * 2, $radius * 2, 90, 90)
-        $gp.CloseFigure()
-        $form.Region = New-Object Drawing.Region($gp)
-        $gp.Dispose()
-
-        $iconPanel = New-Object Windows.Forms.Panel
-        $iconPanel.Location = New-Object Drawing.Point($pad, 7)
-        $iconPanel.Size = New-Object Drawing.Size($iconBox, 24)
-        $iconPanel.BackColor = [Drawing.Color]::Transparent
-
-        $iconBitmap = New-Object Drawing.Bitmap($iconBox, 24)
-        $ig = [Drawing.Graphics]::FromImage($iconBitmap)
-        $ig.SmoothingMode = "AntiAlias"
-        $ig.Clear([Drawing.Color]::Transparent)
-        $iconFill = New-Object Drawing.SolidBrush([Drawing.Color]::FromArgb(0, 163, 255))
-        $ig.FillEllipse($iconFill, 3, 9, 19, 11)
-        $ig.FillEllipse($iconFill, 7, 4, 13, 10)
-        $ig.FillEllipse($iconFill, 1, 10, 10, 9)
-        $ig.FillEllipse($iconFill, 14, 10, 11, 9)
-        $iconPen = New-Object Drawing.Pen([Drawing.Color]::White, 1.7)
-        $iconPen.StartCap = $iconPen.EndCap = [Drawing.Drawing2D.LineCap]::Round
-        $ig.DrawLine($iconPen, 13, 17, 13, 11)
-        $ig.DrawLine($iconPen, 10, 13, 13, 11)
-        $ig.DrawLine($iconPen, 16, 13, 13, 11)
-        $iconPen.Dispose(); $iconFill.Dispose(); $ig.Dispose()
-
-        $iconPicture = New-Object Windows.Forms.PictureBox
-        $iconPicture.Location = New-Object Drawing.Point(0, 0)
-        $iconPicture.Size = New-Object Drawing.Size($iconBox, 24)
-        $iconPicture.BackColor = [Drawing.Color]::Transparent
-        $iconPicture.Image = $iconBitmap
-        $iconPicture.SizeMode = "CenterImage"
-        $iconPanel.Controls.Add($iconPicture)
-
-        $label = New-Object Windows.Forms.Label
-        $label.Text = $ProgressBarText
-        $label.Location = New-Object Drawing.Point(($pad + $iconBox + 8), 7)
-        $label.Size = New-Object Drawing.Size(($w - ($pad * 2) - $iconBox - 8), 15)
-        $label.Font = New-Object Drawing.Font("Segoe UI", 9)
-        $label.ForeColor = [Drawing.Color]::FromArgb(237, 244, 252)
-        $label.BackColor = [Drawing.Color]::Transparent
-        $label.AutoEllipsis = $true
-
-        $track = New-Object Windows.Forms.Panel
-        $track.Location = New-Object Drawing.Point(($pad + $iconBox + 8), 32)
-        $track.Size = New-Object Drawing.Size($script:progressBarTrackWidth, $trackH)
-        $track.BackColor = [Drawing.Color]::FromArgb(72, 82, 94)
-
-        $fill = New-Object Windows.Forms.Panel
-        $fill.Location = New-Object Drawing.Point(0, 0)
-        $fill.Size = New-Object Drawing.Size(0, $trackH)
-        $fill.BackColor = [Drawing.ColorTranslator]::FromHtml($ProgressBarColor)
-
-        $track.Controls.Add($fill)
-        $form.Controls.AddRange(@($iconPanel, $label, $track))
-
-        [void]$form.Show()
-        $screen = ([Windows.Forms.Screen]::AllScreens | Where-Object { $_.Primary }).WorkingArea
-        $form.SetDesktopLocation(($screen.Right - $w - 12), ($screen.Bottom - $h - 12))
-        $form.Refresh()
-
-        $script:progressForm = $form
-        $script:progressBarFill = $fill
-        $script:progressBarLabel = $label
-        $script:progressBarFill.Width = [int]($script:progressBarTrackWidth * 2 / 100)
-        $script:progressForm.Refresh()
-        [Windows.Forms.Application]::DoEvents()
-    } catch {
-        $script:progressForm = $null
-        $script:progressBarFill = $null
-        $script:progressBarLabel = $null
-        $script:progressBarTrackWidth = 0
-    }
-}
-
-function Update-ProgressBar {
-    param(
-        [int]$Percent,
-        [string]$ProgressText
-    )
-
-    if(-not $ShowProgressBar -or -not $script:progressForm -or -not $script:progressBarFill) { return }
-
-    try {
-        $safePercent = [Math]::Max(0, [Math]::Min(100, $Percent))
-        $targetWidth = [int]($script:progressBarTrackWidth * $safePercent / 100)
-        if($safePercent -gt 0 -and $targetWidth -lt 2) { $targetWidth = 2 }
-        $script:progressBarFill.Width = $targetWidth
-        if($script:progressBarLabel -and $ProgressText) {
-            $script:progressBarLabel.Text = "M365AutoLink: $ProgressText"
-        }
-        $script:progressForm.Refresh()
-        [Windows.Forms.Application]::DoEvents()
-    } catch {}
+    if(-not $ShowProgressBar -or -not $script:traySync) { return }
+    $script:traySync.ProgressVisible = $true
 }
 
 function Stop-ProgressBar {
-    if(-not $script:progressForm) { return }
-
-    try {
-        if($script:progressBarFill -and $script:progressBarTrackWidth -gt 0) {
-            $script:progressBarFill.Width = $script:progressBarTrackWidth
-        }
-        $script:progressForm.Refresh()
-        Start-Sleep -Milliseconds 180
-        $script:progressForm.Close()
-        $script:progressForm.Dispose()
-    } catch {}
-
-    $script:progressForm = $null
-    $script:progressBarFill = $null
-    $script:progressBarLabel = $null
-    $script:progressBarTrackWidth = 0
+    if(-not $script:traySync) { return }
+    $script:traySync.ProgressVisible = $false
 }
 
 function Update-TrayState {
@@ -1978,15 +1836,6 @@ function Update-TrayState {
         $script:traySync.ProgressText = $ProgressText
     }
 
-    if($PSBoundParameters.ContainsKey("Percent") -or $PSBoundParameters.ContainsKey("ProgressText")) {
-        $progressPercentValue = if($PSBoundParameters.ContainsKey("Percent")) { $Percent } else { 0 }
-        $progressTextValue = if($PSBoundParameters.ContainsKey("ProgressText")) { $ProgressText } else { "" }
-        if(-not $PSBoundParameters.ContainsKey("Percent") -and $script:traySync) {
-            $progressPercentValue = [int]$script:traySync.ProgressPercent
-        }
-        Update-ProgressBar -Percent $progressPercentValue -ProgressText $progressTextValue
-    }
-
     if($PSBoundParameters.ContainsKey("IsRunning")) {
         $script:traySync.IsRunning = [bool]$IsRunning
     }
@@ -2000,15 +1849,21 @@ function Update-TrayState {
 }
 
 function Initialize-TrayIcon {
-    if(-not $EnableSystemTrayIcon -or $script:traySync) { return }
+    # This runspace owns ALL long-lived WinForms UI (tray icon AND progress form) and pumps
+    # messages continuously via Application.Run().
+    if($script:traySync) { return }
+    if(-not $EnableSystemTrayIcon -and -not $ShowProgressBar) { return }
 
     try {
-        # Keep a plain hashtable here to avoid long-running UI lock contention on synchronized hashtables.
-        # Keys are fixed at initialization; only value updates happen across threads.
-        $script:traySync = @{
+        $script:traySync = [hashtable]::Synchronized(@{
             Text            = "M365AutoLink - Starting"
             ProgressPercent = 0
             ProgressText    = "Idle"
+            ProgressVisible = $false
+            ProgressBarText = $ProgressBarText
+            ProgressBarColor = $ProgressBarColor
+            EnableTrayIcon  = [bool]$EnableSystemTrayIcon
+            TrayReady       = $false
             IsRunning       = $false
             HasCompletedRun = $false
             HasMappedSites  = $false
@@ -2017,6 +1872,7 @@ function Initialize-TrayIcon {
             RequestManageExclusions = $false
             RequestShowExisting = $false
             ExitRequested   = $false
+            RefreshIconRequested = $false
             BalloonTitle    = ""
             BalloonMsg      = ""
             BalloonIcon     = "Info"
@@ -2028,7 +1884,7 @@ function Initialize-TrayIcon {
             HelpLink        = $TrayHelpLink
             CopyrightText   = $TrayCopyrightText
             CopyrightLink   = $TrayCopyrightLink
-        }
+        })
 
         $script:trayRunspace = [runspacefactory]::CreateRunspace()
         $script:trayRunspace.ApartmentState = "STA"
@@ -2039,6 +1895,16 @@ function Initialize-TrayIcon {
         $script:trayPS = [powershell]::Create().AddScript({
             [void][System.Reflection.Assembly]::LoadWithPartialName("System.Drawing")
             [void][System.Reflection.Assembly]::LoadWithPartialName("System.Windows.Forms")
+
+            try {
+                $powerModeHandler = {
+                    param($powerSender, $powerArgs)
+                    if($powerArgs.Mode -eq [Microsoft.Win32.PowerModes]::Resume) {
+                        try { $sync.RefreshIconRequested = $true } catch {}
+                    }
+                }
+                [Microsoft.Win32.SystemEvents]::add_PowerModeChanged($powerModeHandler)
+            } catch {}
 
             $icon = New-Object Windows.Forms.NotifyIcon
 
@@ -2061,7 +1927,9 @@ function Initialize-TrayIcon {
             $icon.Icon = [Drawing.Icon]::FromHandle($bmp.GetHicon())
             $bmp.Dispose()
 
-            $icon.Visible = $true
+            # When only the progress bar is enabled, this runspace still runs but the icon stays hidden.
+            $icon.Visible = [bool]$sync.EnableTrayIcon
+            $icon.Text = "M365AutoLink"
 
             $icon.Add_MouseClick({
                 param($sender, $e)
@@ -2087,6 +1955,21 @@ function Initialize-TrayIcon {
             })
 
             $menu = New-Object Windows.Forms.ContextMenuStrip
+            $menu.AutoClose = $true
+
+            $menu.Add_Opening({
+                try {
+                    if($sync.IsRunning) {
+                        $remapItem.Enabled = $false
+                        $manageExclusionsItem.Enabled = $false
+                        $showExistingItem.Enabled = $false
+                    } else {
+                        $remapItem.Enabled = $true
+                        $manageExclusionsItem.Enabled = [bool]$sync.HasMappedSites
+                        $showExistingItem.Enabled = [bool]$sync.HasCompletedRun
+                    }
+                } catch {}
+            })
 
             $remapItem = New-Object Windows.Forms.ToolStripMenuItem("Run now")
             $remapItem.Add_Click({
@@ -2141,10 +2024,7 @@ function Initialize-TrayIcon {
 
             $exitItem = New-Object Windows.Forms.ToolStripMenuItem("Exit M365AutoLink")
             $exitItem.Add_Click({
-                $sync.ExitRequested = $true
-                $icon.Visible = $false
-                $icon.Dispose()
-                [Windows.Forms.Application]::ExitThread()
+                try { $sync.ExitRequested = $true } catch {}
             })
 
             [void]$menu.Items.Add($remapItem)
@@ -2158,52 +2038,210 @@ function Initialize-TrayIcon {
             [void]$menu.Items.Add($exitItem)
             $icon.ContextMenuStrip = $menu
 
+            $script:progressForm = $null
+            $script:progressFill = $null
+            $script:progressLabel = $null
+            $script:progressTrackWidth = 0
+            $script:progressFormBroken = $false
+            $script:lastProgressPercent = -1
+            $script:lastProgressText = $null
+            $script:lastIconText = ""
+
+            function New-M365ProgressForm {
+                $w = 360
+                $h = 50
+                $pad = 8
+                $iconBox = 24
+                $trackH = 5
+                $script:progressTrackWidth = $w - ($pad * 2) - $iconBox - 8
+
+                $form = New-Object Windows.Forms.Form
+                $form.Text = "M365AutoLink"
+                $form.Size = New-Object Drawing.Size($w, $h)
+                $form.MaximumSize = $form.Size
+                $form.MinimumSize = $form.Size
+                $form.BackColor = [Drawing.Color]::FromArgb(33, 37, 43)
+                $form.ControlBox = $false
+                $form.FormBorderStyle = "None"
+                $form.ShowInTaskbar = $false
+                $form.StartPosition = "Manual"
+                $form.TopMost = $true
+                $form.Opacity = 0.90
+
+                $radius = 8
+                $gp = New-Object Drawing.Drawing2D.GraphicsPath
+                $gp.AddArc(0, 0, $radius * 2, $radius * 2, 180, 90)
+                $gp.AddArc($w - $radius * 2 - 1, 0, $radius * 2, $radius * 2, 270, 90)
+                $gp.AddArc($w - $radius * 2 - 1, $h - $radius * 2 - 1, $radius * 2, $radius * 2, 0, 90)
+                $gp.AddArc(0, $h - $radius * 2 - 1, $radius * 2, $radius * 2, 90, 90)
+                $gp.CloseFigure()
+                $form.Region = New-Object Drawing.Region($gp)
+                $gp.Dispose()
+
+                $iconPanel = New-Object Windows.Forms.Panel
+                $iconPanel.Location = New-Object Drawing.Point($pad, 7)
+                $iconPanel.Size = New-Object Drawing.Size($iconBox, 24)
+                $iconPanel.BackColor = [Drawing.Color]::Transparent
+
+                $iconBitmap = New-Object Drawing.Bitmap($iconBox, 24)
+                $ig = [Drawing.Graphics]::FromImage($iconBitmap)
+                $ig.SmoothingMode = "AntiAlias"
+                $ig.Clear([Drawing.Color]::Transparent)
+                $iconFill = New-Object Drawing.SolidBrush([Drawing.Color]::FromArgb(0, 163, 255))
+                $ig.FillEllipse($iconFill, 3, 9, 19, 11)
+                $ig.FillEllipse($iconFill, 7, 4, 13, 10)
+                $ig.FillEllipse($iconFill, 1, 10, 10, 9)
+                $ig.FillEllipse($iconFill, 14, 10, 11, 9)
+                $iconPen = New-Object Drawing.Pen([Drawing.Color]::White, 1.7)
+                $iconPen.StartCap = $iconPen.EndCap = [Drawing.Drawing2D.LineCap]::Round
+                $ig.DrawLine($iconPen, 13, 17, 13, 11)
+                $ig.DrawLine($iconPen, 10, 13, 13, 11)
+                $ig.DrawLine($iconPen, 16, 13, 13, 11)
+                $iconPen.Dispose(); $iconFill.Dispose(); $ig.Dispose()
+
+                $iconPicture = New-Object Windows.Forms.PictureBox
+                $iconPicture.Location = New-Object Drawing.Point(0, 0)
+                $iconPicture.Size = New-Object Drawing.Size($iconBox, 24)
+                $iconPicture.BackColor = [Drawing.Color]::Transparent
+                $iconPicture.Image = $iconBitmap
+                $iconPicture.SizeMode = "CenterImage"
+                $iconPanel.Controls.Add($iconPicture)
+
+                $label = New-Object Windows.Forms.Label
+                $label.Text = [string]$sync.ProgressBarText
+                $label.Location = New-Object Drawing.Point(($pad + $iconBox + 8), 7)
+                $label.Size = New-Object Drawing.Size(($w - ($pad * 2) - $iconBox - 8), 15)
+                $label.Font = New-Object Drawing.Font("Segoe UI", 9)
+                $label.ForeColor = [Drawing.Color]::FromArgb(237, 244, 252)
+                $label.BackColor = [Drawing.Color]::Transparent
+                $label.AutoEllipsis = $true
+
+                $track = New-Object Windows.Forms.Panel
+                $track.Location = New-Object Drawing.Point(($pad + $iconBox + 8), 32)
+                $track.Size = New-Object Drawing.Size($script:progressTrackWidth, $trackH)
+                $track.BackColor = [Drawing.Color]::FromArgb(72, 82, 94)
+
+                $fill = New-Object Windows.Forms.Panel
+                $fill.Location = New-Object Drawing.Point(0, 0)
+                $fill.Size = New-Object Drawing.Size(0, $trackH)
+                try {
+                    $fill.BackColor = [Drawing.ColorTranslator]::FromHtml([string]$sync.ProgressBarColor)
+                } catch {
+                    $fill.BackColor = [Drawing.Color]::FromArgb(0, 163, 255)
+                }
+
+                $track.Controls.Add($fill)
+                $form.Controls.AddRange(@($iconPanel, $label, $track))
+
+                [void]$form.Show()
+                $screen = [Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+                $form.SetDesktopLocation(($screen.Right - $w - 12), ($screen.Bottom - $h - 12))
+
+                $script:progressForm = $form
+                $script:progressFill = $fill
+                $script:progressLabel = $label
+                $script:lastProgressPercent = -1
+                $script:lastProgressText = $null
+            }
+
             $timer = New-Object Windows.Forms.Timer
-            $timer.Interval = 250
+            $timer.Interval = 200
             $timer.Add_Tick({
                 try {
                     if($sync.ExitRequested) {
                         $timer.Stop()
-                        $icon.Visible = $false
-                        $icon.Dispose()
+                        if($script:progressForm) {
+                            try { $script:progressForm.Close(); $script:progressForm.Dispose() } catch {}
+                            $script:progressForm = $null
+                        }
+                        try {
+                            $icon.Visible = $false
+                            $icon.Dispose()
+                        } catch {}
                         [Windows.Forms.Application]::ExitThread()
                         return
                     }
 
-                    $tipText = "M365AutoLink"
-                    if($tipText.Length -gt 63) { $tipText = $tipText.Substring(0, 63) }
-                    $icon.Text = $tipText
-
-                    if($sync.IsRunning) {
-                        $remapItem.Enabled = $false
-                        $manageExclusionsItem.Enabled = $false
-                        $showExistingItem.Enabled = $false
-                    } else {
-                        $remapItem.Enabled = $true
-                        $manageExclusionsItem.Enabled = [bool]$sync.HasMappedSites
-                        $showExistingItem.Enabled = [bool]$sync.HasCompletedRun
+                    if($sync.ProgressVisible) {
+                        if((-not $script:progressForm -or $script:progressForm.IsDisposed) -and -not $script:progressFormBroken) {
+                            try {
+                                New-M365ProgressForm
+                            } catch {
+                                # Creation failed; don't retry on every tick.
+                                $script:progressFormBroken = $true
+                                $script:progressForm = $null
+                            }
+                        }
+                        if($script:progressForm -and -not $script:progressForm.IsDisposed) {
+                            $percent = [Math]::Max(0, [Math]::Min(100, [int]$sync.ProgressPercent))
+                            if($percent -ne $script:lastProgressPercent) {
+                                $script:lastProgressPercent = $percent
+                                $targetWidth = [int]($script:progressTrackWidth * $percent / 100)
+                                if($percent -gt 0 -and $targetWidth -lt 2) { $targetWidth = 2 }
+                                $script:progressFill.Width = $targetWidth
+                            }
+                            $progressText = [string]$sync.ProgressText
+                            if($progressText -ne $script:lastProgressText) {
+                                $script:lastProgressText = $progressText
+                                if([string]::IsNullOrWhiteSpace($progressText)) {
+                                    $script:progressLabel.Text = [string]$sync.ProgressBarText
+                                } else {
+                                    $script:progressLabel.Text = "M365AutoLink: $progressText"
+                                }
+                            }
+                        }
+                    } elseif($script:progressForm) {
+                        try { $script:progressForm.Close(); $script:progressForm.Dispose() } catch {}
+                        $script:progressForm = $null
+                        $script:progressFill = $null
+                        $script:progressLabel = $null
                     }
 
-                    if($sync.ShowBalloon) {
-                        $sync.ShowBalloon = $false
-                        $tipIcon = switch ($sync.BalloonIcon) {
-                            "Warning" { [Windows.Forms.ToolTipIcon]::Warning }
-                            "Error"   { [Windows.Forms.ToolTipIcon]::Error }
-                            default    { [Windows.Forms.ToolTipIcon]::Info }
+                    if(-not $menu.Visible) {
+                        $iconText = [string]$sync.Text
+                        if($iconText -and $iconText -ne $script:lastIconText) {
+                            $script:lastIconText = $iconText
+                            try { $icon.Text = $iconText } catch {}
                         }
-                        $icon.ShowBalloonTip(3000, $sync.BalloonTitle, $sync.BalloonMsg, $tipIcon)
+
+                        if($sync.RefreshIconRequested) {
+                            $sync.RefreshIconRequested = $false
+                            if($sync.EnableTrayIcon) {
+                                try {
+                                    $icon.Visible = $false
+                                    $icon.Visible = $true
+                                } catch {}
+                            }
+                        }
+
+                        if($sync.ShowBalloon) {
+                            $sync.ShowBalloon = $false
+                            if($sync.EnableTrayIcon -and -not [string]::IsNullOrWhiteSpace([string]$sync.BalloonMsg)) {
+                                $tipIcon = switch ([string]$sync.BalloonIcon) {
+                                    "Warning" { [Windows.Forms.ToolTipIcon]::Warning }
+                                    "Error"   { [Windows.Forms.ToolTipIcon]::Error }
+                                    default    { [Windows.Forms.ToolTipIcon]::Info }
+                                }
+                                $icon.ShowBalloonTip(3000, [string]$sync.BalloonTitle, [string]$sync.BalloonMsg, $tipIcon)
+                            }
+                        }
                     }
                 } catch {
                     # Never let a timer tick exception kill tray responsiveness.
                 }
             })
             $timer.Start()
+            $sync.TrayReady = $true
 
             [Windows.Forms.Application]::Run()
         })
 
         $script:trayPS.Runspace = $script:trayRunspace
         $null = $script:trayPS.BeginInvoke()
+        $readyDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        while(-not $script:traySync.TrayReady -and [DateTime]::UtcNow -lt $readyDeadline) {
+            Start-Sleep -Milliseconds 25
+        }
     } catch {
         $script:traySync = $null
     }
@@ -2212,10 +2250,22 @@ function Initialize-TrayIcon {
 function Stop-TrayIcon {
     if($script:traySync) {
         $script:traySync.ExitRequested = $true
-        Start-Sleep -Milliseconds 300
     }
-    if($script:trayRunspace) {
-        try { $script:trayRunspace.Close() } catch {}
+
+    if($script:trayPS) {
+        $stopDeadline = [DateTime]::UtcNow.AddSeconds(2)
+        while($script:trayPS.InvocationStateInfo.State -eq 'Running' -and [DateTime]::UtcNow -lt $stopDeadline) {
+            Start-Sleep -Milliseconds 50
+        }
+        if($script:trayPS.InvocationStateInfo.State -ne 'Running') {
+            try { $script:trayPS.Dispose() } catch {}
+            if($script:trayRunspace) {
+                try { $script:trayRunspace.Close() } catch {}
+                try { $script:trayRunspace.Dispose() } catch {}
+            }
+        }
+        $script:trayPS = $null
+        $script:trayRunspace = $null
     }
 }
 
@@ -3090,11 +3140,8 @@ $runInTrayMode = $EnableSystemTrayIcon -and $KeepRunningInTray
 try {
     $script:localOneDriveRootPath = Get-LocalOneDriveRootPath
     $script:localShortcutFolderPath = Get-LocalShortcutFolderPath -FolderName $FolderName
-
-    if($EnableSystemTrayIcon) {
-        Initialize-TrayIcon
-        Update-TrayState -Text "M365AutoLink - Ready" -Percent 0 -ProgressText "Waiting to start"
-    }
+    Initialize-TrayIcon
+    Update-TrayState -Text "M365AutoLink - Ready" -Percent 0 -ProgressText "Waiting to start"
 
     $runRequested = $true
     while($true) {
