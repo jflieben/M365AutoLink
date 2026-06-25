@@ -1,328 +1,176 @@
 # M365AutoLink
-M365AutoLink automatically finds all Microsoft Teams and SharePoint sites you have access to and creates shortcuts to them in your OneDrive, making them available in your file explorer.
 
-There are two versions of the script:
+M365AutoLink automatically finds every Microsoft Teams and SharePoint document library you have access to and creates shortcuts to them in your OneDrive, so they show up in File Explorer like any other folder.
 
-| | **M365AutoLink.ps1** (User) | **M365AutoLink_Centralized.ps1** (Admin) |
-|---|---|---|
-| **Runs as** | The logged-in user (delegated) | Managed Identity or App Registration (application) |
-| **Intended for** | Logon scripts / end-user self-service | Scheduled tasks, Azure Automation, Azure Functions |
-| **Site discovery** | `sites?search=*` (delegated) | Enumerates all tenant sites + per-user permission check |
-| **Targets** | Current user only | Any/all users (group, list, or tenant-wide) |
-| **Auth** | Browser-based OAuth / refresh token | Managed Identity, or certificate-based client credentials |
+This script (`M365AutoLink.ps1`) runs **as the signed-in user** (delegated authentication). It is meant to be run as logon script, shortcut or scheduled task.
+
+> **Need to roll this out centrally, for many users, without anyone signing in?**
+> There is a server-side admin version that runs with a Managed Identity or certificate and processes any/all users from Azure Automation, an Azure Function, or a scheduled task. See **[README_Centralized.md](README_Centralized.md)**. That version won't scale well beyond a few hundred users.
 
 ![M365AutoLink Demo](M365AutoLink.gif)
 
-# Features
-- **Saves Time**: Instantly links all your collaborative spaces to your OneDrive.
-- **Organization**: Creates a dedicated folder (default: "AutoLink") in your OneDrive root for all shortcuts.
-- **Silent Operation**: Caches authentication tokens so subsequent runs can happen silently in the background.
-- **Smart Filtering**: Includes configuration to exclude specific site patterns (e.g. personal sites).
-- **Centralized Mode**: Process multiple users from a single server-side run without requiring user interaction.
-- **Permission-Aware**: Only creates shortcuts for libraries the user actually has access to (View or Edit).
-- **Automatic Cleanup**: Removes obsolete shortcuts when a user loses access to a site.
-- **Safety Filtering**: Automatically skips document libraries that require check-out.
-- **Dry Run Support**: Preview all create/rename/delete actions without changing OneDrive.
-- **High-Scale Optimizations**: Adaptive throttling, SharePoint REST batching, and parallel shortcut actions.
-- **Tray Workflow**: Optional system tray mode keeps the script alive so you can run it again, manage exclusions, view existing shortcuts, or open the log without restarting it.
-- **Launch Persistence**: Optional script-owned launch modes can create Desktop and Start Menu shortcuts, or an at-logon startup method when enabled in the script.
+## Features
+- **Legacy App Support** allows legacy apps to find and use the files you migrated to Microsoft 365
+- **Saves time**: instantly links all your collaborative spaces into your OneDrive.
+- **Organized**: creates a single dedicated folder (default: `AutoLink`) in your OneDrive root for all shortcuts.
+- **Silent after first run**: caches the refresh token so subsequent runs happen silently in the background.
+- **Smart filtering**: include/exclude SharePoint sites by URL wildcard, and skip system libraries automatically.
+- **Permission-aware**: only links libraries you can actually access; obsolete shortcuts are removed when you lose access.
+- **Self-service shortcut management**: a built-in **Manage shortcuts** window lets you see every linked library and exclude the ones you don't want. Changes save to OneDrive and apply across your devices.
+- **Sync-budget awareness**: tracks the total number of items across all linked libraries and warns you (tray icon, tooltip, capacity bar) as you approach the point where Windows Explorer/OneDrive sync becomes unreliable.
+- **Tray workflow**: optional system tray icon keeps the script alive so you can re-run it, manage shortcuts, or open the log without restarting.
+- **Floating progress bar**: an optional bottom-right progress indicator shows what the script is doing.
+- **Launch persistence**: optionally create Desktop / Start Menu shortcuts, or run automatically at logon.
+- **Dry-run support**: preview every create/rename/delete action without touching OneDrive.
+- **Safety filtering**: automatically skips libraries that require check-out, plus system/hidden libraries that don't work well as shortcuts.
 
 ---
 
-# User Version (`M365AutoLink.ps1`)
-
 ## Quick Start
-1. Download the script [`M365AutoLink.ps1`](https://github.com/jflieben/M365AutoLink/blob/main/M365AutoLink.ps1).
-2. [Grant Consent](https://login.microsoftonline.com/organizations/adminconsent?client_id=ae7727e4-0471-4690-b155-76cbf5fdcb30) to the SSO app registration
+1. Download [`M365AutoLink.ps1`](https://github.com/jflieben/M365AutoLink/blob/main/M365AutoLink.ps1).
+2. Have an admin [grant consent](https://login.microsoftonline.com/organizations/adminconsent?client_id=ae7727e4-0471-4690-b155-76cbf5fdcb30) to the SSO app registration (one-time, tenant-wide), or use your own app registration (see [Authentication & Permissions](#authentication--permissions)).
 3. Open a PowerShell terminal (PowerShell 5.x or 7.x).
-4. Run the script: 
+4. Run the script:
    ```powershell
    .\M365AutoLink.ps1
    ```
-5. Wait for the Onedrive client to sync down the new links
+5. Sign in if prompted (first run only). After that, runs are silent.
+6. Wait for the OneDrive client to sync the new shortcuts down to File Explorer.
 
-If tray mode is enabled, you can keep the script running and use the tray icon to **Run now**, manage excluded sites, view shortcuts, open the log, or exit.
+If tray mode is enabled (the default), the script stays in the system tray after the first run. Right-click the tray icon to **Run now**, open **Manage shortcuts**, open the log, get help, or exit.
+
+## How It Works
+1. Authenticates to Microsoft Graph using your cached refresh token if available, else silent browser or else interactive browser, (first time only).
+2. Uses SharePoint Search to find every document library you have access to (this is why a site must not be excluded from search to be linked).
+3. Applies your include/exclude wildcards, file-count limits, and the system-library exclusions.
+4. Creates/renames/deletes OneDrive shortcuts in the `AutoLink` folder so they match exactly what you currently have access to.
+
+---
+
+## Manage Shortcuts
+
+Right-click the tray icon and choose **Manage shortcuts** to open the self-service window. It lists every library the last run considered, with its item count and current status (**Linked** or **Excluded**). Tick the **Exclude** box on any library to stop syncing it; untick to bring it back.
+
+![Manage shortcuts and link status](exclusions_and_link_status.png)
+
+- The **capacity bar** at the top shows how many items your currently-included libraries add up to, against the recommended ~1,000,000-item budget. It turns amber as you approach the limit and red once you go over.
+- Exclusions are saved to your OneDrive (`Apps/M365AutoLink/config.json`), so they follow you to every device where you run the script.
+- **Saving re-runs the script automatically** to apply your changes immediately.
+
+This replaces the older separate "exclude site" / "view shortcuts" tray actions — both are now handled in this one window, at the individual-library level.
 
 ## Configuration
-You can edit the `##########START CONFIGURATION##########` block at the top of the script to customize:
-- `$FolderName`: The name of the folder created in OneDrive (Default: "AutoLink").
-- `$excludedSitesByWildcard`: Patterns for sites to skip.
-- `$includedSitesByWildcard`: Patterns for sites to include.
-- `$maxFileCount`: Only create a link if the site has less than this amount of files.
-- `$minFileCount`: Only create a link if the site has more than this amount of files.
-- `$linkNameReplacements`: An array of find/replace patterns applied to shortcut names after creation (see [Link Name Cleanup](#link-name-cleanup)).
+Edit the `##########START CONFIGURATION##########` block at the top of the script.
 
-Tray and persistence settings are script-owned rather than user-facing config:
-- `$EnableSystemTrayIcon`: Shows the tray icon and tray menu.
-- `$KeepRunningInTray`: Keeps the process alive after a run so tray actions remain available.
-- `$LaunchModes`: Controls optional Desktop, Start Menu, and AtLogon persistence behavior.
+### Common settings
+| Variable | Description | Default |
+|---|---|---|
+| `$FolderName` | Name of the OneDrive folder that houses all shortcuts (auto-created). | `"AutoLink"` |
+| `$CloudType` | Cloud environment: `global`, `usgov`, `usdod`, `china`. | `"global"` |
+| `$ClientID` | App registration (public client) ID used for authentication. | Lieben Consultancy app |
+| `$DryRun` | Preview mode — no shortcuts are created, renamed, or deleted. | `$false` |
+| `$excludedSitesByWildcard` | URL patterns to **skip** (`*` matches one or more characters). | *(curated default list)* |
+| `$includedSitesByWildcard` | URL patterns to **include** — if set, only matching sites are linked. | `"https://*.sharepoint.com/sites/*"` |
+| `$maxFileCount` | Only link a library with fewer than this many files. | `300000` |
+| `$minFileCount` | Only link a library with more than this many files. | `0` |
+| `$linkNameReplacements` | Find/replace patterns applied to shortcut names (see [Link Name Cleanup](#link-name-cleanup)). | *(see script)* |
+
+> **Note:** any pre-existing sub-folders inside `$FolderName` will be removed — keep that folder dedicated to M365AutoLink.
+
+### Sync-budget warnings
+| Variable | Description | Default |
+|---|---|---|
+| `$totalItemCountWarningThreshold` | Combined item count across all linked libraries at which the tool shows a red "over limit" warning. | `1000000` |
+| `$totalItemCountWarningRatio` | Fraction of the threshold at which the amber "approaching" warning appears. | `0.9` |
+| `$ItemCountHelpLink` | Knowledgebase article opened from the over/approaching-limit notification. | lieben.nu article |
+
+These only **warn** — the tool never blocks you from going over the limit.
+
+### UI / tray / progress
+| Variable | Description | Default |
+|---|---|---|
+| `$ShowProgressBar` | Show the floating bottom-right progress bar. | `$true` |
+| `$ProgressBarColor` / `$ProgressBarText` | Color and caption of the progress bar. | blue / "updating your shortcuts…" |
+| `$EnableSystemTrayIcon` | Show the system tray icon and its menu. | `$true` |
+| `$KeepRunningInTray` | Keep the process alive after a run so tray actions (Run now, Manage shortcuts) stay available. | `$true` |
+| `$WindowStyle` | Browser window style during sign-in (`Normal`, `Hidden`, `Minimized`, `Maximized`). | `"Normal"` |
+| `$LaunchModes` | Persistence options: any of `Desktop`, `Start Menu`, `AtLogon` (see below). | `@('AtLogon')` |
+
+### System-library exclusions
+The script never turns system/hidden libraries (Style Library, Site Assets, Site Pages, Form Templates, Preservation Hold Library, etc.) into shortcuts. These are controlled by `$excludedLibrariesByWildcard`, `$ExcludedListTitles`, and `$ExcludedListFeatureIDs` — only edit these if you know what you're doing.
+
+## Launch Persistence
+`$LaunchModes` controls how the script can re-launch itself:
+- **`AtLogon`** — registers a scheduled task (falling back to a `Run` key or Startup-folder shortcut) so M365AutoLink runs automatically each time you sign in.
+- **`Desktop`** — creates a Desktop shortcut.
+- **`Start Menu`** — creates a Start Menu shortcut.
+
+Set `$LaunchModes = @()` to disable all persistence. Removing a mode also removes the shortcut/task it created on the next run.
+
+---
 
 ## Authentication & Permissions
 
-### Automatic App Registration (easiest)
-You can consent to the "Lieben Consultancy" multi-tenant app:
+### Option 1 — Use the Lieben Consultancy app (easiest)
+Have an admin consent to the multi-tenant public client app:
 [Grant Consent](https://login.microsoftonline.com/organizations/adminconsent?client_id=ae7727e4-0471-4690-b155-76cbf5fdcb30)
 
-These are delegated permissions only, and thus 100% safe.
+These are **delegated** permissions only — the app can never act outside the signed-in user's own access, and Lieben Consultancy cannot access your data. The app registration is used purely for OAuth.
 
 ![Graph Permissions](graphpermissions.png)
 
-### Manual App Registration
-If you don't want to use my app registration, you can create your own App Registration in Azure AD:
-1. Create a new App Registration ("Mobile and desktop applications").
-2. Set Redirect URI to `http://localhost`.
-3. Check the box for: https://login.microsoftonline.com/common/oauth2/nativeclient
-4. Enable "Allow public client flows".
-5. Replace the `$ClientID` variable in the script with your new Application (Client) ID.
-6. Add and grant the permissions shown below
+### Option 2 — Your own app registration
+If you'd rather not use the shared app, create your own public client App Registration in Entra ID:
+1. App registrations → New registration.
+2. Authentication → Add a platform → **Mobile and desktop applications**.
+3. Add redirect URI `http://localhost` and check `https://login.microsoftonline.com/common/oauth2/nativeclient`. (The script listens on a loopback port for the sign-in callback.)
+4. Enable **Allow public client flows**.
+5. Add and grant the delegated permissions below.
+6. Set `$ClientID` in the script to your Application (client) ID.
 
 ### Required Permissions (Delegated)
+**Microsoft Graph**
+- `Files.ReadWrite.All` — create shortcuts in your OneDrive.
+- `Sites.Read.All` — discover the SharePoint sites you have access to.
+- `User.Read` — sign you in.
 
-Graph:
-- `Files.ReadWrite.All`: To create shortcuts in OneDrive.
-- `Sites.Read.All`: To find SharePoint sites you have access to.
-- `User.Read`: To allow user access.
-
-SharePoint:
-- `AllSites.Read`: To get metadata of existing links
+**SharePoint**
+- `AllSites.Read` — read library metadata and run the search query that finds your libraries.
 
 Your app registration's permissions should look like this:
-![Graph Permissions](requiredpermissions.png)
 
-Note that if you disable indexing of a site, it will not be included irrespective of above filtering.
-![Excluded from Search](excludefromsearch.png)
+![Required Permissions](requiredpermissions.png)
 
----
-
-# Centralized Version (`M365AutoLink_Centralized.ps1`)
-
-The centralized version runs with **application permissions** (no user interaction required). It processes one or more target users from a server-side context — ideal for scheduled tasks, Azure Automation runbooks, or Azure Functions.
-
-## Quick Start
-1. Download [`M365AutoLink_Centralized.ps1`](https://github.com/jflieben/M365AutoLink/blob/main/M365AutoLink_Centralized.ps1).
-2. Set up authentication (Managed Identity or App Registration — see below).
-3. Configure target users and site filters in the script's configuration block.
-4. Run the script:
-   ```powershell
-   .\M365AutoLink_Centralized.ps1
-   ```
-
-## How It Works
-1. **Pre-fetches all tenant sites** via `sites/getAllSites` and enumerates their document libraries.
-2. **Filters** sites/libraries using include/exclude wildcard patterns, file count limits, archived/locked status and check-out requirements.
-3. **For each target user**: checks the user's effective SharePoint permissions on every pre-cached library using `getUserEffectivePermissions`, then creates/updates/deletes OneDrive shortcuts accordingly.
-
-This means shortcuts are only created for libraries the user actually has permissions on — including sites shared via direct permissions, not just group membership.
-
-## Configuration
-Edit the `##########START CONFIGURATION##########` block at the top of the script:
-
-| Variable | Description | Default |
-|---|---|---|
-| `$FolderName` | Name of the OneDrive folder for shortcuts | `"AutoLink"` |
-| `$CloudType` | Cloud environment: `global`, `usgov`, `usdod`, `china` | `"global"` |
-| `$ClientId` | App registration client ID for certificate auth fallback | *(see script)* |
-| `$TenantId` | Tenant ID/domain for certificate auth fallback | *(see script)* |
-| `$CertificateThumbprint` | Certificate thumbprint for cert-based auth | *(see script)* |
-| `$CertificatePath` | Path to `.pfx` (alternative to thumbprint) | `""` |
-| `$CertificatePassword` | PFX password (if needed) | `""` |
-| `$TargetMode` | Which users to process: `"Group"`, `"UserList"`, or `"All"` | `"Group"` |
-| `$TargetGroupId` | M365 Group Object ID (when `$TargetMode = "Group"`) | *(see script)* |
-| `$TargetUsers` | Array of UPNs (when `$TargetMode = "UserList"`) | `@()` |
-| `$MinimumPermissionLevel` | `"View"` = read access is enough, `"Edit"` = require contribute/edit | `"Edit"` |
-| `$excludedSitesByWildcard` | URL patterns to exclude from linking | *(see script)* |
-| `$includedSitesByWildcard` | URL patterns to include | `"https://*.sharepoint.com/sites/*"` |
-| `$onlyConnectedSites` | Only process M365 group-connected sites | `$false` |
-| `$maxFileCount` | Skip libraries with more files than this | `300000` |
-| `$minFileCount` | Skip libraries with fewer files than this | `0` |
-| `$linkNameReplacements` | Find/replace patterns for shortcut names | *(see [Link Name Cleanup](#link-name-cleanup))* |
-| `$InitialParallelLimit` | Initial runspace concurrency for phases 1/2 | `10` |
-| `$MaxParallelLimit` | Max adaptive concurrency ceiling | `25` |
-| `$BatchSize` | SharePoint REST `$batch` chunk size | `25` |
-| `$ShortcutActionParallelLimit` | Parallel create/delete shortcut operations | `8` |
-| `$GraphMutationMaxAttempts` | Retry attempts for Graph create/move/rename/delete calls | `5` |
-| `$DryRun` | Preview mode, no writes/deletes/renames | `$true` |
-| `$EnableRecursivePermissionPreCheck` | Resolve recursive site/list/group memberships before API matrix fallback | `$true` |
-| `$PreCheckIncludeEveryoneClaims` | Treat broad Everyone/All users claims as allow-all in pre-check | `$true` |
-| `$PreCheckVerboseDiagnostics` | Verbose diagnostics for recursive pre-check behavior | `$false` |
-| `$PreCheckMaxRecursionDepth` | Max recursion depth for principal expansion | `8` |
-| `$PreCheckMaxExpandedPrincipals` | Safety cap for expanded principals during recursion | `5000` |
-| `$MaxSitesToProcessForTesting` | Optional limiter for first N filtered sites | `0` |
-
-### Library Compatibility Rules
-The centralized script intentionally skips certain libraries because OneDrive shortcuts are known to behave inconsistently for them:
-- Libraries with **required check-out enabled** (`ForceCheckout = true`)
-- Libraries with **custom columns** (detected as non-base, non-hidden, non-sealed, non-readonly fields)
-
-Skipped libraries are logged in `lastRun.log` with a warning so you can review exactly what was excluded.
-
-### Authentication
-
-#### Option 1: Managed Identity (recommended)
-When running on Azure (VM, Automation Account, Functions, App Service), the script automatically acquires tokens via Managed Identity. No additional configuration needed — just grant the required permissions to the MI's service principal.
-
-Authentication methods are tried in this order:
-1. Cert based (only if clientId etc configured)
-2. Azure Functions / App Service identity endpoint (`$env:IDENTITY_ENDPOINT`)
-3. Azure VM Instance Metadata Service (IMDS)
-4. Az PowerShell module (`Connect-AzAccount -Identity`)
-
-#### Option 2: App Registration with Certificate
-For non-Azure environments (e.g. on-premises server, local workstation), configure an Entra ID App Registration with a certificate:
-
-| Variable | Description |
-|---|---|
-| `$ClientId` | Application (client) ID of your App Registration |
-| `$TenantId` | Your tenant ID (GUID or `contoso.onmicrosoft.com`) |
-| `$CertificateThumbprint` | SHA1 thumbprint (cert must be in `CurrentUser\My` or `LocalMachine\My`) |
-| `$CertificatePath` | Path to a `.pfx` file (alternative to thumbprint) |
-| `$CertificatePassword` | Password for the PFX file (if applicable) |
-
-> **Note**: Client secrets are not supported. Certificate-based auth is required.
-
-#### Step-by-step: Generate a certificate and configure it in Entra ID
-
-##### 1. Generate a self-signed certificate
-
-Open a PowerShell terminal **as Administrator** and run:
-
-```powershell
-# Generate a self-signed certificate valid for 2 years
-$cert = New-SelfSignedCertificate `
-    -Subject "CN=M365AutoLink" `
-    -CertStoreLocation "Cert:\CurrentUser\My" `
-    -KeyExportPolicy Exportable `
-    -KeySpec Signature `
-    -KeyLength 2048 `
-    -KeyAlgorithm RSA `
-    -HashAlgorithm SHA256 `
-    -NotAfter (Get-Date).AddYears(2)
-
-# Display the thumbprint (you'll need this later)
-Write-Output "Thumbprint: $($cert.Thumbprint)"
-```
-
-##### 2. Export the certificate
-
-```powershell
-# Export the public key (.cer) — this is uploaded to Entra ID
-Export-Certificate -Cert $cert -FilePath "C:\certs\M365AutoLink.cer"
-
-# Export the private key (.pfx) — this stays on the machine that runs the script
-$pfxPassword = ConvertTo-SecureString -String "YourPfxPassword" -Force -AsPlainText
-Export-PfxCertificate -Cert $cert -FilePath "C:\certs\M365AutoLink.pfx" -Password $pfxPassword
-```
-
-##### 3. Create an App Registration in Entra ID
-
-1. Go to the [Azure portal](https://portal.azure.com) → **Microsoft Entra ID** → **App registrations** → **New registration**.
-2. Name: `M365AutoLink` (or any name you prefer).
-3. Supported account types: **Accounts in this organizational directory only**.
-4. Click **Register**.
-5. Copy the **Application (client) ID** and **Directory (tenant) ID** — you'll need them for the script configuration.
-
-##### 4. Upload the certificate to the App Registration
-
-1. In your App Registration, go to **Certificates & secrets** → **Certificates** tab.
-2. Click **Upload certificate**.
-3. Select the `.cer` file you exported in step 2 (`C:\certs\M365AutoLink.cer`).
-4. Click **Add**.
-5. Verify the certificate appears with the correct thumbprint.
-
-##### 5. Grant API permissions
-
-1. In the App Registration, go to **API permissions** → **Add a permission**.
-2. Add **Microsoft Graph** (Application permissions):
-   - `Sites.Read.All`
-   - `Files.ReadWrite.All`
-   - `User.Read.All`
-   - `GroupMember.Read.All` (can be skipped if not using TargetMode = Group)
-3. Add **SharePoint** (Application permissions):
-   - `Sites.FullControl.All`
-4. Click **Grant admin consent for \<your tenant\>**.
-
-##### 6a. Configure the script — using thumbprint
-
-Use this approach when the certificate is installed in the Windows certificate store on the machine running the script (the certificate was generated there, or you imported the PFX into `CurrentUser\My` or `LocalMachine\My`).
-
-```powershell
-$ClientId = "your-application-client-id"
-$TenantId = "your-tenant-id-or-contoso.onmicrosoft.com"
-$CertificateThumbprint = "A1B2C3D4E5F6..."  # from step 1
-$CertificatePath = ""
-$CertificatePassword = ""
-```
-
-> **Tip**: To find the thumbprint of an already-installed certificate, run:
-> ```powershell
-> Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -like "*M365AutoLink*" } | Select-Object Thumbprint, Subject, NotAfter
-> ```
-
-##### 6b. Configure the script — using PFX file
-
-Use this approach when you cannot or don't want to install the certificate in the Windows certificate store (e.g. running on a locked-down server, or you want to keep the cert as a portable file).
-
-```powershell
-$ClientId = "your-application-client-id"
-$TenantId = "your-tenant-id-or-contoso.onmicrosoft.com"
-$CertificateThumbprint = ""
-$CertificatePath = "C:\certs\M365AutoLink.pfx"
-$CertificatePassword = "YourPfxPassword"  # leave empty if PFX has no password
-```
-
-##### Importing a PFX into the certificate store (optional)
-
-If you received a PFX file and want to use the thumbprint approach instead, import it first:
-
-```powershell
-$pfxPassword = ConvertTo-SecureString -String "YourPfxPassword" -Force -AsPlainText
-Import-PfxCertificate -FilePath "C:\certs\M365AutoLink.pfx" -CertStoreLocation "Cert:\CurrentUser\My" -Password $pfxPassword
-```
-
-Then use `$CertificateThumbprint` as shown in option 6a.
-
-### Required Permissions (Application)
-
-Grant these **application** permissions to your Managed Identity or App Registration:
-
-**Microsoft Graph:**
-- `Sites.Read.All` — Read SharePoint site information
-- `Files.ReadWrite.All` — Create shortcuts in users' OneDrive
-- `User.Read.All` — Read user profiles for target user enumeration
-
-**SharePoint:**
-- `Sites.FullControl.All` — Access SharePoint REST APIs for site metadata and permission checks
-
-You can use [SPNRoleMgr](https://lieben.nu/tools/SPNRoleMgr/) to easily configure above permissions.
+> If a site has been **excluded from Search** (Settings → Search and offline availability), it won't be found regardless of your filters.
+> ![Excluded from Search](excludefromsearch.png)
 
 ---
-
-# Shared Configuration
 
 ## Link Name Cleanup
-Both versions support `$linkNameReplacements`. Each entry has a `Pattern` (text to find) and a `Replacement` (text to replace it with). Patterns are applied in order and the final name is trimmed.
+`$linkNameReplacements` tidies up shortcut names. Each entry has a `Pattern` (text to find) and a `Replacement`. Patterns are applied in order and the final name is trimmed.
 
-Default configuration:
 ```powershell
 $linkNameReplacements = @(
     @{ Pattern = " - Documents"; Replacement = "" }
     @{ Pattern = "- Documents"; Replacement = "" }
+    @{ Pattern = "- Documenten"; Replacement = "" }
 )
 ```
-This turns a shortcut like `Marketing - Documents` into `Marketing`. Renaming is also applied to existing shortcuts on each run, so changing these patterns will update previously created shortcuts.
 
-# Copyright/License
+This turns `Marketing - Documents` into `Marketing`. Renaming also applies to existing shortcuts on each run, so changing these patterns updates shortcuts you already have.
+
+## Copyright / License
 https://www.lieben.nu/liebensraum/commercial-use/
-(Commercial (re)use not allowed without prior written consent by the author, otherwise free to use/modify as long as headers are kept intact)
+(Commercial (re)use is not allowed without prior written consent by the author; otherwise free to use/modify as long as headers are kept intact.)
 
-# Support / Risk
-Support at best-effort, use at your own risk.
-When reporting issues here on GitHub, please include `lastRun.log` from `%APPDATA%\M365AutoLink\`.
-Before reporting an issue, ensure that:
-- The user having issues can actually access the site through the browser
-- The site in question is not excluded from Search (/layouts/15/srchvis.aspx)
-- Restricted Content (copilot) is not enabled for the site
-- You're not already syncing the site some other way to the device (e.g. through OneDrive direct sync)
+## Support / Risk
+Best-effort support, use at your own risk.
+When reporting issues on GitHub, please include `lastRun.log` from `%APPDATA%\M365AutoLink\`.
+Before reporting, make sure that:
+- The user can actually open the site in a browser.
+- The site is **not** excluded from Search (`/_layouts/15/srchvis.aspx`).
+- Restricted Content (Copilot) is **not** enabled for the site.
+- You're not already syncing the site some other way (e.g. direct OneDrive sync).
 
-# Author
-Jos Lieben (https://www.lieben.nu)
+## Author
+Jos Lieben — https://www.lieben.nu
