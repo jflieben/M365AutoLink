@@ -168,7 +168,7 @@ $script:traySync = $null
 $script:trayRunspace = $null
 $script:trayPS = $null
 $script:userConfig = $null
-$script:lastMappedSiteOptions = @()
+$script:lastMappedLibraryOptions = @()
 $script:lastAlreadyExistingShortcuts = @()
 $script:localOneDriveRootPath = $null
 $script:localShortcutFolderPath = $null
@@ -295,6 +295,7 @@ function Get-DefaultUserConfig {
         version = 1
         preferences = @{
             excludedSiteUrls = @()
+            excludedLibraryKeys = @()
         }
         diagnostics = @{
             lastAlreadyExisting = @()
@@ -823,6 +824,7 @@ function ConvertTo-UserConfig {
         version = 1
         preferences = @{
             excludedSiteUrls = @()
+            excludedLibraryKeys = @()
         }
         diagnostics = @{
             lastAlreadyExisting = @()
@@ -850,6 +852,22 @@ function ConvertTo-UserConfig {
         }
     }
     $config.preferences.excludedSiteUrls = @($normalizedExcluded)
+
+    $excludedLibraries = @()
+    try {
+        if($ConfigObject.preferences -and $ConfigObject.preferences.excludedLibraryKeys) {
+            $excludedLibraries = @($ConfigObject.preferences.excludedLibraryKeys)
+        }
+    } catch {}
+
+    $normalizedExcludedLibraries = [System.Collections.Generic.List[string]]::new()
+    foreach($libraryKey in $excludedLibraries) {
+        $libraryKeyText = ([string]$libraryKey).Trim().ToLowerInvariant()
+        if(-not [string]::IsNullOrWhiteSpace($libraryKeyText) -and -not $normalizedExcludedLibraries.Contains($libraryKeyText)) {
+            $normalizedExcludedLibraries.Add($libraryKeyText)
+        }
+    }
+    $config.preferences.excludedLibraryKeys = @($normalizedExcludedLibraries)
 
     $alreadyExisting = @()
     try {
@@ -975,7 +993,7 @@ function Show-InfoDialog {
 }
 
 function Invoke-ManageShortcuts {
-    if(-not $script:lastMappedSiteOptions -or @($script:lastMappedSiteOptions).Count -eq 0) {
+    if(-not $script:lastMappedLibraryOptions -or @($script:lastMappedLibraryOptions).Count -eq 0) {
         Show-InfoDialog -Title "M365AutoLink" -Message "No shortcuts to manage yet.`r`n`r`nRun a mapping first, then open Manage shortcuts again."
         return
     }
@@ -986,46 +1004,49 @@ function Invoke-ManageShortcuts {
             $script:userConfig = Get-OneDriveUserConfig
         }
 
-        $originalExclusions = [System.Collections.Generic.List[string]]::new()
-        foreach($siteUrl in @($script:userConfig.preferences.excludedSiteUrls)) {
-            $normalized = Get-NormalizedSiteUrl -SiteUrl ([string]$siteUrl)
-            if(-not [string]::IsNullOrWhiteSpace($normalized) -and -not $originalExclusions.Contains($normalized)) {
-                $originalExclusions.Add($normalized)
+        # Originally-excluded libraries = those the run marked isExcluded (covers both the per-library
+        # list and any legacy per-site exclusions that were applied during the run).
+        $originalSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach($option in @($script:lastMappedLibraryOptions)) {
+            if($option.isExcluded) {
+                $optionKey = ([string]$option.key).Trim().ToLowerInvariant()
+                if(-not [string]::IsNullOrWhiteSpace($optionKey)) { [void]$originalSet.Add($optionKey) }
             }
         }
 
-        $selectionResult = Show-ManageShortcutsDialog -SiteOptions @($script:lastMappedSiteOptions) -SelectedSiteUrls @($originalExclusions)
+        $selectionResult = Show-ManageShortcutsDialog -LibraryOptions @($script:lastMappedLibraryOptions)
         if($selectionResult.isCanceled) {
             Update-TrayState -Text "M365AutoLink - Idle" -ProgressText "No changes"
             return
         }
 
-        $normalizedChosen = [System.Collections.Generic.List[string]]::new()
-        foreach($siteUrl in @($selectionResult.selectedSiteUrls)) {
-            $normalized = Get-NormalizedSiteUrl -SiteUrl ([string]$siteUrl)
-            if(-not [string]::IsNullOrWhiteSpace($normalized) -and -not $normalizedChosen.Contains($normalized)) {
-                $normalizedChosen.Add($normalized)
-            }
+        $chosenSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach($libraryKey in @($selectionResult.excludedLibraryKeys)) {
+            $keyText = ([string]$libraryKey).Trim().ToLowerInvariant()
+            if(-not [string]::IsNullOrWhiteSpace($keyText)) { [void]$chosenSet.Add($keyText) }
         }
 
-        # Detect whether the exclusion set actually changed (order-independent).
-        $originalSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        foreach($entry in $originalExclusions) { [void]$originalSet.Add($entry) }
-        $chosenSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        foreach($entry in $normalizedChosen) { [void]$chosenSet.Add($entry) }
         $exclusionsChanged = -not $originalSet.SetEquals($chosenSet)
+        # Even with no exclusion change, migrate any legacy per-site exclusions into the per-library
+        # model so they stop being a separate, invisible mechanism.
+        $hasLegacySiteExclusions = (@($script:userConfig.preferences.excludedSiteUrls).Count -gt 0)
 
-        if(-not $exclusionsChanged) {
+        if(-not $exclusionsChanged -and -not $hasLegacySiteExclusions) {
             Update-TrayState -Text "M365AutoLink - Idle" -ProgressText "No changes" -ShowBalloon -BalloonMessage "No changes to apply." -BalloonIcon "Info"
             return
         }
 
-        $script:userConfig.preferences.excludedSiteUrls = @($normalizedChosen)
+        $script:userConfig.preferences.excludedLibraryKeys = @($chosenSet)
+        $script:userConfig.preferences.excludedSiteUrls = @()
         Save-OneDriveUserConfig -Config $script:userConfig
 
-        # Exclusions changed: re-run automatically instead of asking the user to click Run now.
-        if($script:traySync) { $script:traySync.RequestRerun = $true }
-        Update-TrayState -Text "M365AutoLink - Applying changes" -ProgressText "Re-running" -ShowBalloon -BalloonMessage "Saved $($normalizedChosen.Count) excluded site(s). Re-running now to apply..." -BalloonIcon "Info"
+        if($exclusionsChanged) {
+            # Exclusions changed: re-run automatically instead of asking the user to click Run now.
+            if($script:traySync) { $script:traySync.RequestRerun = $true }
+            Update-TrayState -Text "M365AutoLink - Applying changes" -ProgressText "Re-running" -ShowBalloon -BalloonMessage "Saved $($chosenSet.Count) excluded librar$(if($chosenSet.Count -eq 1){'y'}else{'ies'}). Re-running now to apply..." -BalloonIcon "Info"
+        } else {
+            Update-TrayState -Text "M365AutoLink - Idle" -ProgressText "Saved" -ShowBalloon -BalloonMessage "Exclusions saved." -BalloonIcon "Info"
+        }
     } catch {
         Write-Log "Failed to open/save shortcut manager: $($_.Exception.Message)" "ERROR"
         Update-TrayState -Text "M365AutoLink - Error" -ProgressText "Failed to update shortcuts" -ShowBalloon -BalloonMessage $_.Exception.Message -BalloonIcon "Error"
@@ -1034,19 +1055,11 @@ function Invoke-ManageShortcuts {
 
 function Show-ManageShortcutsDialog {
     param(
-        [Parameter(Mandatory = $true)][array]$SiteOptions,
-        [string[]]$SelectedSiteUrls = @()
+        [Parameter(Mandatory = $true)][array]$LibraryOptions
     )
 
     [void][System.Reflection.Assembly]::LoadWithPartialName("System.Windows.Forms")
     [void][System.Reflection.Assembly]::LoadWithPartialName("System.Drawing")
-
-    $selectedLookup = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach($url in @($SelectedSiteUrls)) {
-        if(-not [string]::IsNullOrWhiteSpace([string]$url)) {
-            [void]$selectedLookup.Add(([string]$url))
-        }
-    }
 
     $form = New-Object Windows.Forms.Form
     $form.Text = "M365AutoLink - Manage shortcuts"
@@ -1089,7 +1102,7 @@ function Show-ManageShortcutsDialog {
     $subLabel.Size = New-Object Drawing.Size(($clientW - 56), 28)
     $subLabel.Font = New-Object Drawing.Font("Segoe UI", 9)
     $subLabel.ForeColor = [Drawing.Color]::FromArgb(191, 205, 223)
-    $subLabel.Text = "Tick the Exclude box to stop syncing a site. Saving applies your changes and re-runs automatically."
+    $subLabel.Text = "Tick the Exclude box to stop syncing a library. Saving applies your changes and re-runs automatically."
 
     $headerCloseButton = New-Object Windows.Forms.Button
     $headerCloseButton.Text = "[X]"
@@ -1160,16 +1173,17 @@ function Show-ManageShortcutsDialog {
     [void]$listView.Columns.Add("Reason", 150)
 
     $excludedForeColor = [Drawing.Color]::FromArgb(150, 158, 168)
-    foreach($option in $SiteOptions) {
+    foreach($option in ($LibraryOptions | Sort-Object @{ Expression = { [string]$_.siteName } }, @{ Expression = { [string]$_.listName } })) {
+        $libraryKeyValue = [string]$option.key
         $siteUrlValue = [string]$option.siteUrl
-        $libraryValue = [string]$option.libraryName
-        if([string]::IsNullOrWhiteSpace($libraryValue)) { $libraryValue = [string]$option.siteName }
+        $libraryValue = [string]$option.listName
         if([string]::IsNullOrWhiteSpace($libraryValue)) { $libraryValue = "-" }
         $optionItemCount = [long]0
         try { $optionItemCount = [long]$option.itemCount } catch {}
-        $isExcluded = $selectedLookup.Contains($siteUrlValue)
+        $isExcluded = [bool]$option.isExcluded
 
-        $itemsValue = if($optionItemCount -gt 0) { '{0:N0}' -f $optionItemCount } else { "-" }
+        # Item counts are unknown for excluded libraries (we skip their metadata to save API calls).
+        $itemsValue = if($isExcluded) { "-" } elseif($optionItemCount -gt 0) { '{0:N0}' -f $optionItemCount } else { "0" }
         $statusValue = if($isExcluded) { "Excluded" } else { "Linked" }
         $reasonValue = if($isExcluded) { "Excluded by you" } else { "" }
 
@@ -1180,7 +1194,7 @@ function Show-ManageShortcutsDialog {
         [void]$item.SubItems.Add($statusValue)
         [void]$item.SubItems.Add($reasonValue)
         $item.ToolTipText = $siteUrlValue
-        $item.Tag = @{ siteUrl = $siteUrlValue; itemCount = $optionItemCount }
+        $item.Tag = @{ key = $libraryKeyValue; itemCount = $optionItemCount }
         $item.Checked = $isExcluded
         if($isExcluded) { $item.ForeColor = $excludedForeColor }
         [void]$listView.Items.Add($item)
@@ -1280,25 +1294,25 @@ function Show-ManageShortcutsDialog {
     } catch {
         Write-Log "Failed to open manage-shortcuts dialog: $($_.Exception.Message)" "ERROR"
         try { $form.Dispose() } catch {}
-        return @{ isCanceled = $true; selectedSiteUrls = @() }
+        return @{ isCanceled = $true; excludedLibraryKeys = @() }
     }
 
     if($dialogResult -ne [Windows.Forms.DialogResult]::OK) {
         $form.Dispose()
-        return @{ isCanceled = $true; selectedSiteUrls = @() }
+        return @{ isCanceled = $true; excludedLibraryKeys = @() }
     }
 
     $selected = [System.Collections.Generic.List[string]]::new()
     foreach($row in $listView.Items) {
         if(-not $row.Checked) { continue }
-        $rowSiteUrl = [string]$row.Tag.siteUrl
-        if(-not [string]::IsNullOrWhiteSpace($rowSiteUrl) -and -not $selected.Contains($rowSiteUrl)) {
-            $selected.Add($rowSiteUrl)
+        $rowKey = [string]$row.Tag.key
+        if(-not [string]::IsNullOrWhiteSpace($rowKey) -and -not $selected.Contains($rowKey)) {
+            $selected.Add($rowKey)
         }
     }
 
     $form.Dispose()
-    return @{ isCanceled = $false; selectedSiteUrls = @($selected) }
+    return @{ isCanceled = $false; excludedLibraryKeys = @($selected) }
 }
 
 function Get-ShortcutTargetKey {
@@ -2494,6 +2508,7 @@ function Invoke-M365AutoLinkRun {
 
         $script:userConfig = $null
         $configuredExcludedSiteSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $userExcludedLibraryKeySet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         $cachedStaticExcludedLibraryKeySet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         $cachedStaticExcludedLibraryMap = @{}
         try {
@@ -2502,6 +2517,13 @@ function Invoke-M365AutoLinkRun {
                 $normalizedSiteUrl = Get-NormalizedSiteUrl -SiteUrl ([string]$siteUrl)
                 if(-not [string]::IsNullOrWhiteSpace($normalizedSiteUrl)) {
                     [void]$configuredExcludedSiteSet.Add($normalizedSiteUrl)
+                }
+            }
+
+            foreach($libraryKey in @($script:userConfig.preferences.excludedLibraryKeys)) {
+                $libraryKeyText = ([string]$libraryKey).Trim().ToLowerInvariant()
+                if(-not [string]::IsNullOrWhiteSpace($libraryKeyText)) {
+                    [void]$userExcludedLibraryKeySet.Add($libraryKeyText)
                 }
             }
 
@@ -2526,7 +2548,10 @@ function Invoke-M365AutoLinkRun {
             }
 
             if($configuredExcludedSiteSet.Count -gt 0) {
-                Write-Log "Loaded $($configuredExcludedSiteSet.Count) user-configured excluded site(s) from OneDrive config" "INFO"
+                Write-Log "Loaded $($configuredExcludedSiteSet.Count) legacy user-configured excluded site(s) from OneDrive config" "INFO"
+            }
+            if($userExcludedLibraryKeySet.Count -gt 0) {
+                Write-Log "Loaded $($userExcludedLibraryKeySet.Count) user-excluded librar$(if($userExcludedLibraryKeySet.Count -eq 1){'y'}else{'ies'}) from OneDrive config" "INFO"
             }
             if($cachedStaticExcludedLibraryKeySet.Count -gt 0) {
                 Write-Log "Loaded $($cachedStaticExcludedLibraryKeySet.Count) cached static excluded librar$(if($cachedStaticExcludedLibraryKeySet.Count -eq 1){'y'}else{'ies'})" "INFO"
@@ -2680,7 +2705,7 @@ function Invoke-M365AutoLinkRun {
 
         Write-Log "Evaluating discovered libraries against site and library rules..." "INFO"
         $siteEvaluationCache = @{}
-        $manageableSiteTable = [ordered]@{}
+        $manageableLibraryTable = [ordered]@{}
         $seenLibraryKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         $libraryTotal = [Math]::Max(1, $discoveredLibraries.Count)
         $libraryIndex = 0
@@ -2732,27 +2757,6 @@ function Invoke-M365AutoLinkRun {
                     continue
                 }
 
-                $normalizedSiteUrl = Get-NormalizedSiteUrl -SiteUrl $siteUrl
-                $candidateLibraryName = [string]$library.listName
-                if(-not [string]::IsNullOrWhiteSpace($normalizedSiteUrl) -and -not $manageableSiteTable.Contains($normalizedSiteUrl)) {
-                    $manageableSiteTable[$normalizedSiteUrl] = @{
-                        siteUrl = $normalizedSiteUrl
-                        siteName = if([string]::IsNullOrWhiteSpace([string]$library.siteName)) { $siteUrl } else { [string]$library.siteName }
-                        libraryName = $candidateLibraryName
-                        itemCount = [long]0
-                    }
-                }
-                if(-not [string]::IsNullOrWhiteSpace($normalizedSiteUrl) -and $manageableSiteTable.Contains($normalizedSiteUrl) -and [string]::IsNullOrWhiteSpace([string]$manageableSiteTable[$normalizedSiteUrl].libraryName) -and -not [string]::IsNullOrWhiteSpace($candidateLibraryName)) {
-                    $manageableSiteTable[$normalizedSiteUrl].libraryName = $candidateLibraryName
-                }
-
-                if(-not [string]::IsNullOrWhiteSpace($normalizedSiteUrl) -and $configuredExcludedSiteSet.Contains($normalizedSiteUrl)) {
-                    Write-Log "  Site URL '$siteUrl' is excluded by user preference, skipping..." "WARN"
-                    $siteState.SkipReason = "Excluded by user config"
-                    $siteEvaluationCache[$siteUrl] = $siteState
-                    continue
-                }
-
                 try {
                 # Get more site info to determine if the site is archived or read-only or other blocking properties using the sharepoint API
                     $siteDetails = New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$siteUrl/_api/site" -Method "GET" -MaxAttempts 1
@@ -2765,10 +2769,6 @@ function Invoke-M365AutoLinkRun {
 
                     if([string]::IsNullOrWhiteSpace($siteState.SiteName)) {
                         $siteState.SiteName = [string]$siteDetails.Title
-                    }
-
-                    if(-not [string]::IsNullOrWhiteSpace($normalizedSiteUrl) -and $manageableSiteTable.Contains($normalizedSiteUrl) -and -not [string]::IsNullOrWhiteSpace([string]$siteState.SiteName)) {
-                        $manageableSiteTable[$normalizedSiteUrl].siteName = [string]$siteState.SiteName
                     }
 
                     $siteState.Include = $true
@@ -2795,6 +2795,29 @@ function Invoke-M365AutoLinkRun {
             $cachedLibraryKey = Get-ShortcutTargetKey -SiteId ([string]$library.siteId) -WebId ([string]$library.webId) -ListId ([string]$library.listId)
             if(-not [string]::IsNullOrWhiteSpace($cachedLibraryKey) -and $cachedStaticExcludedLibraryKeySet.Contains($cachedLibraryKey)) {
                 Write-Log "  $($library.listName) is statically excluded (cached), skipping metadata lookup..." "INFO"
+                continue
+            }
+
+            $normalizedSiteUrl = Get-NormalizedSiteUrl -SiteUrl $siteUrl
+
+            # Per-library user exclusion. The legacy per-site exclusion list is honoured here too so
+            # existing site exclusions keep working until the user next saves (which migrates them).
+            $isUserExcludedLibrary = ($cachedLibraryKey -and $userExcludedLibraryKeySet.Contains($cachedLibraryKey)) -or (-not [string]::IsNullOrWhiteSpace($normalizedSiteUrl) -and $configuredExcludedSiteSet.Contains($normalizedSiteUrl))
+            if($isUserExcludedLibrary) {
+                # Record it so it can be re-included from Manage shortcuts, but skip metadata and linking.
+                Write-Log "  $($library.listName) is excluded by the user, skipping..." "INFO"
+                [void]$seenLibraryKeys.Add($libraryKey)
+                if(-not [string]::IsNullOrWhiteSpace($cachedLibraryKey) -and -not $manageableLibraryTable.Contains($cachedLibraryKey)) {
+                    $excludedSiteName = if([string]::IsNullOrWhiteSpace([string]$cachedSiteState.SiteName)) { $siteUrl } else { [string]$cachedSiteState.SiteName }
+                    $manageableLibraryTable[$cachedLibraryKey] = @{
+                        key = $cachedLibraryKey
+                        siteUrl = $normalizedSiteUrl
+                        siteName = $excludedSiteName
+                        listName = [string]$library.listName
+                        itemCount = [long]0
+                        isExcluded = $true
+                    }
+                }
                 continue
             }
 
@@ -2872,6 +2895,18 @@ function Invoke-M365AutoLinkRun {
                 $resolvedItemCount = 0
                 try { $resolvedItemCount = [long]$listMetaData.ItemCount } catch {}
 
+                # Record this library as a linkable candidate for the Manage shortcuts dialog.
+                if(-not [string]::IsNullOrWhiteSpace($cachedLibraryKey) -and -not $manageableLibraryTable.Contains($cachedLibraryKey)) {
+                    $manageableLibraryTable[$cachedLibraryKey] = @{
+                        key = $cachedLibraryKey
+                        siteUrl = $normalizedSiteUrl
+                        siteName = $resolvedSiteName
+                        listName = $resolvedListName
+                        itemCount = $resolvedItemCount
+                        isExcluded = $false
+                    }
+                }
+
                 # Extract SharePoint IDs from search results and parent site context.
                 $desiredShortcuts += @{
                     shortCut = @{
@@ -2930,62 +2965,19 @@ function Invoke-M365AutoLinkRun {
 
         $desiredShortcuts = @($dedupedDesiredShortcuts)
 
-        # Aggregate item counts: a grand total across all libraries that will be linked, plus a
-        # per-site breakdown so the exclusion dialog can show which sites contribute the most.
+        # Grand total of items across all libraries that will actually be linked (for the tray + bar).
         $totalLinkedItemCount = [long]0
-        $siteItemCountTable = @{}
         foreach($desiredShortcut in $desiredShortcuts) {
-            $shortcutItemCount = [long]0
-            try { $shortcutItemCount = [long]$desiredShortcut.itemCount } catch {}
-            $totalLinkedItemCount += $shortcutItemCount
-
-            $normalizedSiteUrl = Get-NormalizedSiteUrl -SiteUrl ([string]$desiredShortcut.shortCut.siteUrl)
-            if([string]::IsNullOrWhiteSpace($normalizedSiteUrl)) { continue }
-            if($siteItemCountTable.ContainsKey($normalizedSiteUrl)) {
-                $siteItemCountTable[$normalizedSiteUrl] += $shortcutItemCount
-            } else {
-                $siteItemCountTable[$normalizedSiteUrl] = $shortcutItemCount
-            }
+            try { $totalLinkedItemCount += [long]$desiredShortcut.itemCount } catch {}
         }
         Write-Log "Combined item count across $($desiredShortcuts.Count) linked librar$(if($desiredShortcuts.Count -eq 1){'y'}else{'ies'}): $('{0:N0}' -f $totalLinkedItemCount)" "INFO"
 
-        $mappedSiteTable = [ordered]@{}
-        foreach($desiredShortcut in $desiredShortcuts) {
-            $normalizedSiteUrl = Get-NormalizedSiteUrl -SiteUrl ([string]$desiredShortcut.shortCut.siteUrl)
-            if([string]::IsNullOrWhiteSpace($normalizedSiteUrl)) { continue }
-            if(-not $mappedSiteTable.Contains($normalizedSiteUrl)) {
-                $mappedSiteTable[$normalizedSiteUrl] = @{
-                    siteUrl = $normalizedSiteUrl
-                    siteName = [string]$desiredShortcut.siteName
-                    libraryName = [string]$desiredShortcut.listName
-                    itemCount = [long]0
-                }
-            }
-        }
-
-        # Attach the per-site item totals onto whichever table feeds the exclusion dialog.
-        foreach($siteEntry in @($manageableSiteTable.Values)) {
-            $siteEntryUrl = [string]$siteEntry.siteUrl
-            if(-not [string]::IsNullOrWhiteSpace($siteEntryUrl) -and $siteItemCountTable.ContainsKey($siteEntryUrl)) {
-                $siteEntry.itemCount = [long]$siteItemCountTable[$siteEntryUrl]
-            } elseif($null -eq $siteEntry.itemCount) {
-                $siteEntry.itemCount = [long]0
-            }
-        }
-        foreach($siteEntry in @($mappedSiteTable.Values)) {
-            $siteEntryUrl = [string]$siteEntry.siteUrl
-            if(-not [string]::IsNullOrWhiteSpace($siteEntryUrl) -and $siteItemCountTable.ContainsKey($siteEntryUrl)) {
-                $siteEntry.itemCount = [long]$siteItemCountTable[$siteEntryUrl]
-            }
-        }
-
-        if($manageableSiteTable.Count -gt 0) {
-            $script:lastMappedSiteOptions = @($manageableSiteTable.Values)
-        } else {
-            $script:lastMappedSiteOptions = @($mappedSiteTable.Values)
-        }
+        # Per-library options feed the Manage shortcuts dialog (one row per candidate library).
+        $script:lastMappedLibraryOptions = @($manageableLibraryTable.Values)
+        $excludedLibraryCount = @($script:lastMappedLibraryOptions | Where-Object { $_.isExcluded }).Count
+        Write-Log "Manageable libraries: $(@($script:lastMappedLibraryOptions).Count) ($excludedLibraryCount currently excluded by the user)" "INFO"
         if($script:traySync) {
-            $script:traySync.HasMappedSites = (@($script:lastMappedSiteOptions).Count -gt 0)
+            $script:traySync.HasMappedSites = (@($script:lastMappedLibraryOptions).Count -gt 0)
         }
 
         $createTotal = [Math]::Max(1, $desiredShortcuts.Count)
