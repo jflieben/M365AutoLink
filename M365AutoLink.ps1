@@ -52,7 +52,6 @@
 
 .NOTES
     Author: Jos Lieben
-    Version: 1.1
     Date: 2026-03-22
     Copyright/License: https://www.lieben.nu/liebensraum/commercial-use/ (Commercial (re)use not allowed without prior written consent by the author, otherwise free to use/modify as long as header are kept intact)
     Microsoft doc: https://support.microsoft.com/en-us/office/add-shortcuts-to-shared-folders-in-onedrive-d66b1347-99b7-4470-9360-ffc048d35a33
@@ -107,6 +106,14 @@ $linkNameReplacements = @(
 #below variables can be used to filter based on the number of existing files in the target location before creating a link
 $maxFileCount = 300000
 $minFileCount = 0
+
+# Combined item-count guidance. When the total number of items across ALL linked libraries crosses
+# these thresholds, Windows Explorer may not reliably show all folders/links and (rarely) sync breaks.
+# The tool only WARNS about this (icon color, tooltip, dialogs) - it never blocks going over the limit.
+$totalItemCountWarningThreshold = 1000000   # red "over limit" once the combined total reaches this
+$totalItemCountWarningRatio     = 0.9       # amber "approaching" once the total reaches this fraction of the threshold
+# Knowledgebase article opened when the user clicks the over/approaching-limit tray balloon notification.
+$ItemCountHelpLink = "https://www.lieben.nu/liebensraum/m365autolink/"
 
 # Basic floating progress bar (bottom-right)
 $ShowProgressBar = $true
@@ -195,6 +202,40 @@ switch($CloudType){
 }
 
 #region Helper Functions
+function Get-TotalItemCountStatus {
+    param(
+        [long]$TotalItemCount,
+        [long]$Threshold = $totalItemCountWarningThreshold,
+        [double]$WarningRatio = $totalItemCountWarningRatio
+    )
+
+    if($Threshold -le 0) { return "ok" }
+    if($TotalItemCount -ge $Threshold) { return "over" }
+    if($TotalItemCount -ge [long]($Threshold * $WarningRatio)) { return "approaching" }
+    return "ok"
+}
+
+function Get-ItemCountSummaryText {
+    param(
+        [long]$TotalItemCount,
+        [string]$Status,
+        [long]$Threshold = $totalItemCountWarningThreshold
+    )
+
+    $formattedTotal = '{0:N0}' -f $TotalItemCount
+    switch($Status) {
+        "over" {
+            return ("{0} / {1} items - over limit" -f $formattedTotal, ('{0:N0}' -f $Threshold))
+        }
+        "approaching" {
+            return ("{0} / {1} items - approaching limit" -f $formattedTotal, ('{0:N0}' -f $Threshold))
+        }
+        default {
+            return ("{0} items linked" -f $formattedTotal)
+        }
+    }
+}
+
 function Get-CleanedShortcutName {
     param([string]$Name)
     $cleanedName = $Name
@@ -257,6 +298,7 @@ function Get-DefaultUserConfig {
         }
         diagnostics = @{
             lastAlreadyExisting = @()
+            totalItemCount = 0
         }
         cache = @{
             staticExcludedLibraries = @()
@@ -784,6 +826,7 @@ function ConvertTo-UserConfig {
         }
         diagnostics = @{
             lastAlreadyExisting = @()
+            totalItemCount = 0
         }
         cache = @{
             staticExcludedLibraries = @()
@@ -817,14 +860,19 @@ function ConvertTo-UserConfig {
 
     $normalizedExisting = [System.Collections.Generic.List[hashtable]]::new()
     foreach($entry in $alreadyExisting) {
+        $entryItemCount = 0
+        try { $entryItemCount = [long]$entry.itemCount } catch {}
         $normalizedExisting.Add(@{
             siteUrl = [string]$entry.siteUrl
             listName = [string]$entry.listName
             reason = [string]$entry.reason
             timestamp = [string]$entry.timestamp
+            itemCount = $entryItemCount
         })
     }
     $config.diagnostics.lastAlreadyExisting = @($normalizedExisting)
+
+    try { if($ConfigObject.diagnostics -and $null -ne $ConfigObject.diagnostics.totalItemCount) { $config.diagnostics.totalItemCount = [long]$ConfigObject.diagnostics.totalItemCount } } catch {}
 
     $staticExcludedLibraries = @()
     try {
@@ -901,218 +949,15 @@ function Get-OneDriveUserConfig {
     return $normalizedConfig
 }
 
-function Show-ExclusionSelectionDialog {
-    param(
-        [Parameter(Mandatory = $true)][array]$SiteOptions,
-        [string[]]$SelectedSiteUrls = @()
-    )
+function Get-DisplaySiteUrl {
+    # Strips the "https://host/" prefix purely for on-screen display so the path is easier to scan.
+    param([string]$SiteUrl)
 
-    $maxDisplayLength = 110
-
-    function Get-TruncatedDisplayText {
-        param(
-            [Parameter(Mandatory = $true)][string]$Text,
-            [int]$MaxLength = 110
-        )
-
-        if([string]::IsNullOrWhiteSpace($Text)) { return $Text }
-        if($Text.Length -le $MaxLength) { return $Text }
-        if($MaxLength -le 3) { return $Text.Substring(0, $MaxLength) }
-
-        return $Text.Substring(0, $MaxLength - 3).TrimEnd() + "..."
-    }
-
-    [void][System.Reflection.Assembly]::LoadWithPartialName("System.Drawing")
-    [void][System.Reflection.Assembly]::LoadWithPartialName("System.Windows.Forms")
-
-    $selectedLookup = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach($url in @($SelectedSiteUrls)) {
-        if(-not [string]::IsNullOrWhiteSpace([string]$url)) {
-            [void]$selectedLookup.Add(([string]$url))
-        }
-    }
-
-    $form = New-Object Windows.Forms.Form
-    $form.Text = "M365AutoLink - Site Exclusions"
-    $form.StartPosition = "CenterScreen"
-    $form.Size = New-Object Drawing.Size(840, 540)
-    $form.MinimumSize = $form.Size
-    $form.MaximizeBox = $false
-    $form.TopMost = $true
-    $form.FormBorderStyle = [Windows.Forms.FormBorderStyle]::None
-    $form.BackColor = [Drawing.Color]::FromArgb(246, 248, 252)
-    $form.Padding = New-Object Windows.Forms.Padding(1)
-    $form.AutoScaleMode = [Windows.Forms.AutoScaleMode]::None
-
-    $outerMargin = 8
-    $contentLeft = 12
-    $contentRight = 12
-    $headerHeight = 74
-    $footerHeight = 44
-    $closeButtonWidth = 34
-
-    Set-RoundedFormRegion -Form $form -Radius 10
-
-    $headerPanel = New-Object Windows.Forms.Panel
-    $headerPanel.Location = New-Object Drawing.Point($outerMargin, $outerMargin)
-    $headerPanel.Size = New-Object Drawing.Size(($form.ClientSize.Width - ($outerMargin * 2)), $headerHeight)
-    $headerPanel.BackColor = [Drawing.Color]::FromArgb(33, 37, 43)
-
-    $titleLabel = New-Object Windows.Forms.Label
-    $titleLabel.Location = New-Object Drawing.Point(12, 10)
-    $titleLabel.Size = New-Object Drawing.Size(($headerPanel.Width - ($closeButtonWidth + 34)), 24)
-    $titleLabel.Font = New-Object Drawing.Font("Segoe UI", 11, [Drawing.FontStyle]::Bold)
-    $titleLabel.ForeColor = [Drawing.Color]::FromArgb(237, 244, 252)
-    $titleLabel.Text = "Manage Excluded Sites"
-
-    $subtitleLabel = New-Object Windows.Forms.Label
-    $subtitleLabel.Location = New-Object Drawing.Point(12, 35)
-    $subtitleLabel.Size = New-Object Drawing.Size(($headerPanel.Width - ($closeButtonWidth + 34)), 28)
-    $subtitleLabel.Font = New-Object Drawing.Font("Segoe UI", 9)
-    $subtitleLabel.ForeColor = [Drawing.Color]::FromArgb(191, 205, 223)
-    $subtitleLabel.Text = "Select sites to exclude or uncheck a site to include it again."
-
-    $headerCloseButton = New-Object Windows.Forms.Button
-    $headerCloseButton.Text = "[X]"
-    $headerCloseButton.Location = New-Object Drawing.Point(($headerPanel.Width - $closeButtonWidth - 10), 9)
-    $headerCloseButton.Size = New-Object Drawing.Size(34, 24)
-    $headerCloseButton.FlatStyle = [Windows.Forms.FlatStyle]::Flat
-    $headerCloseButton.FlatAppearance.BorderSize = 1
-    $headerCloseButton.FlatAppearance.BorderColor = [Drawing.Color]::FromArgb(95, 108, 124)
-    $headerCloseButton.BackColor = [Drawing.Color]::FromArgb(58, 65, 75)
-    $headerCloseButton.ForeColor = [Drawing.Color]::FromArgb(237, 244, 252)
-    $headerCloseButton.Font = New-Object Drawing.Font("Segoe UI", 8.5, [Drawing.FontStyle]::Bold)
-    $headerCloseButton.UseVisualStyleBackColor = $false
-    $headerCloseButton.Cursor = [Windows.Forms.Cursors]::Hand
-    $headerCloseButton.Anchor = [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Right
-    $headerCloseButton.Add_Click({ $form.DialogResult = [Windows.Forms.DialogResult]::Cancel; $form.Close() })
-
-    $headerPanel.Controls.Add($titleLabel)
-    $headerPanel.Controls.Add($subtitleLabel)
-    $headerPanel.Controls.Add($headerCloseButton)
-    $headerCloseButton.BringToFront()
-
-    $infoLabel = New-Object Windows.Forms.Label
-    $infoLabel.AutoSize = $false
-    $infoLabel.Location = New-Object Drawing.Point($contentLeft, ($headerPanel.Bottom + 8))
-    $infoLabel.Size = New-Object Drawing.Size(($form.ClientSize.Width - $contentLeft - $contentRight), 20)
-    $infoLabel.Font = New-Object Drawing.Font("Segoe UI", 8.5)
-    $infoLabel.ForeColor = [Drawing.Color]::FromArgb(72, 82, 94)
-    $infoLabel.Text = "If you don't see a site, you may not have access to it yet."
-
-    $siteList = New-Object Windows.Forms.CheckedListBox
-    $siteListTop = $infoLabel.Bottom + 4
-    $siteListHeight = $form.ClientSize.Height - $siteListTop - $footerHeight - $outerMargin - 6
-    $siteList.Location = New-Object Drawing.Point($contentLeft, $siteListTop)
-    $siteList.Size = New-Object Drawing.Size(($form.ClientSize.Width - $contentLeft - $contentRight), $siteListHeight)
-    $siteList.Font = New-Object Drawing.Font("Segoe UI", 9)
-    $siteList.CheckOnClick = $true
-    $siteList.HorizontalScrollbar = $false
-    $siteList.IntegralHeight = $false
-
-    $fullDisplayItems = [System.Collections.Generic.List[string]]::new()
-    foreach($option in $SiteOptions) {
-        $siteUrlText = [string]$option.siteUrl
-        $libraryNameText = [string]$option.libraryName
-        $fullDisplayText = if([string]::IsNullOrWhiteSpace($libraryNameText)) { $siteUrlText } else { "$siteUrlText  [$libraryNameText]" }
-        $displayName = Get-TruncatedDisplayText -Text $fullDisplayText -MaxLength $maxDisplayLength
-        $index = $siteList.Items.Add($displayName)
-        $fullDisplayItems.Add($fullDisplayText)
-        if($selectedLookup.Contains([string]$option.siteUrl)) {
-            $siteList.SetItemChecked($index, $true)
-        }
-    }
-
-    $siteListToolTip = New-Object Windows.Forms.ToolTip
-    $siteListToolTip.InitialDelay = 250
-    $siteListToolTip.ReshowDelay = 100
-    $siteListToolTip.AutoPopDelay = 10000
-    $lastHoverIndex = -1
-
-    $siteList.Add_MouseMove({
-        param($sender, $e)
-
-        $hoverIndex = $sender.IndexFromPoint($e.Location)
-        if($hoverIndex -lt 0 -or $hoverIndex -ge $sender.Items.Count) {
-            if($lastHoverIndex -ne -1) {
-                $siteListToolTip.SetToolTip($siteList, "")
-                $lastHoverIndex = -1
-            }
-            return
-        }
-
-        if($hoverIndex -ne $lastHoverIndex) {
-            $lastHoverIndex = $hoverIndex
-            $tooltipText = [string]$fullDisplayItems[[int]$hoverIndex]
-            $siteListToolTip.SetToolTip($siteList, $tooltipText)
-        }
-    })
-
-    $siteList.Add_MouseLeave({
-        $siteListToolTip.SetToolTip($siteList, "")
-        $lastHoverIndex = -1
-    })
-
-    $footerPanel = New-Object Windows.Forms.Panel
-    $footerPanel.Location = New-Object Drawing.Point($outerMargin, ($form.ClientSize.Height - $footerHeight - $outerMargin - 36))
-    $footerPanel.Size = New-Object Drawing.Size(($form.ClientSize.Width - ($outerMargin * 2)), $footerHeight)
-    $footerPanel.BackColor = [Drawing.Color]::FromArgb(241, 245, 251)
-    $footerPanel.Anchor = [Windows.Forms.AnchorStyles]::Bottom -bor [Windows.Forms.AnchorStyles]::Left -bor [Windows.Forms.AnchorStyles]::Right
-
-    $saveButton = New-Object Windows.Forms.Button
-    $saveButton.Text = "Save"
-    $saveButton.Location = New-Object Drawing.Point(($footerPanel.Width - 188), 5)
-    $saveButton.Size = New-Object Drawing.Size(80, 30)
-    $saveButton.FlatStyle = [Windows.Forms.FlatStyle]::Flat
-    $saveButton.BackColor = [Drawing.Color]::FromArgb(0, 163, 255)
-    $saveButton.ForeColor = [Drawing.Color]::White
-    $saveButton.FlatAppearance.BorderSize = 0
-    $saveButton.DialogResult = [Windows.Forms.DialogResult]::OK
-    $saveButton.Anchor = [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Right
-
-    $cancelButton = New-Object Windows.Forms.Button
-    $cancelButton.Text = "Cancel"
-    $cancelButton.Location = New-Object Drawing.Point(($footerPanel.Width - 100), 5)
-    $cancelButton.Size = New-Object Drawing.Size(80, 30)
-    $cancelButton.FlatStyle = [Windows.Forms.FlatStyle]::Flat
-    $cancelButton.BackColor = [Drawing.Color]::FromArgb(231, 236, 244)
-    $cancelButton.ForeColor = [Drawing.Color]::FromArgb(33, 37, 43)
-    $cancelButton.FlatAppearance.BorderColor = [Drawing.Color]::FromArgb(210, 218, 230)
-    $cancelButton.DialogResult = [Windows.Forms.DialogResult]::Cancel
-    $cancelButton.Anchor = [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Right
-
-    $form.AcceptButton = $saveButton
-    $form.CancelButton = $cancelButton
-
-    $footerPanel.Controls.Add($saveButton)
-    $footerPanel.Controls.Add($cancelButton)
-
-    Enable-FormDrag -Form $form -DragControls @($form, $headerPanel, $titleLabel, $subtitleLabel, $infoLabel)
-
-    $form.Controls.AddRange(@($headerPanel, $infoLabel, $siteList, $footerPanel))
-
-    $dialogResult = $form.ShowDialog()
-    if($dialogResult -ne [Windows.Forms.DialogResult]::OK) {
-        $form.Dispose()
-        return @{
-            isCanceled = $true
-            selectedSiteUrls = @()
-        }
-    }
-
-    $selected = [System.Collections.Generic.List[string]]::new()
-    foreach($checkedIndex in $siteList.CheckedIndices) {
-        $option = $SiteOptions[[int]$checkedIndex]
-        if($option -and $option.siteUrl -and -not $selected.Contains([string]$option.siteUrl)) {
-            $selected.Add([string]$option.siteUrl)
-        }
-    }
-
-    $form.Dispose()
-    return @{
-        isCanceled = $false
-        selectedSiteUrls = @($selected)
-    }
+    if([string]::IsNullOrWhiteSpace($SiteUrl)) { return $SiteUrl }
+    $trimmed = $SiteUrl -replace '^https?://[^/]+', ''
+    $trimmed = $trimmed.TrimStart('/')
+    if([string]::IsNullOrWhiteSpace($trimmed)) { return $SiteUrl }
+    return $trimmed
 }
 
 function Show-InfoDialog {
@@ -1129,19 +974,29 @@ function Show-InfoDialog {
     }
 }
 
-function Invoke-ManageExcludedSites {
+function Invoke-ManageShortcuts {
     if(-not $script:lastMappedSiteOptions -or @($script:lastMappedSiteOptions).Count -eq 0) {
-        Show-InfoDialog -Title "M365AutoLink" -Message "No mapped sites found yet.`r`n`r`nRun a mapping first, then open Manage excluded sites again."
+        Show-InfoDialog -Title "M365AutoLink" -Message "No shortcuts to manage yet.`r`n`r`nRun a mapping first, then open Manage shortcuts again."
         return
     }
 
     try {
-        Update-TrayState -Text "M365AutoLink - Loading config" -ProgressText "Opening exclusion manager"
-        $script:userConfig = Get-OneDriveUserConfig
+        Update-TrayState -Text "M365AutoLink - Loading config" -ProgressText "Opening shortcut manager"
+        if(-not $script:userConfig) {
+            $script:userConfig = Get-OneDriveUserConfig
+        }
 
-        $selectionResult = Show-ExclusionSelectionDialog -SiteOptions @($script:lastMappedSiteOptions) -SelectedSiteUrls @($script:userConfig.preferences.excludedSiteUrls)
+        $originalExclusions = [System.Collections.Generic.List[string]]::new()
+        foreach($siteUrl in @($script:userConfig.preferences.excludedSiteUrls)) {
+            $normalized = Get-NormalizedSiteUrl -SiteUrl ([string]$siteUrl)
+            if(-not [string]::IsNullOrWhiteSpace($normalized) -and -not $originalExclusions.Contains($normalized)) {
+                $originalExclusions.Add($normalized)
+            }
+        }
+
+        $selectionResult = Show-ManageShortcutsDialog -SiteOptions @($script:lastMappedSiteOptions) -SelectedSiteUrls @($originalExclusions)
         if($selectionResult.isCanceled) {
-            Update-TrayState -Text "M365AutoLink - Idle" -ProgressText "Exclusion update canceled"
+            Update-TrayState -Text "M365AutoLink - Idle" -ProgressText "No changes"
             return
         }
 
@@ -1153,168 +1008,297 @@ function Invoke-ManageExcludedSites {
             }
         }
 
+        # Detect whether the exclusion set actually changed (order-independent).
+        $originalSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach($entry in $originalExclusions) { [void]$originalSet.Add($entry) }
+        $chosenSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach($entry in $normalizedChosen) { [void]$chosenSet.Add($entry) }
+        $exclusionsChanged = -not $originalSet.SetEquals($chosenSet)
+
+        if(-not $exclusionsChanged) {
+            Update-TrayState -Text "M365AutoLink - Idle" -ProgressText "No changes" -ShowBalloon -BalloonMessage "No changes to apply." -BalloonIcon "Info"
+            return
+        }
+
         $script:userConfig.preferences.excludedSiteUrls = @($normalizedChosen)
         Save-OneDriveUserConfig -Config $script:userConfig
-        Update-TrayState -Text "M365AutoLink - Idle" -ProgressText "Exclusions updated" -ShowBalloon -BalloonMessage "Saved $($normalizedChosen.Count) excluded site(s). Click Run now to apply." -BalloonIcon "Info"
+
+        # Exclusions changed: re-run automatically instead of asking the user to click Run now.
+        if($script:traySync) { $script:traySync.RequestRerun = $true }
+        Update-TrayState -Text "M365AutoLink - Applying changes" -ProgressText "Re-running" -ShowBalloon -BalloonMessage "Saved $($normalizedChosen.Count) excluded site(s). Re-running now to apply..." -BalloonIcon "Info"
     } catch {
-        Write-Log "Failed to open/save exclusion manager: $($_.Exception.Message)" "ERROR"
-        Update-TrayState -Text "M365AutoLink - Error" -ProgressText "Failed to update exclusions" -ShowBalloon -BalloonMessage $_.Exception.Message -BalloonIcon "Error"
+        Write-Log "Failed to open/save shortcut manager: $($_.Exception.Message)" "ERROR"
+        Update-TrayState -Text "M365AutoLink - Error" -ProgressText "Failed to update shortcuts" -ShowBalloon -BalloonMessage $_.Exception.Message -BalloonIcon "Error"
     }
 }
 
-function Show-AlreadyExistingShortcutsReport {
-    $reportEntries = @($script:lastAlreadyExistingShortcuts)
-    if((@($reportEntries).Count -eq 0) -and -not $script:userConfig) {
-        try {
-            $script:userConfig = Get-OneDriveUserConfig
-        } catch {}
+function Show-ManageShortcutsDialog {
+    param(
+        [Parameter(Mandatory = $true)][array]$SiteOptions,
+        [string[]]$SelectedSiteUrls = @()
+    )
+
+    [void][System.Reflection.Assembly]::LoadWithPartialName("System.Windows.Forms")
+    [void][System.Reflection.Assembly]::LoadWithPartialName("System.Drawing")
+
+    $selectedLookup = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach($url in @($SelectedSiteUrls)) {
+        if(-not [string]::IsNullOrWhiteSpace([string]$url)) {
+            [void]$selectedLookup.Add(([string]$url))
+        }
     }
-    if((@($reportEntries).Count -eq 0) -and $script:userConfig -and $script:userConfig.diagnostics -and $script:userConfig.diagnostics.lastAlreadyExisting) {
-        $reportEntries = @($script:userConfig.diagnostics.lastAlreadyExisting)
+
+    $form = New-Object Windows.Forms.Form
+    $form.Text = "M365AutoLink - Manage shortcuts"
+    $form.StartPosition = "CenterScreen"
+    $form.MaximizeBox = $false
+    $form.AutoScaleMode = [Windows.Forms.AutoScaleMode]::None
+    # Set the borderless style BEFORE the size so ClientSize reflects the borderless area. If the size
+    # is applied while the default (sizable) border is still active, the client area ends up narrower
+    # and shorter than expected, which pushes the table/buttons off the right and bottom edges.
+    $form.FormBorderStyle = [Windows.Forms.FormBorderStyle]::None
+    $form.ClientSize = New-Object Drawing.Size(1040, 600)
+    $form.MinimumSize = $form.Size
+    $form.TopMost = $true
+    $form.BackColor = [Drawing.Color]::FromArgb(246, 248, 252)
+    $form.Padding = New-Object Windows.Forms.Padding(1)
+
+    Set-RoundedFormRegion -Form $form -Radius 10
+
+    # Drive all geometry from the measured client area so nothing overflows the window edges.
+    $pad = 12
+    $footerH = 48
+    $clientW = $form.ClientSize.Width
+    $clientH = $form.ClientSize.Height
+    $contentWidth = $clientW - ($pad * 2)
+
+    $headerPanel = New-Object Windows.Forms.Panel
+    $headerPanel.Location = New-Object Drawing.Point(0, 0)
+    $headerPanel.Size = New-Object Drawing.Size($clientW, 74)
+    $headerPanel.BackColor = [Drawing.Color]::FromArgb(33, 37, 43)
+
+    $titleLabel = New-Object Windows.Forms.Label
+    $titleLabel.Location = New-Object Drawing.Point($pad, 10)
+    $titleLabel.Size = New-Object Drawing.Size(($clientW - 56), 24)
+    $titleLabel.Font = New-Object Drawing.Font("Segoe UI", 11, [Drawing.FontStyle]::Bold)
+    $titleLabel.ForeColor = [Drawing.Color]::FromArgb(237, 244, 252)
+    $titleLabel.Text = "Manage shortcuts"
+
+    $subLabel = New-Object Windows.Forms.Label
+    $subLabel.Location = New-Object Drawing.Point($pad, 35)
+    $subLabel.Size = New-Object Drawing.Size(($clientW - 56), 28)
+    $subLabel.Font = New-Object Drawing.Font("Segoe UI", 9)
+    $subLabel.ForeColor = [Drawing.Color]::FromArgb(191, 205, 223)
+    $subLabel.Text = "Tick the Exclude box to stop syncing a site. Saving applies your changes and re-runs automatically."
+
+    $headerCloseButton = New-Object Windows.Forms.Button
+    $headerCloseButton.Text = "[X]"
+    $headerCloseButton.Location = New-Object Drawing.Point(($clientW - 54), 9)
+    $headerCloseButton.Size = New-Object Drawing.Size(34, 24)
+    $headerCloseButton.FlatStyle = [Windows.Forms.FlatStyle]::Flat
+    $headerCloseButton.FlatAppearance.BorderSize = 1
+    $headerCloseButton.FlatAppearance.BorderColor = [Drawing.Color]::FromArgb(95, 108, 124)
+    $headerCloseButton.BackColor = [Drawing.Color]::FromArgb(58, 65, 75)
+    $headerCloseButton.ForeColor = [Drawing.Color]::FromArgb(237, 244, 252)
+    $headerCloseButton.Font = New-Object Drawing.Font("Segoe UI", 8.5, [Drawing.FontStyle]::Bold)
+    $headerCloseButton.UseVisualStyleBackColor = $false
+    $headerCloseButton.Cursor = [Windows.Forms.Cursors]::Hand
+    $headerCloseButton.Anchor = [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Right
+    $headerCloseButton.Add_Click({ $form.DialogResult = [Windows.Forms.DialogResult]::Cancel; $form.Close() })
+
+    $headerPanel.Controls.Add($titleLabel)
+    $headerPanel.Controls.Add($subLabel)
+    $headerPanel.Controls.Add($headerCloseButton)
+    $headerCloseButton.BringToFront()
+
+    # Capacity bar: shows how much of the 1M sync "budget" the currently INCLUDED sites consume.
+    $capPanel = New-Object Windows.Forms.Panel
+    $capPanel.Location = New-Object Drawing.Point($pad, 82)
+    $capPanel.Size = New-Object Drawing.Size($contentWidth, 48)
+    $capPanel.BackColor = [Drawing.Color]::FromArgb(246, 248, 252)
+
+    $capLabel = New-Object Windows.Forms.Label
+    $capLabel.Location = New-Object Drawing.Point(0, 0)
+    $capLabel.Size = New-Object Drawing.Size($contentWidth, 18)
+    $capLabel.Font = New-Object Drawing.Font("Segoe UI", 9, [Drawing.FontStyle]::Bold)
+    $capLabel.TextAlign = [Drawing.ContentAlignment]::MiddleLeft
+
+    $capTrackWidth = $contentWidth
+    $capTrack = New-Object Windows.Forms.Panel
+    $capTrack.Location = New-Object Drawing.Point(0, 24)
+    $capTrack.Size = New-Object Drawing.Size($capTrackWidth, 16)
+    $capTrack.BackColor = [Drawing.Color]::FromArgb(225, 230, 238)
+
+    $capFill = New-Object Windows.Forms.Panel
+    $capFill.Location = New-Object Drawing.Point(0, 0)
+    $capFill.Size = New-Object Drawing.Size(0, 16)
+    $capFill.BackColor = [Drawing.Color]::FromArgb(31, 122, 49)
+    $capTrack.Controls.Add($capFill)
+
+    $capPanel.Controls.Add($capLabel)
+    $capPanel.Controls.Add($capTrack)
+
+    $listView = New-Object Windows.Forms.ListView
+    $listView.Location = New-Object Drawing.Point($pad, 138)
+    $listView.Size = New-Object Drawing.Size($contentWidth, ($clientH - 138 - $footerH - 8))
+    $listView.View = [Windows.Forms.View]::Details
+    $listView.FullRowSelect = $true
+    $listView.GridLines = $true
+    $listView.MultiSelect = $false
+    $listView.CheckBoxes = $true
+    $listView.ShowItemToolTips = $true
+    $listView.Font = New-Object Drawing.Font("Segoe UI", 9)
+    $listView.Anchor = [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Left
+    # Fixed columns total 584px; the Site column flexes to fill the rest so the columns span the full
+    # table width (less ~22px for the vertical scrollbar) - no dead space and nothing pushed off-screen.
+    $siteColumnWidth = [Math]::Max(200, $contentWidth - 584 - 22)
+    [void]$listView.Columns.Add("Exclude", 64)
+    [void]$listView.Columns.Add("Library", 180)
+    [void]$listView.Columns.Add("Site", $siteColumnWidth)
+    [void]$listView.Columns.Add("Items", 100, [Windows.Forms.HorizontalAlignment]::Right)
+    [void]$listView.Columns.Add("Status", 90)
+    [void]$listView.Columns.Add("Reason", 150)
+
+    $excludedForeColor = [Drawing.Color]::FromArgb(150, 158, 168)
+    foreach($option in $SiteOptions) {
+        $siteUrlValue = [string]$option.siteUrl
+        $libraryValue = [string]$option.libraryName
+        if([string]::IsNullOrWhiteSpace($libraryValue)) { $libraryValue = [string]$option.siteName }
+        if([string]::IsNullOrWhiteSpace($libraryValue)) { $libraryValue = "-" }
+        $optionItemCount = [long]0
+        try { $optionItemCount = [long]$option.itemCount } catch {}
+        $isExcluded = $selectedLookup.Contains($siteUrlValue)
+
+        $itemsValue = if($optionItemCount -gt 0) { '{0:N0}' -f $optionItemCount } else { "-" }
+        $statusValue = if($isExcluded) { "Excluded" } else { "Linked" }
+        $reasonValue = if($isExcluded) { "Excluded by you" } else { "" }
+
+        $item = New-Object Windows.Forms.ListViewItem("")
+        [void]$item.SubItems.Add($libraryValue)
+        [void]$item.SubItems.Add((Get-DisplaySiteUrl -SiteUrl $siteUrlValue))
+        [void]$item.SubItems.Add($itemsValue)
+        [void]$item.SubItems.Add($statusValue)
+        [void]$item.SubItems.Add($reasonValue)
+        $item.ToolTipText = $siteUrlValue
+        $item.Tag = @{ siteUrl = $siteUrlValue; itemCount = $optionItemCount }
+        $item.Checked = $isExcluded
+        if($isExcluded) { $item.ForeColor = $excludedForeColor }
+        [void]$listView.Items.Add($item)
     }
+
+    # Recompute the capacity bar + per-row status from the current checkbox states.
+    $refreshCapacity = {
+        $includedTotal = [long]0
+        foreach($row in $listView.Items) {
+            $rowCount = [long]0
+            try { $rowCount = [long]$row.Tag.itemCount } catch {}
+            if($row.Checked) {
+                if([string]$row.SubItems[4].Text -ne "Excluded") { $row.SubItems[4].Text = "Excluded" }
+                if([string]$row.SubItems[5].Text -ne "Excluded by you") { $row.SubItems[5].Text = "Excluded by you" }
+                $row.ForeColor = $excludedForeColor
+            } else {
+                if([string]$row.SubItems[4].Text -ne "Linked") { $row.SubItems[4].Text = "Linked" }
+                if([string]$row.SubItems[5].Text -ne "") { $row.SubItems[5].Text = "" }
+                $row.ForeColor = $listView.ForeColor
+                $includedTotal += $rowCount
+            }
+        }
+
+        $status = Get-TotalItemCountStatus -TotalItemCount $includedTotal
+        $accent = switch($status) {
+            "over"        { [Drawing.Color]::FromArgb(196, 43, 28) }
+            "approaching" { [Drawing.Color]::FromArgb(176, 110, 0) }
+            default       { [Drawing.Color]::FromArgb(31, 122, 49) }
+        }
+        $capLabel.ForeColor = $accent
+        $capFill.BackColor = $accent
+
+        if($totalItemCountWarningThreshold -gt 0) {
+            $ratio = [double]$includedTotal / [double]$totalItemCountWarningThreshold
+            if($ratio -gt 1) { $ratio = 1 }
+            if($ratio -lt 0) { $ratio = 0 }
+            $capFill.Width = [int]($capTrackWidth * $ratio)
+            $remaining = $totalItemCountWarningThreshold - $includedTotal
+            if($remaining -lt 0) {
+                $capLabel.Text = "{0:N0} of {1:N0} items synced  -  OVER by {2:N0}" -f $includedTotal, $totalItemCountWarningThreshold, [math]::Abs($remaining)
+            } else {
+                $capLabel.Text = "{0:N0} of {1:N0} items synced  -  {2:N0} remaining" -f $includedTotal, $totalItemCountWarningThreshold, $remaining
+            }
+        } else {
+            $capFill.Width = 0
+            $capLabel.Text = "{0:N0} items synced  (limit warning disabled)" -f $includedTotal
+        }
+    }
+
+    $listView.Add_ItemChecked({ & $refreshCapacity })
+    & $refreshCapacity
+
+    $footerPanel = New-Object Windows.Forms.Panel
+    $footerPanel.Location = New-Object Drawing.Point(0, ($clientH - $footerH))
+    $footerPanel.Size = New-Object Drawing.Size($clientW, $footerH)
+    $footerPanel.BackColor = [Drawing.Color]::FromArgb(241, 245, 251)
+    $footerPanel.Anchor = [Windows.Forms.AnchorStyles]::Bottom -bor [Windows.Forms.AnchorStyles]::Left -bor [Windows.Forms.AnchorStyles]::Right
+
+    $buttonTop = [int](($footerH - 30) / 2)
+    $saveButton = New-Object Windows.Forms.Button
+    $saveButton.Text = "Save"
+    $saveButton.Location = New-Object Drawing.Point(($clientW - $pad - 176), $buttonTop)
+    $saveButton.Size = New-Object Drawing.Size(80, 30)
+    $saveButton.FlatStyle = [Windows.Forms.FlatStyle]::Flat
+    $saveButton.BackColor = [Drawing.Color]::FromArgb(0, 163, 255)
+    $saveButton.ForeColor = [Drawing.Color]::White
+    $saveButton.FlatAppearance.BorderSize = 0
+    $saveButton.DialogResult = [Windows.Forms.DialogResult]::OK
+    $saveButton.Anchor = [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Right
+
+    $cancelButton = New-Object Windows.Forms.Button
+    $cancelButton.Text = "Cancel"
+    $cancelButton.Location = New-Object Drawing.Point(($clientW - $pad - 88), $buttonTop)
+    $cancelButton.Size = New-Object Drawing.Size(80, 30)
+    $cancelButton.FlatStyle = [Windows.Forms.FlatStyle]::Flat
+    $cancelButton.BackColor = [Drawing.Color]::FromArgb(231, 236, 244)
+    $cancelButton.ForeColor = [Drawing.Color]::FromArgb(33, 37, 43)
+    $cancelButton.FlatAppearance.BorderColor = [Drawing.Color]::FromArgb(210, 218, 230)
+    $cancelButton.DialogResult = [Windows.Forms.DialogResult]::Cancel
+    $cancelButton.Anchor = [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Right
+
+    $form.AcceptButton = $saveButton
+    $form.CancelButton = $cancelButton
+    $footerPanel.Controls.Add($saveButton)
+    $footerPanel.Controls.Add($cancelButton)
+
+    Enable-FormDrag -Form $form -DragControls @($form, $headerPanel, $titleLabel, $subLabel)
+
+    $form.Controls.Add($headerPanel)
+    $form.Controls.Add($capPanel)
+    $form.Controls.Add($listView)
+    $form.Controls.Add($footerPanel)
+    $footerPanel.BringToFront()
 
     try {
-        [void][System.Reflection.Assembly]::LoadWithPartialName("System.Windows.Forms")
-        [void][System.Reflection.Assembly]::LoadWithPartialName("System.Drawing")
-
-        $form = New-Object Windows.Forms.Form
-        $form.Text = "All shortcuts"
-        $form.StartPosition = "CenterScreen"
-        $form.Size = New-Object Drawing.Size(1040, 560)
-        $form.MinimumSize = $form.Size
-        $form.MaximizeBox = $false
-        $form.TopMost = $true
-        $form.FormBorderStyle = [Windows.Forms.FormBorderStyle]::None
-        $form.BackColor = [Drawing.Color]::FromArgb(246, 248, 252)
-        $form.Padding = New-Object Windows.Forms.Padding(1)
-        $form.AutoScaleMode = [Windows.Forms.AutoScaleMode]::None
-
-        Set-RoundedFormRegion -Form $form -Radius 10
-
-        $headerPanel = New-Object Windows.Forms.Panel
-        $headerPanel.Location = New-Object Drawing.Point(0, 0)
-        $headerPanel.Size = New-Object Drawing.Size(1040, 74)
-        $headerPanel.BackColor = [Drawing.Color]::FromArgb(33, 37, 43)
-
-        $titleLabel = New-Object Windows.Forms.Label
-        $titleLabel.Location = New-Object Drawing.Point(12, 10)
-        $titleLabel.Size = New-Object Drawing.Size(960, 24)
-        $titleLabel.Font = New-Object Drawing.Font("Segoe UI", 11, [Drawing.FontStyle]::Bold)
-        $titleLabel.ForeColor = [Drawing.Color]::FromArgb(237, 244, 252)
-        $titleLabel.Text = "All shortcuts"
-
-        $subLabel = New-Object Windows.Forms.Label
-        $subLabel.Location = New-Object Drawing.Point(12, 35)
-        $subLabel.Size = New-Object Drawing.Size(960, 28)
-        $subLabel.Font = New-Object Drawing.Font("Segoe UI", 9)
-        $subLabel.ForeColor = [Drawing.Color]::FromArgb(191, 205, 223)
-        $subLabel.Text = "Your shortcuts and their status"
-
-        $headerCloseButton = New-Object Windows.Forms.Button
-        $headerCloseButton.Text = "[X]"
-        $headerCloseButton.Location = New-Object Drawing.Point(986, 9)
-        $headerCloseButton.Size = New-Object Drawing.Size(34, 24)
-        $headerCloseButton.FlatStyle = [Windows.Forms.FlatStyle]::Flat
-        $headerCloseButton.FlatAppearance.BorderSize = 1
-        $headerCloseButton.FlatAppearance.BorderColor = [Drawing.Color]::FromArgb(95, 108, 124)
-        $headerCloseButton.BackColor = [Drawing.Color]::FromArgb(58, 65, 75)
-        $headerCloseButton.ForeColor = [Drawing.Color]::FromArgb(237, 244, 252)
-        $headerCloseButton.Font = New-Object Drawing.Font("Segoe UI", 8.5, [Drawing.FontStyle]::Bold)
-        $headerCloseButton.UseVisualStyleBackColor = $false
-        $headerCloseButton.Cursor = [Windows.Forms.Cursors]::Hand
-        $headerCloseButton.Anchor = [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Right
-        $headerCloseButton.Add_Click({ $form.Close() })
-
-        $headerPanel.Controls.Add($titleLabel)
-        $headerPanel.Controls.Add($subLabel)
-        $headerPanel.Controls.Add($headerCloseButton)
-        $headerCloseButton.BringToFront()
-
-        $hintLabel = New-Object Windows.Forms.Label
-        $hintLabel.Location = New-Object Drawing.Point(12, 80)
-        $hintLabel.Size = New-Object Drawing.Size(1010, 20)
-        $hintLabel.Font = New-Object Drawing.Font("Segoe UI", 8.5)
-        $hintLabel.ForeColor = [Drawing.Color]::FromArgb(72, 82, 94)
-        if(@($reportEntries).Count -eq 0) {
-            $hintLabel.Text = "No shortcuts detects in the last run"
-        } else {
-            $hintLabel.Text = "If you're missing a shortcut, ensure you have access to the site and then wait a day to rerun"
-        }
-
-        $listView = New-Object Windows.Forms.ListView
-        $listView.Location = New-Object Drawing.Point(12, 104)
-        $listView.Size = New-Object Drawing.Size(1010, 412)
-        $listView.View = [Windows.Forms.View]::Details
-        $listView.FullRowSelect = $true
-        $listView.GridLines = $true
-        $listView.MultiSelect = $false
-        $listView.Font = New-Object Drawing.Font("Segoe UI", 9)
-        [void]$listView.Columns.Add("Library", 200)
-        [void]$listView.Columns.Add("Site", 430)
-        [void]$listView.Columns.Add("Status", 110)
-        [void]$listView.Columns.Add("Reason", 200)
-
-        foreach($entry in $reportEntries) {
-            $libraryValue = [string]$entry.listName
-            $siteValue = [string]$entry.siteUrl
-            $reasonValue = [string]$entry.reason
-            if([string]::IsNullOrWhiteSpace($libraryValue)) { $libraryValue = "-" }
-            if([string]::IsNullOrWhiteSpace($siteValue)) { $siteValue = "-" }
-            $statusValue = "Skipped"
-
-            if($reasonValue -eq "Already exists in current mapped shortcuts") {
-                $statusValue = "Active"
-                $reasonValue = ""
-            } elseif([string]::IsNullOrWhiteSpace($reasonValue)) {
-                $reasonValue = "-"
-            }
-
-            $item = New-Object Windows.Forms.ListViewItem($libraryValue)
-            [void]$item.SubItems.Add($siteValue)
-            [void]$item.SubItems.Add($statusValue)
-            [void]$item.SubItems.Add($reasonValue)
-            [void]$listView.Items.Add($item)
-        }
-
-        if($listView.Items.Count -eq 0) {
-            $emptyItem = New-Object Windows.Forms.ListViewItem("-")
-            [void]$emptyItem.SubItems.Add("-")
-            [void]$emptyItem.SubItems.Add("OK")
-            [void]$emptyItem.SubItems.Add("No issues")
-            [void]$listView.Items.Add($emptyItem)
-        }
-
-        $footerPanel = New-Object Windows.Forms.Panel
-        $footerPanel.Location = New-Object Drawing.Point(0, ($form.ClientSize.Height - 44))
-        $footerPanel.Size = New-Object Drawing.Size($form.ClientSize.Width, 44)
-        $footerPanel.BackColor = [Drawing.Color]::FromArgb(241, 245, 251)
-        $footerPanel.Anchor = [Windows.Forms.AnchorStyles]::Bottom -bor [Windows.Forms.AnchorStyles]::Left -bor [Windows.Forms.AnchorStyles]::Right
-
-        $closeButton = New-Object Windows.Forms.Button
-        $closeButton.Text = "Close"
-        $closeButton.Location = New-Object Drawing.Point(($footerPanel.Width - 88), 7)
-        $closeButton.Size = New-Object Drawing.Size(80, 30)
-        $closeButton.FlatStyle = [Windows.Forms.FlatStyle]::Flat
-        $closeButton.BackColor = [Drawing.Color]::FromArgb(231, 236, 244)
-        $closeButton.ForeColor = [Drawing.Color]::FromArgb(33, 37, 43)
-        $closeButton.FlatAppearance.BorderColor = [Drawing.Color]::FromArgb(210, 218, 230)
-        $closeButton.Anchor = [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Right
-        $closeButton.Add_Click({ $form.Close() })
-
-        $footerPanel.Controls.Add($closeButton)
-
-        Enable-FormDrag -Form $form -DragControls @($form, $headerPanel, $titleLabel, $subLabel, $hintLabel)
-
-        $form.Controls.Add($headerPanel)
-        $form.Controls.Add($hintLabel)
-        $form.Controls.Add($listView)
-        $form.Controls.Add($footerPanel)
-        [void]$form.ShowDialog()
-        $form.Dispose()
+        $dialogResult = $form.ShowDialog()
     } catch {
-        Write-Log "Failed to open existing-shortcuts report: $($_.Exception.Message)" "ERROR"
-        Show-InfoDialog -Title "M365AutoLink - Error" -Message "Could not open existing-shortcuts report.`r`n`r`n$($_.Exception.Message)"
+        Write-Log "Failed to open manage-shortcuts dialog: $($_.Exception.Message)" "ERROR"
+        try { $form.Dispose() } catch {}
+        return @{ isCanceled = $true; selectedSiteUrls = @() }
     }
+
+    if($dialogResult -ne [Windows.Forms.DialogResult]::OK) {
+        $form.Dispose()
+        return @{ isCanceled = $true; selectedSiteUrls = @() }
+    }
+
+    $selected = [System.Collections.Generic.List[string]]::new()
+    foreach($row in $listView.Items) {
+        if(-not $row.Checked) { continue }
+        $rowSiteUrl = [string]$row.Tag.siteUrl
+        if(-not [string]::IsNullOrWhiteSpace($rowSiteUrl) -and -not $selected.Contains($rowSiteUrl)) {
+            $selected.Add($rowSiteUrl)
+        }
+    }
+
+    $form.Dispose()
+    return @{ isCanceled = $false; selectedSiteUrls = @($selected) }
 }
 
 function Get-ShortcutTargetKey {
@@ -1815,10 +1799,23 @@ function Update-TrayState {
         [string]$BalloonMessage = "",
         [ValidateSet("Info", "Warning", "Error")]
         [string]$BalloonIcon = "Info",
+        [string]$BalloonClickUrl = "",
+        [long]$TotalItemCount,
+        [ValidateSet("ok", "approaching", "over")]
+        [string]$ItemCountStatus,
         [switch]$IsRunning
     )
 
     if(-not $script:traySync) { return }
+
+    if($PSBoundParameters.ContainsKey("TotalItemCount")) {
+        $script:traySync.TotalItemCount = $TotalItemCount
+        $resolvedStatus = if($PSBoundParameters.ContainsKey("ItemCountStatus")) { $ItemCountStatus } else { Get-TotalItemCountStatus -TotalItemCount $TotalItemCount }
+        $script:traySync.ItemCountStatus = $resolvedStatus
+        $script:traySync.ItemCountText = "M365AutoLink - " + (Get-ItemCountSummaryText -TotalItemCount $TotalItemCount -Status $resolvedStatus)
+    } elseif($PSBoundParameters.ContainsKey("ItemCountStatus")) {
+        $script:traySync.ItemCountStatus = $ItemCountStatus
+    }
 
     if($PSBoundParameters.ContainsKey("Text") -and $Text) {
         $trimmedText = $Text
@@ -1844,6 +1841,8 @@ function Update-TrayState {
         $script:traySync.BalloonTitle = $BalloonTitle
         $script:traySync.BalloonMsg = $BalloonMessage
         $script:traySync.BalloonIcon = $BalloonIcon
+        # Set the click target for this balloon (or clear it, so a previous link never carries over).
+        $script:traySync.BalloonClickUrl = $BalloonClickUrl
         $script:traySync.ShowBalloon = $true
     }
 }
@@ -1869,14 +1868,19 @@ function Initialize-TrayIcon {
             HasMappedSites  = $false
             HasExistingConflicts = $false
             RequestRerun    = $false
-            RequestManageExclusions = $false
-            RequestShowExisting = $false
+            RequestManageShortcuts = $false
             ExitRequested   = $false
             RefreshIconRequested = $false
             BalloonTitle    = ""
             BalloonMsg      = ""
             BalloonIcon     = "Info"
+            BalloonClickUrl = ""
             ShowBalloon     = $false
+            TotalItemCount  = 0
+            ItemCountThreshold = $totalItemCountWarningThreshold
+            ItemCountStatus = "ok"
+            ItemCountText   = ""
+            ItemCountHelpLink = $ItemCountHelpLink
             LogFile         = $global:octo.LogPath
             OneDriveRootPath = $script:localOneDriveRootPath
             LocalShortcutFolderPath = $script:localShortcutFolderPath
@@ -1908,28 +1912,55 @@ function Initialize-TrayIcon {
 
             $icon = New-Object Windows.Forms.NotifyIcon
 
-            $bmp = New-Object Drawing.Bitmap(16, 16)
-            $g = [Drawing.Graphics]::FromImage($bmp)
-            $g.SmoothingMode = "AntiAlias"
-            $g.Clear([Drawing.Color]::Transparent)
-            $accent = [Drawing.Color]::FromArgb(0, 120, 215)
-            $fill = New-Object Drawing.SolidBrush($accent)
-            $g.FillEllipse($fill, 2, 5, 12, 9)
-            $g.FillEllipse($fill, 4, 2, 8, 8)
-            $g.FillEllipse($fill, 1, 6, 6, 7)
-            $g.FillEllipse($fill, 9, 6, 6, 7)
-            $pen = New-Object Drawing.Pen([Drawing.Color]::White, 1.6)
-            $pen.StartCap = $pen.EndCap = [Drawing.Drawing2D.LineCap]::Round
-            $g.DrawLine($pen, 8, 12, 8, 7)
-            $g.DrawLine($pen, 5.5, 9.5, 8, 7)
-            $g.DrawLine($pen, 10.5, 9.5, 8, 7)
-            $pen.Dispose(); $fill.Dispose(); $g.Dispose()
-            $icon.Icon = [Drawing.Icon]::FromHandle($bmp.GetHicon())
-            $bmp.Dispose()
+            # Draws the cloud+arrow glyph tinted by item-count status so the icon itself signals
+            # whether the combined linked-library item count is ok (blue), approaching (amber) or
+            # over (red) the limit. Returns a fresh Icon handle the caller is responsible for.
+            function New-TrayIconHandle {
+                param([string]$Status)
+
+                $accent = switch($Status) {
+                    "over"        { [Drawing.Color]::FromArgb(220, 53, 69) }   # red
+                    "approaching" { [Drawing.Color]::FromArgb(245, 158, 11) }  # amber
+                    default       { [Drawing.Color]::FromArgb(0, 120, 215) }   # blue
+                }
+
+                $bmp = New-Object Drawing.Bitmap(16, 16)
+                $g = [Drawing.Graphics]::FromImage($bmp)
+                $g.SmoothingMode = "AntiAlias"
+                $g.Clear([Drawing.Color]::Transparent)
+                $fill = New-Object Drawing.SolidBrush($accent)
+                $g.FillEllipse($fill, 2, 5, 12, 9)
+                $g.FillEllipse($fill, 4, 2, 8, 8)
+                $g.FillEllipse($fill, 1, 6, 6, 7)
+                $g.FillEllipse($fill, 9, 6, 6, 7)
+                $pen = New-Object Drawing.Pen([Drawing.Color]::White, 1.6)
+                $pen.StartCap = $pen.EndCap = [Drawing.Drawing2D.LineCap]::Round
+                $g.DrawLine($pen, 8, 12, 8, 7)
+                $g.DrawLine($pen, 5.5, 9.5, 8, 7)
+                $g.DrawLine($pen, 10.5, 9.5, 8, 7)
+                $pen.Dispose(); $fill.Dispose(); $g.Dispose()
+                $iconHandle = [Drawing.Icon]::FromHandle($bmp.GetHicon())
+                $bmp.Dispose()
+                return $iconHandle
+            }
+
+            $script:lastIconStatus = [string]$sync.ItemCountStatus
+            if([string]::IsNullOrWhiteSpace($script:lastIconStatus)) { $script:lastIconStatus = "ok" }
+            $icon.Icon = New-TrayIconHandle -Status $script:lastIconStatus
 
             # When only the progress bar is enabled, this runspace still runs but the icon stays hidden.
             $icon.Visible = [bool]$sync.EnableTrayIcon
             $icon.Text = "M365AutoLink"
+
+            # Clicking the over/approaching-limit balloon opens the configured knowledgebase article.
+            $icon.Add_BalloonTipClicked({
+                try {
+                    $balloonUrl = [string]$sync.BalloonClickUrl
+                    if(-not [string]::IsNullOrWhiteSpace($balloonUrl)) {
+                        Start-Process $balloonUrl
+                    }
+                } catch {}
+            })
 
             $icon.Add_MouseClick({
                 param($sender, $e)
@@ -1961,15 +1992,33 @@ function Initialize-TrayIcon {
                 try {
                     if($sync.IsRunning) {
                         $remapItem.Enabled = $false
-                        $manageExclusionsItem.Enabled = $false
-                        $showExistingItem.Enabled = $false
+                        $manageShortcutsItem.Enabled = $false
                     } else {
                         $remapItem.Enabled = $true
-                        $manageExclusionsItem.Enabled = [bool]$sync.HasMappedSites
-                        $showExistingItem.Enabled = [bool]$sync.HasCompletedRun
+                        $manageShortcutsItem.Enabled = [bool]$sync.HasMappedSites
+                    }
+
+                    # Refresh the read-only combined item-count line (hidden until a run produced data).
+                    $itemCountText = [string]$sync.ItemCountText
+                    $hasItemCount = -not [string]::IsNullOrWhiteSpace($itemCountText)
+                    $itemCountInfoItem.Visible = $hasItemCount
+                    $itemCountInfoSeparator.Visible = $hasItemCount
+                    if($hasItemCount) {
+                        $itemCountInfoItem.Text = $itemCountText -replace '^M365AutoLink - ', ''
+                        $itemCountInfoItem.ForeColor = switch([string]$sync.ItemCountStatus) {
+                            "over"        { [Drawing.Color]::FromArgb(196, 43, 28) }
+                            "approaching" { [Drawing.Color]::FromArgb(176, 110, 0) }
+                            default       { [Drawing.Color]::FromArgb(72, 82, 94) }
+                        }
                     }
                 } catch {}
             })
+
+            $itemCountInfoItem = New-Object Windows.Forms.ToolStripMenuItem("")
+            $itemCountInfoItem.Enabled = $false
+            $itemCountInfoItem.Visible = $false
+            $itemCountInfoSeparator = New-Object Windows.Forms.ToolStripSeparator
+            $itemCountInfoSeparator.Visible = $false
 
             $remapItem = New-Object Windows.Forms.ToolStripMenuItem("Run now")
             $remapItem.Add_Click({
@@ -1980,31 +2029,18 @@ function Initialize-TrayIcon {
                 } catch {}
             })
 
-            $manageExclusionsItem = New-Object Windows.Forms.ToolStripMenuItem("Manage excluded sites")
-            $manageExclusionsItem.Add_Click({
+            $manageShortcutsItem = New-Object Windows.Forms.ToolStripMenuItem("Manage shortcuts")
+            $manageShortcutsItem.Add_Click({
                 try {
                     if(-not $sync.IsRunning) {
-                        $sync.RequestManageExclusions = $true
-                        $icon.ShowBalloonTip(1500, "M365AutoLink", "Opening site exclusions...", [Windows.Forms.ToolTipIcon]::Info)
+                        $sync.RequestManageShortcuts = $true
+                        $icon.ShowBalloonTip(1500, "M365AutoLink", "Opening Manage shortcuts...", [Windows.Forms.ToolTipIcon]::Info)
                     }
                 } catch {
                     try { $icon.ShowBalloonTip(2000, "M365AutoLink", "Tray action failed. Please try again.", [Windows.Forms.ToolTipIcon]::Warning) } catch {}
                 }
             })
-            $manageExclusionsItem.Enabled = $false
-
-            $showExistingItem = New-Object Windows.Forms.ToolStripMenuItem("Show shortcuts")
-            $showExistingItem.Add_Click({
-                try {
-                    if($sync.HasCompletedRun) {
-                        $sync.RequestShowExisting = $true
-                        $icon.ShowBalloonTip(1500, "M365AutoLink", "Opening shortcuts...", [Windows.Forms.ToolTipIcon]::Info)
-                    }
-                } catch {
-                    try { $icon.ShowBalloonTip(2000, "M365AutoLink", "Tray action failed. Please try again.", [Windows.Forms.ToolTipIcon]::Warning) } catch {}
-                }
-            })
-            $showExistingItem.Enabled = $false
+            $manageShortcutsItem.Enabled = $false
 
             $helpItem = New-Object Windows.Forms.ToolStripMenuItem("Open help")
             $helpItem.Add_Click({
@@ -2027,9 +2063,10 @@ function Initialize-TrayIcon {
                 try { $sync.ExitRequested = $true } catch {}
             })
 
+            [void]$menu.Items.Add($itemCountInfoItem)
+            [void]$menu.Items.Add($itemCountInfoSeparator)
             [void]$menu.Items.Add($remapItem)
-            [void]$menu.Items.Add($manageExclusionsItem)
-            [void]$menu.Items.Add($showExistingItem)
+            [void]$menu.Items.Add($manageShortcutsItem)
             [void]$menu.Items.Add((New-Object Windows.Forms.ToolStripSeparator))
             [void]$menu.Items.Add($helpItem)
             [void]$menu.Items.Add($copyrightItem)
@@ -2197,8 +2234,25 @@ function Initialize-TrayIcon {
                         $script:progressLabel = $null
                     }
 
+                    # Recolor the tray icon when the combined item-count status changes.
+                    $currentItemStatus = [string]$sync.ItemCountStatus
+                    if([string]::IsNullOrWhiteSpace($currentItemStatus)) { $currentItemStatus = "ok" }
+                    if($currentItemStatus -ne $script:lastIconStatus) {
+                        $script:lastIconStatus = $currentItemStatus
+                        try {
+                            $oldIconHandle = $icon.Icon
+                            $icon.Icon = New-TrayIconHandle -Status $currentItemStatus
+                            if($oldIconHandle) { try { $oldIconHandle.Dispose() } catch {} }
+                        } catch {}
+                    }
+
                     if(-not $menu.Visible) {
+                        # When near/over the limit, surface the item-count warning in the tooltip itself.
                         $iconText = [string]$sync.Text
+                        if(($currentItemStatus -eq "over" -or $currentItemStatus -eq "approaching") -and -not [string]::IsNullOrWhiteSpace([string]$sync.ItemCountText)) {
+                            $iconText = [string]$sync.ItemCountText
+                        }
+                        if($iconText.Length -gt 63) { $iconText = $iconText.Substring(0, 63) }
                         if($iconText -and $iconText -ne $script:lastIconText) {
                             $script:lastIconText = $iconText
                             try { $icon.Text = $iconText } catch {}
@@ -2429,7 +2483,7 @@ function Invoke-M365AutoLinkRun {
 
         Update-TrayState -Text "M365AutoLink - Starting mapping" -Percent 1 -ProgressText "Starting" -IsRunning
 
-        Write-Log "=== M365AutoLink v1.1 Started ===" "INFO"
+        Write-Log "=== M365AutoLink v1.2 Started ===" "INFO"
         if($DryRun) { Write-Log "*** DRY RUN MODE - no changes will be made ***" "WARN" }
 
         [void] [System.Reflection.Assembly]::LoadWithPartialName("System.Web")
@@ -2685,6 +2739,7 @@ function Invoke-M365AutoLinkRun {
                         siteUrl = $normalizedSiteUrl
                         siteName = if([string]::IsNullOrWhiteSpace([string]$library.siteName)) { $siteUrl } else { [string]$library.siteName }
                         libraryName = $candidateLibraryName
+                        itemCount = [long]0
                     }
                 }
                 if(-not [string]::IsNullOrWhiteSpace($normalizedSiteUrl) -and $manageableSiteTable.Contains($normalizedSiteUrl) -and [string]::IsNullOrWhiteSpace([string]$manageableSiteTable[$normalizedSiteUrl].libraryName) -and -not [string]::IsNullOrWhiteSpace($candidateLibraryName)) {
@@ -2814,6 +2869,9 @@ function Invoke-M365AutoLinkRun {
                     $resolvedSiteName = $siteUrl
                 }
 
+                $resolvedItemCount = 0
+                try { $resolvedItemCount = [long]$listMetaData.ItemCount } catch {}
+
                 # Extract SharePoint IDs from search results and parent site context.
                 $desiredShortcuts += @{
                     shortCut = @{
@@ -2825,6 +2883,7 @@ function Invoke-M365AutoLinkRun {
                     }
                     siteName = $resolvedSiteName
                     listName = $resolvedListName
+                    itemCount = $resolvedItemCount
                 }
             }catch{
                 Write-Log "  Failed to evaluate library '$($library.listName)' on '$siteUrl': $($_.Exception.Message)" "ERROR"
@@ -2871,6 +2930,25 @@ function Invoke-M365AutoLinkRun {
 
         $desiredShortcuts = @($dedupedDesiredShortcuts)
 
+        # Aggregate item counts: a grand total across all libraries that will be linked, plus a
+        # per-site breakdown so the exclusion dialog can show which sites contribute the most.
+        $totalLinkedItemCount = [long]0
+        $siteItemCountTable = @{}
+        foreach($desiredShortcut in $desiredShortcuts) {
+            $shortcutItemCount = [long]0
+            try { $shortcutItemCount = [long]$desiredShortcut.itemCount } catch {}
+            $totalLinkedItemCount += $shortcutItemCount
+
+            $normalizedSiteUrl = Get-NormalizedSiteUrl -SiteUrl ([string]$desiredShortcut.shortCut.siteUrl)
+            if([string]::IsNullOrWhiteSpace($normalizedSiteUrl)) { continue }
+            if($siteItemCountTable.ContainsKey($normalizedSiteUrl)) {
+                $siteItemCountTable[$normalizedSiteUrl] += $shortcutItemCount
+            } else {
+                $siteItemCountTable[$normalizedSiteUrl] = $shortcutItemCount
+            }
+        }
+        Write-Log "Combined item count across $($desiredShortcuts.Count) linked librar$(if($desiredShortcuts.Count -eq 1){'y'}else{'ies'}): $('{0:N0}' -f $totalLinkedItemCount)" "INFO"
+
         $mappedSiteTable = [ordered]@{}
         foreach($desiredShortcut in $desiredShortcuts) {
             $normalizedSiteUrl = Get-NormalizedSiteUrl -SiteUrl ([string]$desiredShortcut.shortCut.siteUrl)
@@ -2880,9 +2958,27 @@ function Invoke-M365AutoLinkRun {
                     siteUrl = $normalizedSiteUrl
                     siteName = [string]$desiredShortcut.siteName
                     libraryName = [string]$desiredShortcut.listName
+                    itemCount = [long]0
                 }
             }
         }
+
+        # Attach the per-site item totals onto whichever table feeds the exclusion dialog.
+        foreach($siteEntry in @($manageableSiteTable.Values)) {
+            $siteEntryUrl = [string]$siteEntry.siteUrl
+            if(-not [string]::IsNullOrWhiteSpace($siteEntryUrl) -and $siteItemCountTable.ContainsKey($siteEntryUrl)) {
+                $siteEntry.itemCount = [long]$siteItemCountTable[$siteEntryUrl]
+            } elseif($null -eq $siteEntry.itemCount) {
+                $siteEntry.itemCount = [long]0
+            }
+        }
+        foreach($siteEntry in @($mappedSiteTable.Values)) {
+            $siteEntryUrl = [string]$siteEntry.siteUrl
+            if(-not [string]::IsNullOrWhiteSpace($siteEntryUrl) -and $siteItemCountTable.ContainsKey($siteEntryUrl)) {
+                $siteEntry.itemCount = [long]$siteItemCountTable[$siteEntryUrl]
+            }
+        }
+
         if($manageableSiteTable.Count -gt 0) {
             $script:lastMappedSiteOptions = @($manageableSiteTable.Values)
         } else {
@@ -2907,12 +3003,13 @@ function Invoke-M365AutoLinkRun {
             }
 
             if ($exists) {
-                Write-Log "  Shortcut already exists for '$($desiredShortcut.shortcut.siteUrl)', skipping..." "WARN"
+                Write-Log "  Shortcut already exists for '$($desiredShortcut.shortcut.siteUrl)', skipping..." "SUCCESS"
                 $alreadyExistingShortcuts.Add(@{
                     siteUrl = [string]$desiredShortcut.shortcut.siteUrl
                     listName = [string]$desiredShortcut.listName
                     reason = "Already exists in current mapped shortcuts"
                     timestamp = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                    itemCount = [long]$desiredShortcut.itemCount
                 })
                 $skipCount++
                 continue
@@ -2986,6 +3083,7 @@ function Invoke-M365AutoLinkRun {
                         listName = [string]$desiredShortcut.listName
                         reason = "Graph reported shortcutAlreadyExists during create"
                         timestamp = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                        itemCount = [long]$desiredShortcut.itemCount
                     })
                     if(-not [string]::IsNullOrWhiteSpace($desiredTargetKey)) {
                         [void]$existingShortcutTargetKeys.Add($desiredTargetKey)
@@ -3090,7 +3188,7 @@ function Invoke-M365AutoLinkRun {
         }
 
         if($alreadyExistingShortcuts.Count -gt 0) {
-            Write-Log "Already-existing conflicts: $($alreadyExistingShortcuts.Count)" "WARN"
+            Write-Log "Already existing: $($alreadyExistingShortcuts.Count)" "SUCCESS"
         }
 
         $script:lastAlreadyExistingShortcuts = @($alreadyExistingShortcuts)
@@ -3105,6 +3203,7 @@ function Invoke-M365AutoLinkRun {
         }
         $script:userConfig.cache.staticExcludedLibraries = @($cachedStaticExcludedLibraryMap.Values | Sort-Object key)
         $script:userConfig.diagnostics.lastAlreadyExisting = @($script:lastAlreadyExistingShortcuts)
+        $script:userConfig.diagnostics.totalItemCount = $totalLinkedItemCount
         try {
             Save-OneDriveUserConfig -Config $script:userConfig
         } catch {
@@ -3112,6 +3211,22 @@ function Invoke-M365AutoLinkRun {
         }
 
         Update-TrayState -Text "M365AutoLink - Mapping complete" -Percent 100 -ProgressText "Completed" -IsRunning:$false
+
+        # Reflect the combined item count on the tray (icon color + tooltip) and warn once if we are
+        # near/over the limit where Explorer may misbehave. The balloon links to the KB article.
+        $totalItemCountStatus = Get-TotalItemCountStatus -TotalItemCount $totalLinkedItemCount
+        Update-TrayState -TotalItemCount $totalLinkedItemCount -ItemCountStatus $totalItemCountStatus
+        if($totalItemCountStatus -ne "ok") {
+            $itemCountBalloon = if($totalItemCountStatus -eq "over") {
+                "Your linked libraries now hold $('{0:N0}' -f $totalLinkedItemCount) items, over the $('{0:N0}' -f $totalItemCountWarningThreshold) limit. Explorer may not show all folders. Click to learn how to reduce this."
+            } else {
+                "Your linked libraries hold $('{0:N0}' -f $totalLinkedItemCount) items, approaching the $('{0:N0}' -f $totalItemCountWarningThreshold) limit. Click to learn more."
+            }
+            $itemCountBalloonIcon = if($totalItemCountStatus -eq "over") { "Warning" } else { "Info" }
+            Update-TrayState -ShowBalloon -BalloonTitle "M365AutoLink" -BalloonMessage $itemCountBalloon -BalloonIcon $itemCountBalloonIcon -BalloonClickUrl $ItemCountHelpLink
+            Write-Log "Combined linked item count is $totalItemCountStatus the limit ($('{0:N0}' -f $totalLinkedItemCount)/$('{0:N0}' -f $totalItemCountWarningThreshold))" "WARN"
+        }
+
         Write-Log "=== Script Completed ===" "SUCCESS"
 
         return @{
@@ -3154,18 +3269,11 @@ try {
             if($script:traySync -and $script:traySync.RequestRerun) {
                 $script:traySync.RequestRerun = $false
                 $runRequested = $true
-            } elseif($script:traySync -and $script:traySync.RequestManageExclusions) {
-                $script:traySync.RequestManageExclusions = $false
-                Write-Log "Tray action received: Manage excluded sites" "INFO"
-                Update-TrayState -Text "M365AutoLink - Opening exclusions" -ProgressText "Opening exclusion manager"
-                Invoke-ManageExcludedSites
-                Start-Sleep -Milliseconds 100
-                continue
-            } elseif($script:traySync -and $script:traySync.RequestShowExisting) {
-                $script:traySync.RequestShowExisting = $false
-                Write-Log "Tray action received: Show shortcuts" "INFO"
-                Update-TrayState -Text "M365AutoLink - Opening shortcuts" -ProgressText "Opening shortcuts"
-                Show-AlreadyExistingShortcutsReport
+            } elseif($script:traySync -and $script:traySync.RequestManageShortcuts) {
+                $script:traySync.RequestManageShortcuts = $false
+                Write-Log "Tray action received: Manage shortcuts" "INFO"
+                Update-TrayState -Text "M365AutoLink - Opening shortcuts" -ProgressText "Opening shortcut manager"
+                Invoke-ManageShortcuts
                 Start-Sleep -Milliseconds 100
                 continue
             } else {

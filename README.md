@@ -178,7 +178,7 @@ For non-Azure environments (e.g. on-premises server, local workstation), configu
 | `$CertificatePath` | Path to a `.pfx` file (alternative to thumbprint) |
 | `$CertificatePassword` | Password for the PFX file (if applicable) |
 
-> **Note**: Client secrets are not supported. Certificate-based auth is required for the app registration fallback.
+> **Note**: Client secrets are not supported. Certificate-based auth is required.
 
 #### Step-by-step: Generate a certificate and configure it in Entra ID
 
@@ -293,27 +293,7 @@ Grant these **application** permissions to your Managed Identity or App Registra
 **SharePoint:**
 - `Sites.FullControl.All` — Access SharePoint REST APIs for site metadata and permission checks
 
-Example PowerShell to grant permissions to a Managed Identity:
-```powershell
-$MIObjectId = "<Your-Managed-Identity-Object-Id>"
-$GraphAppId = "00000003-0000-0000-c000-000000000000"
-
-Connect-MgGraph -Scopes "AppRoleAssignment.ReadWrite.All"
-$graphSp = Get-MgServicePrincipal -Filter "appId eq '$GraphAppId'"
-$permissions = @("Sites.Read.All","Files.ReadWrite.All","User.Read.All")
-foreach($perm in $permissions){
-    $role = $graphSp.AppRoles | Where-Object { $_.Value -eq $perm }
-    New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $MIObjectId `
-        -PrincipalId $MIObjectId -ResourceId $graphSp.Id -AppRoleId $role.Id
-}
-
-# Grant SharePoint permissions
-$SPAppId = "00000003-0000-0ff1-ce00-000000000000"
-$spSp = Get-MgServicePrincipal -Filter "appId eq '$SPAppId'"
-$spRole = $spSp.AppRoles | Where-Object { $_.Value -eq "Sites.FullControl.All" }
-New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $MIObjectId `
-    -PrincipalId $MIObjectId -ResourceId $spSp.Id -AppRoleId $spRole.Id
-```
+You can use [SPNRoleMgr](https://lieben.nu/tools/SPNRoleMgr/) to easily configure above permissions.
 
 ---
 
