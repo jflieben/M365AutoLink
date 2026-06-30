@@ -74,6 +74,24 @@ $DryRun = $false
 # Launch mode valid values: Desktop, Start Menu, AtLogon
 $LaunchModes = @('AtLogon')
 
+# When the script is deployed through Intune it runs from a temporary location that is deleted again right after execution. 
+# Any persistence (see $LaunchModes) would then create shortcuts pointing at a path that no longer exists.
+# Set $deployToPath to a permanent location and on first run the script copies itself there
+#
+# - Use a full file path (ending in .ps1) or a folder (the script keeps its M365AutoLink.ps1 name).
+# - Environment variables are supported in both $env:NAME (PowerShell) and %NAME% (Windows) form.
+# - The target folder is created automatically if it does not exist.
+#
+# Examples:
+#   $deployToPath = "$env:APPDATA\M365AutoLink\M365AutoLink.ps1"        # roaming AppData (per-user, roams with the profile)
+#   $deployToPath = "$env:OneDrive\Apps\M365AutoLink\M365AutoLink.ps1"  # OneDrive (per-user, survives device reset/reinstall)
+#
+# Leave as $Null to never copy the script (it runs and persists from wherever it currently is).
+$deployToPath = $Null
+
+# Uninstall mode: when $true the script removes ALL persistence, to cleanly remove M365AutoLink from a device.
+$Uninstall = $false
+
 #excluded sites will not be added a link if below pattern occurs in the site's URL. Use a * to match 1 or more characters
 #the default list is recommended
 #e.g. https://contoso.sharepoint.com/sites/HR*" would exclude all sites where the name starts with HR"
@@ -172,6 +190,7 @@ $script:lastMappedLibraryOptions = @()
 $script:lastAlreadyExistingShortcuts = @()
 $script:localOneDriveRootPath = $null
 $script:localShortcutFolderPath = $null
+$script:effectiveScriptPath = $null
 $script:allowedLaunchModes = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 foreach($launchMode in @('Desktop', 'Start Menu', 'AtLogon')) {
     [void]$script:allowedLaunchModes.Add($launchMode)
@@ -402,7 +421,8 @@ function Get-NormalizedLaunchModes {
     return @($normalizedLaunchModes)
 }
 
-function Get-M365AutoLinkScriptPath {
+function Get-RawScriptPath {
+    # The physical path the script is currently executing from (a temporary location when deployed via Intune).
     if(-not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
         return $PSCommandPath
     }
@@ -414,6 +434,81 @@ function Get-M365AutoLinkScriptPath {
     } catch {}
 
     return $null
+}
+
+function Get-M365AutoLinkScriptPath {
+    # Once self-deployment has resolved a permanent location, persistence must target that copy rather
+    # than the (possibly temporary) location the current process is running from.
+    if(-not [string]::IsNullOrWhiteSpace($script:effectiveScriptPath)) {
+        return $script:effectiveScriptPath
+    }
+
+    return Get-RawScriptPath
+}
+
+function Get-DeployTargetPath {
+    param([string]$DeployToPath)
+
+    if([string]::IsNullOrWhiteSpace($DeployToPath)) { return $null }
+
+    # Expand %NAME% style environment variables. $env:NAME style is already expanded at assignment time.
+    $expandedPath = [System.Environment]::ExpandEnvironmentVariables($DeployToPath.Trim())
+    if([string]::IsNullOrWhiteSpace($expandedPath)) { return $null }
+
+    # A path ending in .ps1 is treated as the full target file; anything else is treated as a folder
+    # into which the script is copied under its standard M365AutoLink.ps1 name.
+    if($expandedPath.TrimEnd('\', '/').ToLowerInvariant().EndsWith('.ps1')) {
+        $targetFile = $expandedPath
+    } else {
+        $targetFile = [System.IO.Path]::Combine($expandedPath, 'M365AutoLink.ps1')
+    }
+
+    try {
+        return [System.IO.Path]::GetFullPath($targetFile)
+    } catch {
+        return $targetFile
+    }
+}
+
+function Invoke-SelfDeployment {
+    param([string]$DeployToPath)
+
+    # Resolves the path persistence should target. With no deployment configured (or if it cannot be
+    # performed) this is simply the current script path.
+    $currentScriptPath = Get-RawScriptPath
+
+    $targetScriptPath = Get-DeployTargetPath -DeployToPath $DeployToPath
+    if([string]::IsNullOrWhiteSpace($targetScriptPath)) {
+        return $currentScriptPath
+    }
+
+    if([string]::IsNullOrWhiteSpace($currentScriptPath)) {
+        Write-Log "deployToPath is set but the current script path could not be resolved; skipping self-deployment." "WARN"
+        return $currentScriptPath
+    }
+
+    $resolvedCurrentPath = $currentScriptPath
+    try { $resolvedCurrentPath = [System.IO.Path]::GetFullPath($currentScriptPath) } catch {}
+
+    # Already running from the deploy location: nothing to copy, and we must not rewrite the file each run.
+    if([string]::Equals($resolvedCurrentPath, $targetScriptPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-Log "Running from the configured deploy location ($targetScriptPath); no copy needed." "INFO"
+        return $targetScriptPath
+    }
+
+    try {
+        $targetDirectory = [System.IO.Path]::GetDirectoryName($targetScriptPath)
+        if(-not [string]::IsNullOrWhiteSpace($targetDirectory) -and -not (Test-Path -LiteralPath $targetDirectory)) {
+            New-Item -ItemType Directory -Path $targetDirectory -Force | Out-Null
+        }
+
+        Copy-Item -LiteralPath $currentScriptPath -Destination $targetScriptPath -Force -ErrorAction Stop
+        Write-Log "Deployed script copy to permanent location: $targetScriptPath" "SUCCESS"
+        return $targetScriptPath
+    } catch {
+        Write-Log "Failed to deploy script to '$targetScriptPath', persistence will target the current location instead: $($_.Exception.Message)" "WARN"
+        return $currentScriptPath
+    }
 }
 
 function Get-PowerShellExecutablePath {
@@ -693,6 +788,72 @@ function Sync-LaunchPersistence {
     } catch {
         Write-Log "At-logon persistence sync failed: $($_.Exception.Message)" "WARN"
     }
+}
+
+function Invoke-Uninstall {
+    param([string]$DeployToPath)
+
+    Write-Log "=== M365AutoLink Uninstall requested ===" "INFO"
+
+    $desktopShortcutPath = Join-Path -Path ([Environment]::GetFolderPath('DesktopDirectory')) -ChildPath 'M365AutoLink.lnk'
+    $startMenuShortcutPath = Join-Path -Path ([Environment]::GetFolderPath('Programs')) -ChildPath 'M365AutoLink.lnk'
+
+    # Remove the Desktop + Start Menu launch shortcuts regardless of the configured $LaunchModes.
+    foreach($shortcut in @(
+        @{ Path = $desktopShortcutPath; Label = 'Desktop launch shortcut' },
+        @{ Path = $startMenuShortcutPath; Label = 'Start Menu launch shortcut' }
+    )) {
+        try {
+            if(Test-Path -LiteralPath $shortcut.Path) {
+                Remove-Item -LiteralPath $shortcut.Path -Force -ErrorAction Stop
+                Write-Log "Removed $($shortcut.Label)" "INFO"
+            }
+        } catch {
+            Write-Log "Failed to remove $($shortcut.Label): $($_.Exception.Message)" "WARN"
+        }
+    }
+
+    # Remove at-logon persistence (scheduled task + Run key + startup-folder shortcut).
+    try {
+        $removedAtLogon = Set-AtLogonPersistence -Mode 'AtLogon' -Remove
+        if($removedAtLogon) {
+            Write-Log "Removed at-logon persistence" "INFO"
+        } else {
+            Write-Log "No at-logon persistence found to remove" "INFO"
+        }
+    } catch {
+        Write-Log "Failed to remove at-logon persistence: $($_.Exception.Message)" "WARN"
+    }
+
+    # Remove the deployed copy of the script from disk - only when a deploy location is configured.
+    # A running .ps1 is not locked on Windows, so this also works when the current process IS that copy.
+    $targetScriptPath = Get-DeployTargetPath -DeployToPath $DeployToPath
+    if([string]::IsNullOrWhiteSpace($targetScriptPath)) {
+        Write-Log "deployToPath is not configured; leaving the script file in place." "INFO"
+    } else {
+        try {
+            if(Test-Path -LiteralPath $targetScriptPath) {
+                Remove-Item -LiteralPath $targetScriptPath -Force -ErrorAction Stop
+                Write-Log "Removed deployed script: $targetScriptPath" "SUCCESS"
+            } else {
+                Write-Log "Deployed script not found at $targetScriptPath; nothing to remove." "INFO"
+            }
+
+            # Clean up the deploy folder too, but only when it is now empty so we never delete
+            # unrelated data (e.g. the token cache / log when they share the folder).
+            $targetDirectory = [System.IO.Path]::GetDirectoryName($targetScriptPath)
+            if(-not [string]::IsNullOrWhiteSpace($targetDirectory) -and (Test-Path -LiteralPath $targetDirectory)) {
+                if(-not (Get-ChildItem -LiteralPath $targetDirectory -Force -ErrorAction SilentlyContinue)) {
+                    Remove-Item -LiteralPath $targetDirectory -Force -ErrorAction Stop
+                    Write-Log "Removed empty deploy folder: $targetDirectory" "INFO"
+                }
+            }
+        } catch {
+            Write-Log "Failed to remove deployed script '$targetScriptPath': $($_.Exception.Message)" "WARN"
+        }
+    }
+
+    Write-Log "=== M365AutoLink Uninstall complete ===" "SUCCESS"
 }
 
 function Set-RoundedFormRegion {
@@ -3244,9 +3405,18 @@ function Invoke-M365AutoLinkRun {
 
 $runInTrayMode = $EnableSystemTrayIcon -and $KeepRunningInTray
 
+if($Uninstall) {
+    # Uninstall short-circuits everything else: no deployment, no tray, no mapping run.
+    Invoke-Uninstall -DeployToPath $deployToPath
+    return
+}
+
 try {
     $script:localOneDriveRootPath = Get-LocalOneDriveRootPath
     $script:localShortcutFolderPath = Get-LocalShortcutFolderPath -FolderName $FolderName
+    # Copy the script to its permanent home (if configured) before any persistence is created, so that
+    # shortcuts/scheduled tasks/run keys point at the permanent copy rather than a temporary deploy path.
+    $script:effectiveScriptPath = Invoke-SelfDeployment -DeployToPath $deployToPath
     Initialize-TrayIcon
     Update-TrayState -Text "M365AutoLink - Ready" -Percent 0 -ProgressText "Waiting to start"
 
