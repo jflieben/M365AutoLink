@@ -71,7 +71,10 @@ $WindowStyle = "Normal" #Normal, Hidden, Minimized, Maximized - this controls th
 # Dry-run mode: when $true, no shortcuts are created, deleted, or renamed. The script only shows what it would do.
 $DryRun = $false
 
-# Launch mode valid values: Desktop, Start Menu, AtLogon
+# Auto Launch mode valid values: Desktop, Start Menu, AtLogon
+# Do not configure this if you want to run 100% manual or e.g. use this as a logon script in Group Policy
+# Not configured would look like this: 
+# $LaunchModes = @()
 $LaunchModes = @('AtLogon')
 
 # When the script is deployed through Intune it runs from a temporary location that is deleted again right after execution. 
@@ -131,7 +134,7 @@ $minFileCount = 0
 $totalItemCountWarningThreshold = 1000000   # red "over limit" once the combined total reaches this
 $totalItemCountWarningRatio     = 0.9       # amber "approaching" once the total reaches this fraction of the threshold
 # Knowledgebase article opened when the user clicks the over/approaching-limit tray balloon notification.
-$ItemCountHelpLink = "https://www.lieben.nu/liebensraum/m365autolink/"
+$ItemCountHelpLink = "https://support.microsoft.com/en-US/onedrive/restrictions-and-limitations-in-onedrive-and-sharepoint#numberitemscanbesynced"
 
 # Basic floating progress bar (bottom-right)
 $ShowProgressBar = $true
@@ -144,6 +147,9 @@ $KeepRunningInTray = $true # keeps process alive so tray can trigger runs and ma
 $TrayHelpLink = "https://support.microsoft.com/en-us/office/add-shortcuts-to-shared-folders-in-onedrive-d66b1347-99b7-4470-9360-ffc048d35a33"
 $TrayCopyrightText = "Copyright (c) Lieben Consultancy"
 $TrayCopyrightLink = "https://www.lieben.nu/liebensraum/commercial-use/"
+
+# Device name inclusion filter - only run on devices where the name contains a specific string. Leave as $Null to run on all devices the script is deployed to
+$DeviceNameIncludeFilter = $Null
 
 #system libraries that should never become OneDrive shortcuts even if returned by search
 $excludedLibrariesByWildcard = @(
@@ -173,6 +179,11 @@ $ExcludedListFeatureIDs = @(
 )
 
 ##########END CONFIGURATION#############################
+
+if($DeviceNameIncludeFilter -and -not $env:COMPUTERNAME.ToLowerInvariant().Contains($DeviceNameIncludeFilter.ToLowerInvariant())) {
+    Write-Host "Device name '$($env:COMPUTERNAME)' does not match filter '$DeviceNameIncludeFilter'; exiting."
+    return
+}
 
 #base vars
 $global:octo = @{}
@@ -508,6 +519,108 @@ function Invoke-SelfDeployment {
     } catch {
         Write-Log "Failed to deploy script to '$targetScriptPath', persistence will target the current location instead: $($_.Exception.Message)" "WARN"
         return $currentScriptPath
+    }
+}
+
+function Test-PathUnderIntune {
+    param([string]$Path)
+
+    if([string]::IsNullOrWhiteSpace($Path)) { return $false }
+
+    # Well-known locations the Intune Management Extension uses to stage and run PowerShell scripts and
+    # Win32 app payloads. Anything running from here is temporary and gets cleaned up after execution.
+    $intunePathFragments = @(
+        'Microsoft Intune Management Extension\Policies\Scripts',
+        'Microsoft Intune Management Extension\Content',
+        '\IMECache\'
+    )
+
+    foreach($fragment in $intunePathFragments) {
+        if($Path.IndexOf($fragment, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Test-RunningUnderIntune {
+    # Intune enforces a timeout on PowerShell scripts and considers the deployment failed if the process
+    # does not exit in time (which the tray "keep running" loop would trigger). Detect Intune either by
+    # the temporary location the script is launched from, or by walking the parent process chain for the
+    # Intune agent processes that spawn it.
+    try {
+        $rawScriptPath = Get-RawScriptPath
+        if(Test-PathUnderIntune -Path $rawScriptPath) {
+            return $true
+        }
+    } catch {}
+
+    $intuneProcessNames = @(
+        'intunemanagementextension',
+        'agentexecutor',
+        'microsoft.management.services.intunewindowsagent'
+    )
+
+    try {
+        $currentProcessId = $PID
+        $depth = 0
+        while($currentProcessId -and $depth -lt 8) {
+            $processInfo = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $currentProcessId" -ErrorAction Stop
+            if(-not $processInfo) { break }
+
+            $parentProcessId = [int]$processInfo.ParentProcessId
+            if($parentProcessId -le 0) { break }
+
+            $parentInfo = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $parentProcessId" -ErrorAction SilentlyContinue
+            if(-not $parentInfo) { break }
+
+            $parentName = [System.IO.Path]::GetFileNameWithoutExtension([string]$parentInfo.Name).ToLowerInvariant()
+            if($intuneProcessNames -contains $parentName) {
+                return $true
+            }
+
+            $currentProcessId = $parentProcessId
+            $depth++
+        }
+    } catch {}
+
+    return $false
+}
+
+function Start-DetachedM365AutoLinkRun {
+    param([Parameter(Mandatory = $true)][string]$ScriptPath)
+
+    if([string]::IsNullOrWhiteSpace($ScriptPath) -or -not (Test-Path -LiteralPath $ScriptPath)) {
+        Write-Log "Cannot start a detached run, script path '$ScriptPath' is invalid or missing." "WARN"
+        return $false
+    }
+
+    $powerShellExe = Get-PowerShellExecutablePath
+    $launchCommand = Get-PowerShellLaunchCommand -ScriptPath $ScriptPath -PowerShellExe $powerShellExe -HiddenWindow
+    $commandLine = '"{0}" {1}' -f $launchCommand.TargetPath, $launchCommand.Arguments
+
+    # Preferred: spawn via WMI so the new process is owned by the WMI provider host and is NOT part of the
+    # Intune agent's process/job tree. That way it keeps running (tray icon + mapping) after this
+    # Intune-launched process exits immediately.
+    try {
+        $result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $commandLine } -ErrorAction Stop
+        if($result -and $result.ReturnValue -eq 0 -and $result.ProcessId) {
+            Write-Log "Started detached M365AutoLink run (PID $($result.ProcessId)) via WMI." "SUCCESS"
+            return $true
+        }
+        Write-Log "WMI process creation returned code $($result.ReturnValue); falling back to Start-Process." "WARN"
+    } catch {
+        Write-Log "WMI process creation failed, falling back to Start-Process: $($_.Exception.Message)" "WARN"
+    }
+
+    try {
+        Start-Process -FilePath $launchCommand.TargetPath -ArgumentList $launchCommand.Arguments -WindowStyle Hidden -ErrorAction Stop | Out-Null
+        Write-Log "Started detached M365AutoLink run via Start-Process." "SUCCESS"
+        return $true
+    } catch {
+        Write-Log "Failed to start a detached M365AutoLink run: $($_.Exception.Message)" "WARN"
+        return $false
     }
 }
 
@@ -3408,6 +3521,41 @@ $runInTrayMode = $EnableSystemTrayIcon -and $KeepRunningInTray
 if($Uninstall) {
     # Uninstall short-circuits everything else: no deployment, no tray, no mapping run.
     Invoke-Uninstall -DeployToPath $deployToPath
+    return
+}
+
+if(Test-RunningUnderIntune) {
+    # Running under Intune: Intune times out PowerShell scripts and would flag M365AutoLink as failed
+    # because the tray "keep running" loop never returns. Instead we only copy the script to its
+    # permanent home, apply the configured persistence, and kick off a fully detached run - then exit
+    # right away. Intune records a quick, successful execution while the user still gets the tray icon,
+    # shortcuts and mapping from the detached process.
+    Write-Log "=== M365AutoLink started under Intune - bootstrapping persistence + detached run ===" "INFO"
+
+    try {
+        $script:effectiveScriptPath = Invoke-SelfDeployment -DeployToPath $deployToPath
+    } catch {
+        Write-Log "Self-deployment under Intune failed: $($_.Exception.Message)" "WARN"
+    }
+
+    try {
+        Sync-LaunchPersistence
+    } catch {
+        Write-Log "Persistence sync under Intune failed: $($_.Exception.Message)" "WARN"
+    }
+
+    $detachedScriptPath = Get-M365AutoLinkScriptPath
+    if(Test-PathUnderIntune -Path $detachedScriptPath) {
+        # No permanent copy was made (deployToPath not configured), so the only path we have is the
+        # temporary Intune one which gets deleted right after we exit. Launching from there would be
+        # unreliable and could re-trigger this same Intune branch, so we skip it and tell the admin how
+        # to fix it.
+        Write-Log "The script is still running from a temporary Intune location because `$deployToPath is not configured. Set `$deployToPath to a permanent path so M365AutoLink can copy itself there; skipping the detached run to avoid launching from a location Intune will delete." "WARN"
+    } else {
+        [void](Start-DetachedM365AutoLinkRun -ScriptPath $detachedScriptPath)
+    }
+
+    Write-Log "=== Intune bootstrap complete - exiting so Intune does not time out ===" "SUCCESS"
     return
 }
 
