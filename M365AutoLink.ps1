@@ -80,7 +80,7 @@ $DryRun = $false
 # Do not configure this if you want to run 100% manual or e.g. use this as a logon script in Group Policy
 # Not configured would look like this: 
 # $LaunchModes = @()
-$LaunchModes = @('AtLogon','Desktop')
+$LaunchModes = @('AtLogon')
 
 # When the script is deployed through Intune it runs from a temporary location that is deleted again right after execution. 
 # Any persistence (see $LaunchModes) would then create shortcuts pointing at a path that no longer exists.
