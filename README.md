@@ -142,7 +142,7 @@ Example `M365AutoLink.config.json`:
   "excludedSitesByWildcard": ["*/personal/*", "*/sites/AppCatalog*"]
 }
 ```
-Overridable keys include: `FolderName`, `CloudType`, `ClientID`, `WindowStyle`, `DryRun`, `LaunchModes`, `deployToPath`, `Uninstall`, `excludedSitesByWildcard`, `includedSitesByWildcard`, `maxFileCount`, `minFileCount`, `totalItemCountWarningThreshold`, `ShowProgressBar`, `EnableSystemTrayIcon`, `KeepRunningInTray`, `DeviceNameIncludeFilter`, `AutoRefreshHours`, `DeletionSafetyRatio`, `LogHistoryCount`.
+Overridable keys include: `FolderName`, `CloudType`, `ClientID`, `WindowStyle`, `DryRun`, `LaunchModes`, `deployToPath`, `Uninstall`, `excludedSitesByWildcard`, `includedSitesByWildcard`, `maxFileCount`, `minFileCount`, `totalItemCountWarningThreshold`, `ShowProgressBar`, `EnableSystemTrayIcon`, `KeepRunningInTray`, `DeviceNameIncludeFilter`, `AutoRefreshHours`, `DeletionSafetyRatio`, `LogHistoryCount`, `TrayHelpLink`, `ItemCountHelpLink`.
 
 ### Registry-based configuration
 

@@ -285,6 +285,8 @@ $DeviceNameIncludeFilter        = Resolve-Setting -Name 'DeviceNameIncludeFilter
 $AutoRefreshHours               = Resolve-Setting -Name 'AutoRefreshHours' -Default $AutoRefreshHours
 $DeletionSafetyRatio            = Resolve-Setting -Name 'DeletionSafetyRatio' -Default $DeletionSafetyRatio
 $LogHistoryCount                = Resolve-Setting -Name 'LogHistoryCount' -Default $LogHistoryCount
+$TrayHelpLink                   = Resolve-Setting -Name 'TrayHelpLink' -Default $TrayHelpLink
+$ItemCountHelpLink              = Resolve-Setting -Name 'ItemCountHelpLink' -Default $ItemCountHelpLink
 
 # Normalize the wildcard pattern lists: trim each entry and drop empties. Leading/trailing whitespace in a
 # pattern (common when it comes from a hand-edited config) is otherwise matched LITERALLY by -like, so e.g.
