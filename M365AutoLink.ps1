@@ -38,10 +38,13 @@
 
         3. Replace the $ClientID variable in this script with your App Registration's Application (client) ID
 
-.GRAPH PERMISSIONS REQUIRED (Delegated)
-    - Files.ReadWrite.All     - Create shortcuts in OneDrive
-    - Team.ReadBasic.All      - Read Teams membership
+.PERMISSIONS REQUIRED (Delegated)
+    Microsoft Graph:
+    - Files.ReadWrite.All     - Create/rename/remove the OneDrive shortcuts and read/write the app's config.json
     - Sites.Read.All          - Read SharePoint site information
+    SharePoint (Office 365 SharePoint Online):
+    - AllSites.Read           - Run the SharePoint Search discovery query and read list metadata via the REST API
+    NOTE: Teams permissions are NOT required (discovery moved to SharePoint Search); do not add Team.ReadBasic.All.
 
 .AUTHENTICATION FLOW
     1. Cached Refresh Token - From previous successful authentication (completely silent)
@@ -52,7 +55,8 @@
 
 .NOTES
     Author: Jos Lieben
-    Date: 2026-03-22
+    Version: see $ScriptVersion in the configuration block below
+    Updates/Git: https://github.com/jflieben/M365AutoLink
     Copyright/License: https://www.lieben.nu/liebensraum/commercial-use/ (Commercial (re)use not allowed without prior written consent by the author, otherwise free to use/modify as long as header are kept intact)
     Microsoft doc: https://support.microsoft.com/en-us/office/add-shortcuts-to-shared-folders-in-onedrive-d66b1347-99b7-4470-9360-ffc048d35a33
     Always test carefully, use at your own risk, author takes no responsibility for this script
@@ -62,6 +66,7 @@
 #>
 
 ##########START CONFIGURATION#############################
+$ScriptVersion = "1.3.0" #single source of truth for the version (shown in the log + tray tooltip)
 $FolderName = "AutoLink" #this is the folder created in onedrive to house all links this tool will create. Feel free to change this to something localized, the tool will auto-create it if it does not exist
 #WARNING: Any pre-existing folders in above folder will be deleted!
 $CloudType = "global" #global, usgov, usdod, china
@@ -75,7 +80,7 @@ $DryRun = $false
 # Do not configure this if you want to run 100% manual or e.g. use this as a logon script in Group Policy
 # Not configured would look like this: 
 # $LaunchModes = @()
-$LaunchModes = @('AtLogon')
+$LaunchModes = @('AtLogon','Desktop')
 
 # When the script is deployed through Intune it runs from a temporary location that is deleted again right after execution. 
 # Any persistence (see $LaunchModes) would then create shortcuts pointing at a path that no longer exists.
@@ -151,6 +156,20 @@ $TrayCopyrightLink = "https://www.lieben.nu/liebensraum/commercial-use/"
 # Device name inclusion filter - only run on devices where the name contains a specific string. Leave as $Null to run on all devices the script is deployed to
 $DeviceNameIncludeFilter = $Null
 
+# Periodic auto-refresh. When > 0, a run is triggered automatically every N hours while the tray
+# process is alive (in addition to logon and manual "Run now"), plus shortly after the device resumes
+# from sleep. 0 = off (only logon + manual). Requires $KeepRunningInTray.
+$AutoRefreshHours = 0
+
+# Deletion circuit breaker. To protect against a partial SharePoint Search outage causing mass
+# deletion of valid shortcuts, the delete phase is SKIPPED for this run when the desired set shrank by
+# more than this fraction versus the last successful run, or when search paging ended abnormally.
+# Set to 1 to effectively disable the ratio guard. 
+$DeletionSafetyRatio = 0.40
+
+# Logging (C5). How many timestamped previous run logs to keep alongside lastRun.log.
+$LogHistoryCount = 5
+
 #system libraries that should never become OneDrive shortcuts even if returned by search
 $excludedLibrariesByWildcard = @(
     "*style library*"
@@ -180,6 +199,101 @@ $ExcludedListFeatureIDs = @(
 
 ##########END CONFIGURATION#############################
 
+#region External configuration (F1)
+# Layered configuration so admins can manage settings WITHOUT editing the script (which every update would
+# overwrite - especially painful with $deployToPath self-copy). Precedence, first match wins per setting:
+#   1. HKLM\Software\Policies\Lieben\M365AutoLink   (Intune/GPO manageable + lockable, most authoritative)
+#   2. HKCU\Software\Policies\Lieben\M365AutoLink
+#   3. M365AutoLink.config.json next to the script  (admin-managed, survives script updates)
+#   4. the in-script default assigned above         (zero-config still works unchanged)
+$script:externalConfigJson = $null
+try {
+    $selfConfigPath = if(-not [string]::IsNullOrWhiteSpace($PSCommandPath)) { $PSCommandPath }
+                      elseif($MyInvocation.MyCommand -and -not [string]::IsNullOrWhiteSpace($MyInvocation.MyCommand.Path)) { $MyInvocation.MyCommand.Path }
+                      else { $null }
+    if($selfConfigPath) {
+        $externalConfigFile = Join-Path -Path ([System.IO.Path]::GetDirectoryName($selfConfigPath)) -ChildPath 'M365AutoLink.config.json'
+        if(Test-Path -LiteralPath $externalConfigFile) {
+            $script:externalConfigJson = (Get-Content -LiteralPath $externalConfigFile -Raw | ConvertFrom-Json)
+            Write-Host "Loaded external configuration from $externalConfigFile"
+        }
+    }
+} catch {
+    Write-Host "Failed to read M365AutoLink.config.json, using in-script defaults: $($_.Exception.Message)"
+}
+
+function Convert-SettingValue {
+    # Coerce an external (string/registry/json) value to the type of the in-script default template.
+    param($Value, $Template)
+    try {
+        if($Template -is [bool]) {
+            if($Value -is [bool]) { return $Value }
+            $text = ([string]$Value).Trim().ToLowerInvariant()
+            return ($text -eq 'true' -or $text -eq '1' -or $text -eq 'yes' -or $text -eq 'on')
+        }
+        if($Template -is [int] -or $Template -is [long]) { return [int]$Value }
+        if($Template -is [double]) { return [double]$Value }
+        if($Template -is [array]) { return @($Value) }
+        return [string]$Value
+    } catch { return $Template }
+}
+
+function Resolve-Setting {
+    param([Parameter(Mandatory = $true)][string]$Name, $Default)
+
+    foreach($policyRoot in @('HKLM:\Software\Policies\Lieben\M365AutoLink', 'HKCU:\Software\Policies\Lieben\M365AutoLink')) {
+        try {
+            if(Test-Path -LiteralPath $policyRoot) {
+                $property = Get-ItemProperty -Path $policyRoot -Name $Name -ErrorAction SilentlyContinue
+                if($property -and $null -ne $property.$Name) {
+                    return (Convert-SettingValue -Value $property.$Name -Template $Default)
+                }
+            }
+        } catch {}
+    }
+
+    if($script:externalConfigJson) {
+        try {
+            $jsonProperty = $script:externalConfigJson.PSObject.Properties[$Name]
+            if($jsonProperty -and $null -ne $jsonProperty.Value) {
+                return (Convert-SettingValue -Value $jsonProperty.Value -Template $Default)
+            }
+        } catch {}
+    }
+
+    return $Default
+}
+
+# Apply external overrides to the configurable settings (no-op when nothing external is present).
+$FolderName                     = Resolve-Setting -Name 'FolderName' -Default $FolderName
+$CloudType                      = Resolve-Setting -Name 'CloudType' -Default $CloudType
+$ClientID                       = Resolve-Setting -Name 'ClientID' -Default $ClientID
+$WindowStyle                    = Resolve-Setting -Name 'WindowStyle' -Default $WindowStyle
+$DryRun                         = Resolve-Setting -Name 'DryRun' -Default $DryRun
+$LaunchModes                    = Resolve-Setting -Name 'LaunchModes' -Default $LaunchModes
+$deployToPath                   = Resolve-Setting -Name 'deployToPath' -Default $deployToPath
+$Uninstall                      = Resolve-Setting -Name 'Uninstall' -Default $Uninstall
+$excludedSitesByWildcard        = Resolve-Setting -Name 'excludedSitesByWildcard' -Default $excludedSitesByWildcard
+$includedSitesByWildcard        = Resolve-Setting -Name 'includedSitesByWildcard' -Default $includedSitesByWildcard
+$maxFileCount                   = Resolve-Setting -Name 'maxFileCount' -Default $maxFileCount
+$minFileCount                   = Resolve-Setting -Name 'minFileCount' -Default $minFileCount
+$totalItemCountWarningThreshold = Resolve-Setting -Name 'totalItemCountWarningThreshold' -Default $totalItemCountWarningThreshold
+$ShowProgressBar                = Resolve-Setting -Name 'ShowProgressBar' -Default $ShowProgressBar
+$EnableSystemTrayIcon           = Resolve-Setting -Name 'EnableSystemTrayIcon' -Default $EnableSystemTrayIcon
+$KeepRunningInTray              = Resolve-Setting -Name 'KeepRunningInTray' -Default $KeepRunningInTray
+$DeviceNameIncludeFilter        = Resolve-Setting -Name 'DeviceNameIncludeFilter' -Default $DeviceNameIncludeFilter
+$AutoRefreshHours               = Resolve-Setting -Name 'AutoRefreshHours' -Default $AutoRefreshHours
+$DeletionSafetyRatio            = Resolve-Setting -Name 'DeletionSafetyRatio' -Default $DeletionSafetyRatio
+$LogHistoryCount                = Resolve-Setting -Name 'LogHistoryCount' -Default $LogHistoryCount
+
+# Normalize the wildcard pattern lists: trim each entry and drop empties. Leading/trailing whitespace in a
+# pattern (common when it comes from a hand-edited config) is otherwise matched LITERALLY by -like, so e.g.
+# "*kennisportaal* " would never match a URL that doesn't actually end in a space.
+$excludedSitesByWildcard     = @($excludedSitesByWildcard     | ForEach-Object { ([string]$_).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+$includedSitesByWildcard     = @($includedSitesByWildcard     | ForEach-Object { ([string]$_).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+$excludedLibrariesByWildcard = @($excludedLibrariesByWildcard | ForEach-Object { ([string]$_).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+#endregion
+
 if($DeviceNameIncludeFilter -and -not $env:COMPUTERNAME.ToLowerInvariant().Contains($DeviceNameIncludeFilter.ToLowerInvariant())) {
     Write-Host "Device name '$($env:COMPUTERNAME)' does not match filter '$DeviceNameIncludeFilter'; exiting."
     return
@@ -199,13 +313,12 @@ $script:trayPS = $null
 $script:userConfig = $null
 $script:lastMappedLibraryOptions = @()
 $script:lastAlreadyExistingShortcuts = @()
+# Set for one run when the user deliberately changes exclusions in Manage shortcuts, so the deletion
+# ratio guard (meant to catch a partial Search outage) doesn't block their intentional shrink.
+$script:bypassDeletionRatioOnce = $false
 $script:localOneDriveRootPath = $null
 $script:localShortcutFolderPath = $null
 $script:effectiveScriptPath = $null
-$script:allowedLaunchModes = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-foreach($launchMode in @('Desktop', 'Start Menu', 'AtLogon')) {
-    [void]$script:allowedLaunchModes.Add($launchMode)
-}
 
 #determine URLs based on where the tenant resides
 switch($CloudType){
@@ -231,7 +344,187 @@ switch($CloudType){
     }
 }
 
+# OAuth 2.0 v2 endpoints (B2). The v2 authorize/token endpoints take scopes instead of the legacy
+# v1 resource= parameter and are the current public-client baseline (PKCE, OAuth 2.1).
+$global:octo.authorizeUrl = "$($global:octo.idpUrl)/common/oauth2/v2.0/authorize"
+$global:octo.tokenUrl = "$($global:octo.idpUrl)/common/oauth2/v2.0/token"
+
+# Windows PowerShell 5.1 on older/unmanaged machines can still negotiate TLS 1.0. Force modern TLS
+# once at startup (guarded so we never fail on an older enum that lacks Tls13).
+try {
+    $desiredProtocols = [Net.SecurityProtocolType]::Tls12
+    try { $desiredProtocols = $desiredProtocols -bor [Net.SecurityProtocolType]::Tls13 } catch {}
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor $desiredProtocols
+} catch {}
+
+function Get-RetryAfterSeconds {
+    # read the Retry-After header across both the PS 5.1 (HttpWebResponse) and PS 7
+    # (HttpResponseMessage) exception shapes. Returns 0 when no usable value is present.
+    param($ErrorRecord)
+
+    if($null -eq $ErrorRecord) { return 0 }
+    $response = $null
+    try { $response = $ErrorRecord.Exception.Response } catch {}
+    if($null -eq $response) { return 0 }
+
+    # PS 7 / HttpResponseMessage: Headers.RetryAfter.Delta (a TimeSpan) or .Date.
+    try {
+        $retryAfter = $response.Headers.RetryAfter
+        if($retryAfter) {
+            if($retryAfter.Delta -and $retryAfter.Delta.TotalSeconds -gt 0) {
+                return [int][math]::Ceiling($retryAfter.Delta.TotalSeconds)
+            }
+            if($retryAfter.Date) {
+                $seconds = ($retryAfter.Date.UtcDateTime - [DateTime]::UtcNow).TotalSeconds
+                if($seconds -gt 0) { return [int][math]::Ceiling($seconds) }
+            }
+        }
+    } catch {}
+
+    # PS 5.1 / HttpWebResponse: Headers.GetValues("Retry-After") returns a numeric string.
+    try {
+        $values = $response.Headers.GetValues("Retry-After")
+        if($values -and $values.Count -gt 0 -and $values[0] -match '^\d+$') {
+            return [int]$values[0]
+        }
+    } catch {}
+
+    return 0
+}
+
+function Get-HttpStatusCode {
+    param($ErrorRecord)
+    if($null -eq $ErrorRecord) { return $null }
+    try { return [int]$ErrorRecord.Exception.Response.StatusCode } catch {}
+    return $null
+}
+
+function Test-IsTransientHttpError {
+    # Shared classifier used by every retry loop: throttling (429) or transport-level blips.
+    param($ErrorRecord)
+
+    $statusCode = Get-HttpStatusCode -ErrorRecord $ErrorRecord
+    $message = ""
+    try { $message = [string]$ErrorRecord.Exception.Message } catch {}
+
+    $is429 = ($statusCode -eq 429) -or ($message -like "*429*")
+    if($is429) { return $true }
+    # Retry 5xx server errors too - they are frequently transient on the SharePoint search endpoint.
+    if($null -ne $statusCode -and $statusCode -ge 500 -and $statusCode -lt 600) { return $true }
+
+    $isTransientNetwork = $message -like "*No such host is known*" -or $message -like "*name or service not known*" -or $message -like "*network is unreachable*" -or $message -like "*connection was forcibly closed*" -or $message -like "*An existing connection was forcibly closed*" -or $message -like "*The operation has timed out*" -or $message -like "*Unable to connect to the remote server*"
+    return [bool]$isTransientNetwork
+}
+
+function Invoke-RestWithRetry {
+    # single retry/throttle core shared by Invoke-GraphRaw (and available to any caller). Honors
+    # Retry-After (A10), retries only 429/5xx/transport errors, and fails fast on other HTTP errors.
+    param(
+        [Parameter(Mandatory = $true)][string]$Method,
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [hashtable]$Headers,
+        $Body,
+        [string]$ContentType = 'application/json; charset=utf-8',
+        [int]$MaxAttempts = 5,
+        [int]$TimeoutSec = 120
+    )
+
+    $attempt = 0
+    while($true) {
+        $attempt++
+        try {
+            $params = @{
+                Method      = $Method
+                Uri         = $Uri
+                ErrorAction = 'Stop'
+                TimeoutSec  = $TimeoutSec
+                UserAgent   = "ISV|LiebenConsultancy|M365AutoLink|$ScriptVersion"
+                Verbose     = $false
+            }
+            if($Headers) { $params.Headers = $Headers }
+            if($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
+                $params.Body = $Body
+                $params.ContentType = $ContentType
+            }
+            return Invoke-RestMethod @params
+        } catch {
+            if($attempt -ge $MaxAttempts -or -not (Test-IsTransientHttpError -ErrorRecord $_)) {
+                throw
+            }
+            $delay = Get-RetryAfterSeconds -ErrorRecord $_
+            if($delay -le 0) { $delay = [math]::Min(15, 2 * $attempt) }
+            Write-Log "Transient error on attempt $attempt/$MaxAttempts, retrying in $($delay)s: $($_.Exception.Message)" -Level "WARN"
+            Start-Sleep -Seconds (1 + $delay)
+        }
+    }
+}
+
+function Get-ScopeForResource {
+    # Faithful v2 translation of the v1 "resource=<url>" parameter: request every statically consented
+    # permission for that resource (.default) plus a refresh token (offline_access).
+    param([Parameter(Mandatory = $true)][string]$Resource)
+    return ("{0}/.default offline_access" -f $Resource.TrimEnd('/'))
+}
+
+function Save-RefreshToken {
+    # DPAPI-protected (current user) persistence of the refresh token. Only called when the token
+    # actually changed (A1) so we are not encrypting + writing to disk on every single API call.
+    param([Parameter(Mandatory = $true)][string]$RefreshToken)
+    try {
+        $tokenDir = [System.IO.Path]::GetDirectoryName($global:octo.TokenCachePath)
+        if(!(Test-Path $tokenDir)){ New-Item -ItemType Directory -Path $tokenDir -Force | Out-Null }
+        $secureToken = ConvertTo-SecureString -String $RefreshToken -AsPlainText -Force
+        $credential = New-Object System.Management.Automation.PSCredential("RefreshToken", $secureToken)
+        $credential | Export-Clixml -Path $global:octo.TokenCachePath -Force
+    } catch {
+        Write-Warning "Could not cache refresh token: $($_.Exception.Message)"
+    }
+}
+
+function New-PkceCodeVerifier {
+    # RFC 7636 code_verifier: 32 random bytes, base64url-encoded (43 chars, no padding).
+    $bytes = New-Object byte[] 32
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+    return (([Convert]::ToBase64String($bytes)) -replace '\+','-' -replace '/','_' -replace '=','')
+}
+
+function New-PkceCodeChallenge {
+    # S256 challenge = base64url(SHA256(code_verifier)).
+    param([Parameter(Mandatory = $true)][string]$Verifier)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha.ComputeHash([System.Text.Encoding]::ASCII.GetBytes($Verifier))
+    } finally { $sha.Dispose() }
+    return (([Convert]::ToBase64String($hash)) -replace '\+','-' -replace '/','_' -replace '=','')
+}
+
 #region Helper Functions
+function Set-M365ProcessDpiAwareness {
+    # declare the process per-monitor-v2 DPI aware BEFORE any window is created, so WinForms renders
+    # crisp (not bitmap-stretched/blurry) at 125-200% display scaling. Falls back through the older APIs
+    # for down-level Windows, and is a no-op if already set.
+    try {
+        if(-not ("M365AutoLink.DpiNative" -as [type])) {
+            Add-Type -Namespace "M365AutoLink" -Name "DpiNative" -MemberDefinition @"
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool SetProcessDpiAwarenessContext(System.IntPtr value);
+[System.Runtime.InteropServices.DllImport("shcore.dll")]
+public static extern int SetProcessDpiAwareness(int value);
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool SetProcessDPIAware();
+"@ -ErrorAction Stop
+        }
+    } catch { return }
+
+    # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+    try { if([M365AutoLink.DpiNative]::SetProcessDpiAwarenessContext([System.IntPtr](-4))) { return } } catch {}
+    # PROCESS_PER_MONITOR_DPI_AWARE = 2 (Windows 8.1+)
+    try { if([M365AutoLink.DpiNative]::SetProcessDpiAwareness(2) -eq 0) { return } } catch {}
+    # System-DPI aware (Vista+)
+    try { [void][M365AutoLink.DpiNative]::SetProcessDPIAware() } catch {}
+}
+
 function Get-TotalItemCountStatus {
     param(
         [long]$TotalItemCount,
@@ -300,8 +593,9 @@ function Test-IsExcludedLibraryName {
 
     if([string]::IsNullOrWhiteSpace($ListName)) { return $false }
     foreach($pattern in $excludedLibrariesByWildcard) {
-        $wildcardPattern = "^" + [regex]::Escape($pattern) -replace "\\\*", ".*"
-        if($ListName.ToLowerInvariant() -match $wildcardPattern) {
+        # PowerShell -like is case-insensitive and anchors both ends correctly, unlike the old
+        # start-anchored regex which over-matched (e.g. "*/sites/pwa" also hit "/sites/pwa-archive").
+        if($ListName -like $pattern) {
             return $true
         }
     }
@@ -330,6 +624,7 @@ function Get-DefaultUserConfig {
         diagnostics = @{
             lastAlreadyExisting = @()
             totalItemCount = 0
+            lastDesiredCount = 0
         }
         cache = @{
             staticExcludedLibraries = @()
@@ -640,6 +935,11 @@ function Get-PowerShellExecutablePath {
     return 'powershell.exe'
 }
 
+function Test-IsWindows11OrLater {
+    # Windows 11 is build 22000+; used to gate the conhost --headless launch (D5).
+    try { return ([Environment]::OSVersion.Version.Build -ge 22000) } catch { return $false }
+}
+
 function Get-PowerShellLaunchCommand {
     param(
         [Parameter(Mandatory = $true)][string]$ScriptPath,
@@ -650,6 +950,18 @@ function Get-PowerShellLaunchCommand {
     $arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -Sta -File "{0}"' -f $ScriptPath
     if($HiddenWindow) {
         $arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Sta -File "{0}"' -f $ScriptPath
+
+        # on Windows 11, launching through "conhost.exe --headless" avoids the brief console window
+        # flash that "-WindowStyle Hidden" alone still shows at logon.
+        if(Test-IsWindows11OrLater) {
+            $conhostPath = Join-Path -Path $env:SystemRoot -ChildPath 'System32\conhost.exe'
+            if(Test-Path -LiteralPath $conhostPath) {
+                return @{
+                    TargetPath = $conhostPath
+                    Arguments = ('--headless "{0}" {1}' -f $PowerShellExe, $arguments)
+                }
+            }
+        }
     }
 
     return @{
@@ -824,7 +1136,9 @@ function Set-AtLogonPersistence {
             $action = New-ScheduledTaskAction -Execute $launchCommand.TargetPath -Argument $launchCommand.Arguments
             $trigger = New-ScheduledTaskTrigger -AtLogOn -User $principalUser
             $principal = New-ScheduledTaskPrincipal -UserId $principalUser -LogonType Interactive -RunLevel Limited
-            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable
+            # the default 72h ExecutionTimeLimit would kill the long-lived tray process; disable it.
+            # MultipleInstances IgnoreNew avoids a second logon-triggered instance racing the running one.
+            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
             $task = New-ScheduledTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'Launch M365AutoLink at logon'
             Register-ScheduledTask -TaskName $taskName -InputObject $task -Force -ErrorAction Stop | Out-Null
             return 'ScheduledTask'
@@ -938,6 +1252,26 @@ function Invoke-Uninstall {
         Write-Log "Failed to remove at-logon persistence: $($_.Exception.Message)" "WARN"
     }
 
+    # always remove M365AutoLink's own credential + log files. RefreshToken.xml is a usable,
+    # long-lived credential and must never survive an uninstall. Deleting the cache is also the
+    # practical way to end the session (there is no refresh-token logout endpoint).
+    foreach($ownFile in @(
+        @{ Path = $global:octo.TokenCachePath; Label = 'refresh token cache' },
+        @{ Path = $global:octo.LogPath; Label = 'run log' }
+    )) {
+        try {
+            if($ownFile.Path -and (Test-Path -LiteralPath $ownFile.Path)) {
+                Remove-Item -LiteralPath $ownFile.Path -Force -ErrorAction Stop
+                Write-Log "Removed $($ownFile.Label): $($ownFile.Path)" "INFO"
+            }
+        } catch {
+            Write-Log "Failed to remove $($ownFile.Label) '$($ownFile.Path)': $($_.Exception.Message)" "WARN"
+        }
+    }
+    # Also drop the in-memory token so nothing re-writes the cache during this process.
+    $global:octo.LCRefreshToken = $Null
+    $global:octo.LCCachedTokens = @{}
+
     # Remove the deployed copy of the script from disk - only when a deploy location is configured.
     # A running .ps1 is not locked on Windows, so this also works when the current process IS that copy.
     $targetScriptPath = Get-DeployTargetPath -DeployToPath $DeployToPath
@@ -1037,8 +1371,17 @@ namespace Win32 {
         $control.Add_MouseDown({
             param($sender, $e)
             if($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
-                [void][Win32.NativeMethods]::ReleaseCapture()
-                [void][Win32.NativeMethods]::SendMessage($Form.Handle, 0xA1, 0x2, 0)
+                # resolve the form from the sender at event time; the captured $Form is out of scope
+                # once Enable-FormDrag has returned, so dragging would otherwise fail silently.
+                $topLevelForm = $null
+                try { $topLevelForm = $sender.FindForm() } catch {}
+                if($null -eq $topLevelForm){
+                    try { $topLevelForm = ($sender -as [System.Windows.Forms.Control]).TopLevelControl } catch {}
+                }
+                if($null -ne $topLevelForm){
+                    [void][Win32.NativeMethods]::ReleaseCapture()
+                    [void][Win32.NativeMethods]::SendMessage($topLevelForm.Handle, 0xA1, 0x2, 0)
+                }
             }
         })
     }
@@ -1055,11 +1398,13 @@ function Invoke-GraphRaw {
     $token = Get-AccessToken -resource $global:octo.graphUrl
     $headers = @{ Authorization = "Bearer $token" }
 
+    # config load/save (used at the start and end of every run) now survives a transient 429/5xx
+    # instead of dying, because it goes through the shared retry core rather than a bare Invoke-RestMethod.
     if($PSBoundParameters.ContainsKey('Body')) {
-        return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -Body $Body -ContentType $ContentType -ErrorAction Stop -TimeoutSec 120 -UserAgent "ISV|LiebenConsultancy|M365AutoLink|1.0"
+        return Invoke-RestWithRetry -Method $Method -Uri $Uri -Headers $headers -Body $Body -ContentType $ContentType
     }
 
-    return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -ErrorAction Stop -TimeoutSec 120 -UserAgent "ISV|LiebenConsultancy|M365AutoLink|1.0"
+    return Invoke-RestWithRetry -Method $Method -Uri $Uri -Headers $headers
 }
 
 function Get-OneDriveFolder {
@@ -1103,6 +1448,7 @@ function ConvertTo-UserConfig {
         diagnostics = @{
             lastAlreadyExisting = @()
             totalItemCount = 0
+            lastDesiredCount = 0
         }
         cache = @{
             staticExcludedLibraries = @()
@@ -1165,6 +1511,7 @@ function ConvertTo-UserConfig {
     $config.diagnostics.lastAlreadyExisting = @($normalizedExisting)
 
     try { if($ConfigObject.diagnostics -and $null -ne $ConfigObject.diagnostics.totalItemCount) { $config.diagnostics.totalItemCount = [long]$ConfigObject.diagnostics.totalItemCount } } catch {}
+    try { if($ConfigObject.diagnostics -and $null -ne $ConfigObject.diagnostics.lastDesiredCount) { $config.diagnostics.lastDesiredCount = [int]$ConfigObject.diagnostics.lastDesiredCount } } catch {}
 
     $staticExcludedLibraries = @()
     try {
@@ -1252,6 +1599,39 @@ function Get-DisplaySiteUrl {
     return $trimmed
 }
 
+function Get-ManageDialogSizePath {
+    # remember the Manage-shortcuts window size in a small local file (avoids OneDrive round-trips).
+    $dir = [System.IO.Path]::GetDirectoryName($global:octo.LogPath)
+    if([string]::IsNullOrWhiteSpace($dir)) { return $null }
+    return (Join-Path -Path $dir -ChildPath "manage-ui.json")
+}
+
+function Get-SavedManageDialogSize {
+    try {
+        $path = Get-ManageDialogSizePath
+        if($path -and (Test-Path -LiteralPath $path)) {
+            $saved = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+            $width = [int]$saved.width
+            $height = [int]$saved.height
+            if($width -ge 700 -and $height -ge 400) {
+                return @{ Width = $width; Height = $height }
+            }
+        }
+    } catch {}
+    return $null
+}
+
+function Save-ManageDialogSize {
+    param([int]$Width, [int]$Height)
+    try {
+        $path = Get-ManageDialogSizePath
+        if([string]::IsNullOrWhiteSpace($path)) { return }
+        $dir = [System.IO.Path]::GetDirectoryName($path)
+        if(-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        (@{ width = $Width; height = $Height } | ConvertTo-Json) | Set-Content -LiteralPath $path -Encoding UTF8
+    } catch {}
+}
+
 function Show-InfoDialog {
     param(
         [Parameter(Mandatory = $true)][string]$Title,
@@ -1259,7 +1639,7 @@ function Show-InfoDialog {
     )
 
     try {
-        [void][System.Reflection.Assembly]::LoadWithPartialName("System.Windows.Forms")
+        Add-Type -AssemblyName System.Windows.Forms
         [void][System.Windows.Forms.MessageBox]::Show($Message, $Title, [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
     } catch {
         Update-TrayState -ShowBalloon -BalloonTitle $Title -BalloonMessage $Message -BalloonIcon "Info"
@@ -1316,6 +1696,8 @@ function Invoke-ManageShortcuts {
 
         if($exclusionsChanged) {
             # Exclusions changed: re-run automatically instead of asking the user to click Run now.
+            # This shrink is intentional, so let the upcoming run bypass the deletion ratio safety guard.
+            $script:bypassDeletionRatioOnce = $true
             if($script:traySync) { $script:traySync.RequestRerun = $true }
             Update-TrayState -Text "M365AutoLink - Applying changes" -ProgressText "Re-running" -ShowBalloon -BalloonMessage "Saved $($chosenSet.Count) excluded librar$(if($chosenSet.Count -eq 1){'y'}else{'ies'}). Re-running now to apply..." -BalloonIcon "Info"
         } else {
@@ -1332,102 +1714,150 @@ function Show-ManageShortcutsDialog {
         [Parameter(Mandatory = $true)][array]$LibraryOptions
     )
 
-    [void][System.Reflection.Assembly]::LoadWithPartialName("System.Windows.Forms")
-    [void][System.Reflection.Assembly]::LoadWithPartialName("System.Drawing")
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $excludedForeColor = [Drawing.Color]::FromArgb(150, 158, 168)
+
+    # Build the master item list once; the visible ListView is (re)populated from this by filter + sort.
+    $allItems = [System.Collections.Generic.List[object]]::new()
+
+    foreach($option in $LibraryOptions) {
+        $libraryValue = [string]$option.listName
+        if([string]::IsNullOrWhiteSpace($libraryValue)) { $libraryValue = "-" }
+        $optionItemCount = [long]0
+        try { $optionItemCount = [long]$option.itemCount } catch {}
+        $isExcluded = [bool]$option.isExcluded
+
+        $itemsValue = if($isExcluded) { "-" } elseif($optionItemCount -gt 0) { '{0:N0}' -f $optionItemCount } else { "0" }
+        $statusValue = if($isExcluded) { "Excluded" } else { "Linked" }
+        $reasonValue = if($isExcluded) { "Excluded by you" } else { "" }
+
+        $item = New-Object Windows.Forms.ListViewItem("")
+        [void]$item.SubItems.Add($libraryValue)
+        [void]$item.SubItems.Add((Get-DisplaySiteUrl -SiteUrl ([string]$option.siteUrl)))
+        [void]$item.SubItems.Add($itemsValue)
+        [void]$item.SubItems.Add($statusValue)
+        [void]$item.SubItems.Add($reasonValue)
+        $item.ToolTipText = [string]$option.siteUrl
+        $item.Tag = @{ key = [string]$option.key; itemCount = $optionItemCount; autoSkipped = $false }
+        $item.Checked = $isExcluded
+        if($isExcluded) { $item.ForeColor = $excludedForeColor }
+        $allItems.Add($item)
+    }
 
     $form = New-Object Windows.Forms.Form
     $form.Text = "M365AutoLink - Manage shortcuts"
     $form.StartPosition = "CenterScreen"
-    $form.MaximizeBox = $false
     $form.AutoScaleMode = [Windows.Forms.AutoScaleMode]::None
-    # Set the borderless style BEFORE the size so ClientSize reflects the borderless area. If the size
-    # is applied while the default (sizable) border is still active, the client area ends up narrower
-    # and shorter than expected, which pushes the table/buttons off the right and bottom edges.
-    $form.FormBorderStyle = [Windows.Forms.FormBorderStyle]::None
-    $form.ClientSize = New-Object Drawing.Size(1040, 600)
-    $form.MinimumSize = $form.Size
-    $form.TopMost = $true
+    # a normal sizable window (resizable + remembers its size), rather than the old borderless one.
+    $form.FormBorderStyle = [Windows.Forms.FormBorderStyle]::Sizable
+    $form.MaximizeBox = $true
+    $form.MinimumSize = New-Object Drawing.Size(760, 460)
+    $savedSize = Get-SavedManageDialogSize
+    if($savedSize) {
+        $form.ClientSize = New-Object Drawing.Size([int]$savedSize.Width, [int]$savedSize.Height)
+    } else {
+        $form.ClientSize = New-Object Drawing.Size(1040, 600)
+    }
     $form.BackColor = [Drawing.Color]::FromArgb(246, 248, 252)
-    $form.Padding = New-Object Windows.Forms.Padding(1)
 
-    Set-RoundedFormRegion -Form $form -Radius 10
-
-    # Drive all geometry from the measured client area so nothing overflows the window edges.
     $pad = 12
     $footerH = 48
+    $filterH = 30
     $clientW = $form.ClientSize.Width
     $clientH = $form.ClientSize.Height
     $contentWidth = $clientW - ($pad * 2)
+    $rightAnchor = [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Left -bor [Windows.Forms.AnchorStyles]::Right
 
     $headerPanel = New-Object Windows.Forms.Panel
     $headerPanel.Location = New-Object Drawing.Point(0, 0)
-    $headerPanel.Size = New-Object Drawing.Size($clientW, 74)
+    $headerPanel.Size = New-Object Drawing.Size($clientW, 66)
     $headerPanel.BackColor = [Drawing.Color]::FromArgb(33, 37, 43)
+    $headerPanel.Anchor = $rightAnchor
 
     $titleLabel = New-Object Windows.Forms.Label
-    $titleLabel.Location = New-Object Drawing.Point($pad, 10)
-    $titleLabel.Size = New-Object Drawing.Size(($clientW - 56), 24)
+    $titleLabel.Location = New-Object Drawing.Point($pad, 9)
+    $titleLabel.Size = New-Object Drawing.Size(($clientW - ($pad * 2)), 22)
     $titleLabel.Font = New-Object Drawing.Font("Segoe UI", 11, [Drawing.FontStyle]::Bold)
     $titleLabel.ForeColor = [Drawing.Color]::FromArgb(237, 244, 252)
     $titleLabel.Text = "Manage shortcuts"
+    $titleLabel.Anchor = $rightAnchor
 
     $subLabel = New-Object Windows.Forms.Label
-    $subLabel.Location = New-Object Drawing.Point($pad, 35)
-    $subLabel.Size = New-Object Drawing.Size(($clientW - 56), 28)
+    $subLabel.Location = New-Object Drawing.Point($pad, 34)
+    $subLabel.Size = New-Object Drawing.Size(($clientW - ($pad * 2)), 26)
     $subLabel.Font = New-Object Drawing.Font("Segoe UI", 9)
     $subLabel.ForeColor = [Drawing.Color]::FromArgb(191, 205, 223)
-    $subLabel.Text = "Tick the Exclude box to stop syncing a library. Saving applies your changes and re-runs automatically."
-
-    $headerCloseButton = New-Object Windows.Forms.Button
-    $headerCloseButton.Text = "[X]"
-    $headerCloseButton.Location = New-Object Drawing.Point(($clientW - 54), 9)
-    $headerCloseButton.Size = New-Object Drawing.Size(34, 24)
-    $headerCloseButton.FlatStyle = [Windows.Forms.FlatStyle]::Flat
-    $headerCloseButton.FlatAppearance.BorderSize = 1
-    $headerCloseButton.FlatAppearance.BorderColor = [Drawing.Color]::FromArgb(95, 108, 124)
-    $headerCloseButton.BackColor = [Drawing.Color]::FromArgb(58, 65, 75)
-    $headerCloseButton.ForeColor = [Drawing.Color]::FromArgb(237, 244, 252)
-    $headerCloseButton.Font = New-Object Drawing.Font("Segoe UI", 8.5, [Drawing.FontStyle]::Bold)
-    $headerCloseButton.UseVisualStyleBackColor = $false
-    $headerCloseButton.Cursor = [Windows.Forms.Cursors]::Hand
-    $headerCloseButton.Anchor = [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Right
-    $headerCloseButton.Add_Click({ $form.DialogResult = [Windows.Forms.DialogResult]::Cancel; $form.Close() })
+    $subLabel.Text = "Tick Exclude to stop syncing a library. Type to filter, click a column to sort. Saving re-runs automatically."
+    $subLabel.Anchor = $rightAnchor
 
     $headerPanel.Controls.Add($titleLabel)
     $headerPanel.Controls.Add($subLabel)
-    $headerPanel.Controls.Add($headerCloseButton)
-    $headerCloseButton.BringToFront()
 
-    # Capacity bar: shows how much of the 1M sync "budget" the currently INCLUDED sites consume.
+    # Filter row: a search box plus quick Exclude-all / Include-all buttons.
+    $filterLabel = New-Object Windows.Forms.Label
+    $filterLabel.Location = New-Object Drawing.Point($pad, 74)
+    $filterLabel.Size = New-Object Drawing.Size(40, $filterH)
+    $filterLabel.Text = "Filter"
+    $filterLabel.TextAlign = [Drawing.ContentAlignment]::MiddleLeft
+    $filterLabel.Font = New-Object Drawing.Font("Segoe UI", 9)
+
+    $filterBox = New-Object Windows.Forms.TextBox
+    $filterBox.Location = New-Object Drawing.Point(($pad + 44), 76)
+    $filterBox.Size = New-Object Drawing.Size(($contentWidth - 44 - 220), 24)
+    $filterBox.Font = New-Object Drawing.Font("Segoe UI", 9)
+    $filterBox.Anchor = $rightAnchor
+
+    $excludeAllButton = New-Object Windows.Forms.Button
+    $excludeAllButton.Text = "Exclude all"
+    $excludeAllButton.Size = New-Object Drawing.Size(100, 26)
+    $excludeAllButton.Location = New-Object Drawing.Point(($clientW - $pad - 208), 75)
+    $excludeAllButton.FlatStyle = [Windows.Forms.FlatStyle]::Flat
+    $excludeAllButton.BackColor = [Drawing.Color]::FromArgb(231, 236, 244)
+    $excludeAllButton.Anchor = [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Right
+
+    $includeAllButton = New-Object Windows.Forms.Button
+    $includeAllButton.Text = "Include all"
+    $includeAllButton.Size = New-Object Drawing.Size(100, 26)
+    $includeAllButton.Location = New-Object Drawing.Point(($clientW - $pad - 100), 75)
+    $includeAllButton.FlatStyle = [Windows.Forms.FlatStyle]::Flat
+    $includeAllButton.BackColor = [Drawing.Color]::FromArgb(231, 236, 244)
+    $includeAllButton.Anchor = [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Right
+
+    # Capacity bar: shows how much of the sync "budget" the currently INCLUDED libraries consume.
     $capPanel = New-Object Windows.Forms.Panel
-    $capPanel.Location = New-Object Drawing.Point($pad, 82)
-    $capPanel.Size = New-Object Drawing.Size($contentWidth, 48)
+    $capPanel.Location = New-Object Drawing.Point($pad, 112)
+    $capPanel.Size = New-Object Drawing.Size($contentWidth, 44)
     $capPanel.BackColor = [Drawing.Color]::FromArgb(246, 248, 252)
+    $capPanel.Anchor = $rightAnchor
 
     $capLabel = New-Object Windows.Forms.Label
     $capLabel.Location = New-Object Drawing.Point(0, 0)
     $capLabel.Size = New-Object Drawing.Size($contentWidth, 18)
     $capLabel.Font = New-Object Drawing.Font("Segoe UI", 9, [Drawing.FontStyle]::Bold)
     $capLabel.TextAlign = [Drawing.ContentAlignment]::MiddleLeft
+    $capLabel.Anchor = $rightAnchor
 
-    $capTrackWidth = $contentWidth
     $capTrack = New-Object Windows.Forms.Panel
-    $capTrack.Location = New-Object Drawing.Point(0, 24)
-    $capTrack.Size = New-Object Drawing.Size($capTrackWidth, 16)
+    $capTrack.Location = New-Object Drawing.Point(0, 22)
+    $capTrack.Size = New-Object Drawing.Size($contentWidth, 14)
     $capTrack.BackColor = [Drawing.Color]::FromArgb(225, 230, 238)
+    $capTrack.Anchor = $rightAnchor
 
     $capFill = New-Object Windows.Forms.Panel
     $capFill.Location = New-Object Drawing.Point(0, 0)
-    $capFill.Size = New-Object Drawing.Size(0, 16)
+    $capFill.Size = New-Object Drawing.Size(0, 14)
     $capFill.BackColor = [Drawing.Color]::FromArgb(31, 122, 49)
     $capTrack.Controls.Add($capFill)
 
     $capPanel.Controls.Add($capLabel)
     $capPanel.Controls.Add($capTrack)
 
+    $listTop = 164
     $listView = New-Object Windows.Forms.ListView
-    $listView.Location = New-Object Drawing.Point($pad, 138)
-    $listView.Size = New-Object Drawing.Size($contentWidth, ($clientH - 138 - $footerH - 8))
+    $listView.Location = New-Object Drawing.Point($pad, $listTop)
+    $listView.Size = New-Object Drawing.Size($contentWidth, ($clientH - $listTop - $footerH - 8))
     $listView.View = [Windows.Forms.View]::Details
     $listView.FullRowSelect = $true
     $listView.GridLines = $true
@@ -1435,9 +1865,7 @@ function Show-ManageShortcutsDialog {
     $listView.CheckBoxes = $true
     $listView.ShowItemToolTips = $true
     $listView.Font = New-Object Drawing.Font("Segoe UI", 9)
-    $listView.Anchor = [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Left
-    # Fixed columns total 584px; the Site column flexes to fill the rest so the columns span the full
-    # table width (less ~22px for the vertical scrollbar) - no dead space and nothing pushed off-screen.
+    $listView.Anchor = [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Bottom -bor [Windows.Forms.AnchorStyles]::Left -bor [Windows.Forms.AnchorStyles]::Right
     $siteColumnWidth = [Math]::Max(200, $contentWidth - 584 - 22)
     [void]$listView.Columns.Add("Exclude", 64)
     [void]$listView.Columns.Add("Library", 180)
@@ -1446,38 +1874,18 @@ function Show-ManageShortcutsDialog {
     [void]$listView.Columns.Add("Status", 90)
     [void]$listView.Columns.Add("Reason", 150)
 
-    $excludedForeColor = [Drawing.Color]::FromArgb(150, 158, 168)
-    foreach($option in ($LibraryOptions | Sort-Object @{ Expression = { [string]$_.siteName } }, @{ Expression = { [string]$_.listName } })) {
-        $libraryKeyValue = [string]$option.key
-        $siteUrlValue = [string]$option.siteUrl
-        $libraryValue = [string]$option.listName
-        if([string]::IsNullOrWhiteSpace($libraryValue)) { $libraryValue = "-" }
-        $optionItemCount = [long]0
-        try { $optionItemCount = [long]$option.itemCount } catch {}
-        $isExcluded = [bool]$option.isExcluded
+    # Suppress capacity recompute while we bulk-repopulate the list (filter/sort), then recompute once.
+    $script:mgSuspend = $false
 
-        # Item counts are unknown for excluded libraries (we skip their metadata to save API calls).
-        $itemsValue = if($isExcluded) { "-" } elseif($optionItemCount -gt 0) { '{0:N0}' -f $optionItemCount } else { "0" }
-        $statusValue = if($isExcluded) { "Excluded" } else { "Linked" }
-        $reasonValue = if($isExcluded) { "Excluded by you" } else { "" }
-
-        $item = New-Object Windows.Forms.ListViewItem("")
-        [void]$item.SubItems.Add($libraryValue)
-        [void]$item.SubItems.Add((Get-DisplaySiteUrl -SiteUrl $siteUrlValue))
-        [void]$item.SubItems.Add($itemsValue)
-        [void]$item.SubItems.Add($statusValue)
-        [void]$item.SubItems.Add($reasonValue)
-        $item.ToolTipText = $siteUrlValue
-        $item.Tag = @{ key = $libraryKeyValue; itemCount = $optionItemCount }
-        $item.Checked = $isExcluded
-        if($isExcluded) { $item.ForeColor = $excludedForeColor }
-        [void]$listView.Items.Add($item)
-    }
-
-    # Recompute the capacity bar + per-row status from the current checkbox states.
     $refreshCapacity = {
+        if($script:mgSuspend) { return }
+      try {
         $includedTotal = [long]0
         foreach($row in $listView.Items) {
+            # During the ListView handle-creation ItemChecked storm the enumeration can briefly yield a
+            # null/partial row; indexing $null.SubItems is what threw "Cannot index into a null array".
+            if($null -eq $row -or $null -eq $row.SubItems -or $row.SubItems.Count -lt 6) { continue }
+            if($row.Tag.autoSkipped) { continue }
             $rowCount = [long]0
             try { $rowCount = [long]$row.Tag.itemCount } catch {}
             if($row.Checked) {
@@ -1505,7 +1913,7 @@ function Show-ManageShortcutsDialog {
             $ratio = [double]$includedTotal / [double]$totalItemCountWarningThreshold
             if($ratio -gt 1) { $ratio = 1 }
             if($ratio -lt 0) { $ratio = 0 }
-            $capFill.Width = [int]($capTrackWidth * $ratio)
+            $capFill.Width = [int]($capTrack.Width * $ratio)
             $remaining = $totalItemCountWarningThreshold - $includedTotal
             if($remaining -lt 0) {
                 $capLabel.Text = "{0:N0} of {1:N0} items synced  -  OVER by {2:N0}" -f $includedTotal, $totalItemCountWarningThreshold, [math]::Abs($remaining)
@@ -1516,10 +1924,79 @@ function Show-ManageShortcutsDialog {
             $capFill.Width = 0
             $capLabel.Text = "{0:N0} items synced  (limit warning disabled)" -f $includedTotal
         }
+      } catch {
+        # Never let a stray handler error surface as a WinForms Continue/Quit ThreadException popup.
+        Write-Log "Manage-shortcuts capacity refresh failed: $($_.Exception.Message)" "WARN"
+      }
+    }
+
+    # (Re)build the visible rows from $allItems using the current filter text + sort column/direction.
+    $applyView = {
+      try {
+        $filterText = ([string]$filterBox.Text).Trim().ToLowerInvariant()
+        $rows = @($allItems)
+        if(-not [string]::IsNullOrWhiteSpace($filterText)) {
+            $rows = @($rows | Where-Object {
+                (([string]$_.SubItems[1].Text).ToLowerInvariant().Contains($filterText)) -or
+                (([string]$_.SubItems[2].Text).ToLowerInvariant().Contains($filterText)) -or
+                (([string]$_.ToolTipText).ToLowerInvariant().Contains($filterText)) -or
+                (([string]$_.SubItems[5].Text).ToLowerInvariant().Contains($filterText))
+            })
+        }
+
+        $col = $script:mgSortColumn
+        if($null -ne $col) {
+            if($col -eq 0) {
+                $rows = @($rows | Sort-Object @{ Expression = { [bool]$_.Checked } })
+            } elseif($col -eq 3) {
+                $rows = @($rows | Sort-Object @{ Expression = { [long]$_.Tag.itemCount } })
+            } else {
+                $rows = @($rows | Sort-Object @{ Expression = { [string]$_.SubItems[$col].Text } })
+            }
+            if(-not $script:mgSortAsc) { [array]::Reverse($rows) }
+        }
+
+        $script:mgSuspend = $true
+        $listView.BeginUpdate()
+        $listView.Items.Clear()
+        foreach($r in $rows) { [void]$listView.Items.Add($r) }
+        $listView.EndUpdate()
+        $script:mgSuspend = $false
+        & $refreshCapacity
+      } catch {
+        $script:mgSuspend = $false
+        Write-Log "Manage-shortcuts view refresh failed: $($_.Exception.Message)" "WARN"
+      }
     }
 
     $listView.Add_ItemChecked({ & $refreshCapacity })
-    & $refreshCapacity
+    $listView.Add_ColumnClick({
+        param($s, $e)
+        if($script:mgSortColumn -eq $e.Column) { $script:mgSortAsc = -not $script:mgSortAsc }
+        else { $script:mgSortColumn = $e.Column; $script:mgSortAsc = $true }
+        & $applyView
+    })
+    $filterBox.Add_TextChanged({ & $applyView })
+
+    $excludeAllButton.Add_Click({
+        try {
+            $script:mgSuspend = $true
+            foreach($row in $listView.Items) { if(-not $row.Tag.autoSkipped -and -not $row.Checked) { $row.Checked = $true } }
+        } catch {} finally { $script:mgSuspend = $false }
+        & $refreshCapacity
+    })
+    $includeAllButton.Add_Click({
+        try {
+            $script:mgSuspend = $true
+            foreach($row in $listView.Items) { if(-not $row.Tag.autoSkipped -and $row.Checked) { $row.Checked = $false } }
+        } catch {} finally { $script:mgSuspend = $false }
+        & $refreshCapacity
+    })
+
+    # Default sort: site/library ascending.
+    $script:mgSortColumn = 2
+    $script:mgSortAsc = $true
+    & $applyView
 
     $footerPanel = New-Object Windows.Forms.Panel
     $footerPanel.Location = New-Object Drawing.Point(0, ($clientH - $footerH))
@@ -1555,9 +2032,11 @@ function Show-ManageShortcutsDialog {
     $footerPanel.Controls.Add($saveButton)
     $footerPanel.Controls.Add($cancelButton)
 
-    Enable-FormDrag -Form $form -DragControls @($form, $headerPanel, $titleLabel, $subLabel)
-
     $form.Controls.Add($headerPanel)
+    $form.Controls.Add($filterLabel)
+    $form.Controls.Add($filterBox)
+    $form.Controls.Add($excludeAllButton)
+    $form.Controls.Add($includeAllButton)
     $form.Controls.Add($capPanel)
     $form.Controls.Add($listView)
     $form.Controls.Add($footerPanel)
@@ -1571,13 +2050,17 @@ function Show-ManageShortcutsDialog {
         return @{ isCanceled = $true; excludedLibraryKeys = @() }
     }
 
+    # remember the window size for next time.
+    try { Save-ManageDialogSize -Width $form.ClientSize.Width -Height $form.ClientSize.Height } catch {}
+
     if($dialogResult -ne [Windows.Forms.DialogResult]::OK) {
         $form.Dispose()
         return @{ isCanceled = $true; excludedLibraryKeys = @() }
     }
 
     $selected = [System.Collections.Generic.List[string]]::new()
-    foreach($row in $listView.Items) {
+    foreach($row in $allItems) {
+        if($row.Tag.autoSkipped) { continue }
         if(-not $row.Checked) { continue }
         $rowKey = [string]$row.Tag.key
         if(-not [string]::IsNullOrWhiteSpace($rowKey) -and -not $selected.Contains($rowKey)) {
@@ -1647,13 +2130,35 @@ foreach($featureId in $ExcludedListFeatureIDs) {
     }
 }
 
-function get-AccessToken{    
+function Invoke-RefreshTokenExchange {
+    # Redeems the cached refresh token for an access token for a specific resource (v2 endpoint, B2).
+    # Persists the refresh token only when Entra rotated it (A1), so the hot path never writes to disk.
+    param([Parameter(Mandatory = $true)][string]$Resource)
+
+    $body = @{
+        client_id     = $global:octo.LCClientId
+        grant_type    = "refresh_token"
+        refresh_token = $global:octo.LCRefreshToken
+        scope         = (Get-ScopeForResource -Resource $Resource)
+    }
+
+    $response = Invoke-RestMethod -Uri $global:octo.tokenUrl -Method POST -Body $body -ErrorAction Stop -Verbose:$false
+
+    if($response.refresh_token -and $response.refresh_token -ne $global:octo.LCRefreshToken){
+        $global:octo.LCRefreshToken = $response.refresh_token
+        Save-RefreshToken -RefreshToken $response.refresh_token
+    }
+
+    return $response
+}
+
+function get-AccessToken{
     Param(
         [Parameter(Mandatory=$true)]$resource,
         [Switch]$returnHeader
-    )   
+    )
 
-    # Try to load refresh token from disk
+    # Try to load refresh token from disk (once per process)
     if(!$global:octo.LCRefreshToken -and (Test-Path $global:octo.TokenCachePath)){
         try {
             $global:octo.LCRefreshToken = (Import-Clixml $global:octo.TokenCachePath).GetNetworkCredential().Password
@@ -1661,84 +2166,138 @@ function get-AccessToken{
         } catch {
             Write-Warning "Failed to load cached token, proceeding to authentication..."
             Remove-Item $global:octo.TokenCachePath -ErrorAction SilentlyContinue
-        }     
-    }
-
-    # Use cached refresh token
-    if($global:octo.LCRefreshToken){
-        try {
-            $response = Invoke-RestMethod "$($global:octo.idpUrl)/common/oauth2/token" -Method POST -Body "resource=$([System.Web.HttpUtility]::UrlEncode($resource))&grant_type=refresh_token&refresh_token=$($global:octo.LCRefreshToken)&client_id=$($global:octo.LCClientId)" -ErrorAction Stop -Verbose:$false
-            
-            if($response.access_token){
-                if($response.refresh_token){ 
-                    $global:octo.LCRefreshToken = $response.refresh_token
-                    try {
-                        $tokenDir = [System.IO.Path]::GetDirectoryName($global:octo.TokenCachePath)
-                        if(!(Test-Path $tokenDir)){ New-Item -ItemType Directory -Path $tokenDir -Force | Out-Null }
-                        $secureToken = ConvertTo-SecureString -String $response.refresh_token -AsPlainText -Force
-                        $credential = New-Object System.Management.Automation.PSCredential("RefreshToken", $secureToken)
-                        $credential | Export-Clixml -Path $global:octo.TokenCachePath -Force
-                    } catch {}
-                }
-                
-                if(!$global:octo.LCCachedTokens.$resource){
-                    $global:octo.LCCachedTokens.$resource = @{ "validFrom" = Get-Date; "accessToken" = $Null }
-                }
-                $global:octo.LCCachedTokens.$($resource).accessToken = $response.access_token
-                $global:octo.LCCachedTokens.$($resource).validFrom = Get-Date
-                return $response.access_token
-            }
-        } catch {
-            Write-Warning "Cached refresh token invalid or expired, will re-authenticate..."
-            $global:octo.LCRefreshToken = $Null
-            Remove-Item $global:octo.TokenCachePath -ErrorAction SilentlyContinue
         }
     }
 
-    # Browser-based authentication
+    # hot path: serve a still-valid cached access token WITHOUT any network/DPAPI/disk work.
+    # Renew 5 minutes ahead of the real expiry reported by Entra.
+    $cached = $global:octo.LCCachedTokens[$resource]
+    if($cached -and $cached.accessToken -and $cached.expiresOn -gt (Get-Date).AddMinutes(5)){
+        if($returnHeader){ return @{ "Authorization" = "Bearer $($cached.accessToken)" } }
+        return $cached.accessToken
+    }
+
+    # No usable cached access token: make sure we have a refresh token, then exchange it.
     if(!$global:octo.LCRefreshToken){
         $global:octo.LCRefreshToken = Get-BrowserAuthorizationCode
     }
 
-    if(!$global:octo.LCCachedTokens.$resource){
-        $global:octo.LCCachedTokens.$resource = @{ "validFrom" = Get-Date; "accessToken" = $Null }
+    $response = $null
+    try {
+        $response = Invoke-RefreshTokenExchange -Resource $resource
+    } catch {
+        # Refresh token invalid/expired/revoked -> drop it and fall back to an interactive sign-in once.
+        Write-Warning "Cached refresh token invalid or expired, will re-authenticate..."
+        $global:octo.LCRefreshToken = $Null
+        Remove-Item $global:octo.TokenCachePath -ErrorAction SilentlyContinue
+        $global:octo.LCRefreshToken = Get-BrowserAuthorizationCode
+        $response = Invoke-RefreshTokenExchange -Resource $resource
     }
 
-    if(!$global:octo.LCCachedTokens.$($resource).accessToken -or $global:octo.LCCachedTokens.$($resource).validFrom -lt (Get-Date).AddMinutes(-15)){
-        $response = Invoke-RestMethod "$($global:octo.idpUrl)/common/oauth2/token" -Method POST -Body "resource=$([System.Web.HttpUtility]::UrlEncode($resource))&grant_type=refresh_token&refresh_token=$($global:octo.LCRefreshToken)&client_id=$($global:octo.LCClientId)" -ErrorAction Stop -Verbose:$false
-        
-        if($response.access_token){
-            if($response.refresh_token){ 
-                $global:octo.LCRefreshToken = $response.refresh_token
-                try {
-                    $tokenDir = [System.IO.Path]::GetDirectoryName($global:octo.TokenCachePath)
-                    if(!(Test-Path $tokenDir)){ New-Item -ItemType Directory -Path $tokenDir -Force | Out-Null }
-                    $secureToken = ConvertTo-SecureString -String $response.refresh_token -AsPlainText -Force
-                    $credential = New-Object System.Management.Automation.PSCredential("RefreshToken", $secureToken)
-                    $credential | Export-Clixml -Path $global:octo.TokenCachePath -Force
-                } catch {}
-            }
-            $global:octo.LCCachedTokens.$($resource).accessToken = $response.access_token
-            $global:octo.LCCachedTokens.$($resource).validFrom = Get-Date
-        }else{
-            throw "Failed to retrieve access token!"
-        }
+    if(!$response -or !$response.access_token){
+        throw "Failed to retrieve access token!"
     }
 
-    return $global:octo.LCCachedTokens.$($resource).accessToken
+    # Cache the access token against its real lifetime (expires_in seconds), defaulting to ~55 minutes.
+    $expiresOn = (Get-Date).AddSeconds(3300)
+    if($response.expires_in){
+        try { $expiresOn = (Get-Date).AddSeconds([double]$response.expires_in) } catch {}
+    }
+    $global:octo.LCCachedTokens[$resource] = @{ accessToken = $response.access_token; expiresOn = $expiresOn }
+
+    if($returnHeader){ return @{ "Authorization" = "Bearer $($response.access_token)" } }
+    return $response.access_token
+}
+
+function Send-AuthListenerResponse {
+    # Writes an HTML response to an HttpListener callback and closes it. Everything reflected from the
+    # query string is HTML-encoded by the caller before it reaches here (B3).
+    param(
+        [Parameter(Mandatory = $true)]$Context,
+        [Parameter(Mandatory = $true)][string]$Html,
+        [int]$StatusCode = 200
+    )
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Html)
+        $Context.Response.StatusCode = $StatusCode
+        $Context.Response.ContentType = "text/html; charset=utf-8"
+        $Context.Response.ContentLength64 = $bytes.Length
+        $Context.Response.OutputStream.Write($bytes, 0, $bytes.Length)
+    } catch {
+    } finally {
+        try { $Context.Response.OutputStream.Close() } catch {}
+        try { $Context.Response.Close() } catch {}
+    }
+}
+
+function Get-AuthLandingPage {
+    # Branded, self-closing landing page shown in the browser after the callback (D6).
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('success','failure')][string]$Kind,
+        [string]$Detail = ""
+    )
+    $accent = if($Kind -eq 'success'){ "#107c10" } else { "#a80000" }
+    $heading = if($Kind -eq 'success'){ "&#10004; You're signed in" } else { "&#10006; Sign-in failed" }
+    $message = if($Kind -eq 'success'){ "M365AutoLink has what it needs. You can safely close this tab." } else { "M365AutoLink could not complete sign-in." }
+    $detailHtml = if([string]::IsNullOrWhiteSpace($Detail)){ "" } else { "<p class='detail'>$Detail</p>" }
+    return @"
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M365AutoLink</title>
+<style>
+ body{margin:0;font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#f3f2f1;color:#201f1e;display:flex;min-height:100vh;align-items:center;justify-content:center}
+ .card{background:#fff;border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.12);padding:36px 40px;max-width:420px;text-align:center}
+ .accent{color:$accent;font-size:22px;font-weight:600;margin:0 0 10px}
+ p{margin:6px 0;line-height:1.5}
+ .brand{margin-top:18px;font-size:12px;color:#605e5c}
+ .detail{font-size:13px;color:#605e5c;word-break:break-word}
+</style></head><body>
+<div class="card">
+ <p class="accent">$heading</p>
+ <p>$message</p>
+ $detailHtml
+ <p class="brand">M365AutoLink &middot; Lieben Consultancy</p>
+</div>
+<script>setTimeout(function(){window.close();},1500);</script>
+</body></html>
+"@
 }
 
 function Get-BrowserAuthorizationCode {
-    $tcpListener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 1985)
-    $tcpListener.Start()
+    # pick a free ephemeral loopback port (fixed ports collide on multi-session hosts and races).
+    $portFinder = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $portFinder.Start()
+    $port = ([System.Net.IPEndPoint]$portFinder.LocalEndpoint).Port
+    $portFinder.Stop()
 
-    $redirectUri = "http://localhost:1985"
-    $authUrl = "$($global:octo.idpUrl)/common/oauth2/authorize?" +
-        "client_id=$($global:octo.LCClientId)" +
+    $redirectUri = "http://localhost:$port/"
+
+    # HttpListener handles HTTP correctly (vs. the raw TcpListener that only parsed the first line).
+    # Binding to localhost does not require admin rights.
+    $listener = [System.Net.HttpListener]::new()
+    $listener.Prefixes.Add($redirectUri)
+    try {
+        $listener.Start()
+    } catch {
+        throw "Could not start the local sign-in listener on port $port : $($_.Exception.Message)"
+    }
+
+    # PKCE (S256) + anti-forgery state so any other local process cannot inject a code.
+    $codeVerifier = New-PkceCodeVerifier
+    $codeChallenge = New-PkceCodeChallenge -Verifier $codeVerifier
+    $state = [Guid]::NewGuid().ToString("N")
+    $scope = "$($global:octo.graphUrl)/.default offline_access"
+
+    # v2 authorize endpoint (scope=, not resource=).
+    $authUrl = "$($global:octo.authorizeUrl)?" +
+        "client_id=$([System.Uri]::EscapeDataString($global:octo.LCClientId))" +
         "&response_type=code" +
-        "&redirect_uri=$([System.Web.HttpUtility]::UrlEncode($redirectUri))" +
+        "&redirect_uri=$([System.Uri]::EscapeDataString($redirectUri))" +
         "&response_mode=query" +
-        "&resource=$([System.Web.HttpUtility]::UrlEncode($global:octo.graphUrl))"
+        "&scope=$([System.Uri]::EscapeDataString($scope))" +
+        "&state=$([System.Uri]::EscapeDataString($state))" +
+        "&code_challenge=$([System.Uri]::EscapeDataString($codeChallenge))" +
+        "&code_challenge_method=S256"
 
     Write-Host ""
     Write-Host "============================================" -ForegroundColor Cyan
@@ -1748,7 +2307,7 @@ function Get-BrowserAuthorizationCode {
     Write-Host "Opening browser for sign-in..." -ForegroundColor Yellow
     Write-Host "(After signing in once, future runs will be silent)" -ForegroundColor DarkGray
     Write-Host ""
-    
+
     try {
         Start-Process $authUrl -WindowStyle $WindowStyle | Out-Null
     } catch {
@@ -1757,77 +2316,80 @@ function Get-BrowserAuthorizationCode {
         Write-Host $authUrl -ForegroundColor White
     }
 
-    $tcpListener.Server.ReceiveTimeout = 300000 # 5 minutes
-    
+    $code = $null
+    $authError = $null
+    $deadline = (Get-Date).AddMinutes(5)
+
     try {
-        $client = $tcpListener.AcceptTcpClient()
-    } catch {
-        $tcpListener.Stop()
-        throw "Authentication timed out - no response received within 5 minutes"
-    }
-    
-    Start-Sleep -Milliseconds 500
-    $stream = $client.GetStream()
-    $reader = New-Object System.IO.StreamReader($stream)
-    $writer = New-Object System.IO.StreamWriter($stream)
-    $requestLine = $reader.ReadLine()
-    
-    # Check for errors
-    if($requestLine -match "error=([^&\s]+)"){
-        $errorCode = $matches[1]
-        $errorDesc = ""
-        if($requestLine -match "error_description=([^&\s]+)"){
-            $errorDesc = [System.Web.HttpUtility]::UrlDecode($matches[1])
+        while((Get-Date) -lt $deadline){
+            $remainingMs = [int][Math]::Max(1000, ($deadline - (Get-Date)).TotalMilliseconds)
+            $contextTask = $listener.GetContextAsync()
+            if(-not $contextTask.Wait($remainingMs)){ break }
+
+            $context = $contextTask.Result
+            $query = $context.Request.QueryString
+            $returnedState = [string]$query["state"]
+
+            # ignore anything whose state doesn't match ours (junk, races, injection attempts)
+            # instead of terminating the wait.
+            if($returnedState -ne $state){
+                Send-AuthListenerResponse -Context $context -StatusCode 400 -Html (Get-AuthLandingPage -Kind 'failure' -Detail 'Unexpected request ignored.')
+                continue
+            }
+
+            if($query["error"]){
+                $errorCode = [string]$query["error"]
+                $errorDesc = [string]$query["error_description"]
+                $authError = "$errorCode - $errorDesc"
+                $safeDetail = [System.Net.WebUtility]::HtmlEncode("$($errorCode): $errorDesc")
+                Send-AuthListenerResponse -Context $context -Html (Get-AuthLandingPage -Kind 'failure' -Detail $safeDetail)
+                break
+            }
+
+            if($query["code"]){
+                $code = [string]$query["code"]
+                Send-AuthListenerResponse -Context $context -Html (Get-AuthLandingPage -Kind 'success')
+                break
+            }
+
+            # State matched but neither code nor error present: ignore and keep waiting.
+            Send-AuthListenerResponse -Context $context -StatusCode 400 -Html (Get-AuthLandingPage -Kind 'failure' -Detail 'Incomplete request ignored.')
         }
-        $writer.Write("HTTP/1.1 200 OK`r`nContent-Type: text/html`r`n`r`n<html><body><h2>Authentication for M365AutoLink failed</h2><p>$($errorCode): $errorDesc</p></body></html>")
-        $writer.Flush()
-        $writer.Close();$reader.Close();$client.Close();$tcpListener.Stop()
-        throw "Authentication error: $errorCode - $errorDesc"
+    } finally {
+        try { $listener.Stop() } catch {}
+        try { $listener.Close() } catch {}
     }
-    
-    # Extract authorization code
-    if($requestLine -match "code=([^&\s]+)"){
-        $code = $matches[1]
-    }else{
-        $writer.Close();$reader.Close();$client.Close();$tcpListener.Stop()
-        throw "Failed to receive authorization code"
+
+    if($authError){
+        throw "Authentication error: $authError"
     }
-    
-    # Send success response
-    $writer.Write("HTTP/1.1 200 OK`r`nContent-Type: text/html`r`n`r`n<html><head><script>window.close();</script></head><body><h2 style='color:green'>&#10004; M365AutoLink authentication successful!</h2><p>You can close this window.</p></body></html>")
-    $writer.Flush()
-    Start-Sleep -Milliseconds 500
-    $writer.Close();$reader.Close();$client.Close();$tcpListener.Stop()
+    if([string]::IsNullOrWhiteSpace($code)){
+        throw "Authentication timed out - no valid response received within 5 minutes"
+    }
 
     Write-Host "Authorization code received, exchanging for tokens..." -ForegroundColor Cyan
 
-    # Exchange code for tokens
+    # v2 token endpoint. include the PKCE code_verifier in the exchange.
     $tokenBody = @{
         grant_type    = "authorization_code"
         client_id     = $global:octo.LCClientId
         code          = $code
         redirect_uri  = $redirectUri
-        resource      = $global:octo.graphUrl
+        scope         = $scope
+        code_verifier = $codeVerifier
     }
-    
-    $response = Invoke-RestMethod -Uri "$($global:octo.idpUrl)/common/oauth2/token" -Method POST -Body $tokenBody -ErrorAction Stop
-    
+
+    $response = Invoke-RestMethod -Uri $global:octo.tokenUrl -Method POST -Body $tokenBody -ErrorAction Stop
+
     if ($response.refresh_token) {
-        try {
-            $tokenDir = [System.IO.Path]::GetDirectoryName($global:octo.TokenCachePath)
-            if(!(Test-Path $tokenDir)){ New-Item -ItemType Directory -Path $tokenDir -Force | Out-Null }
-            $secureToken = ConvertTo-SecureString -String $response.refresh_token -AsPlainText -Force
-            $credential = New-Object System.Management.Automation.PSCredential("RefreshToken", $secureToken)
-            $credential | Export-Clixml -Path $global:octo.TokenCachePath -Force
-            Write-Host ""
-            Write-Host "Authentication successful! Token cached for future use." -ForegroundColor Green
-            Write-Host ""
-        } catch { Write-Warning "Could not cache token: $_" }
-        
+        Save-RefreshToken -RefreshToken $response.refresh_token
+        Write-Host ""
+        Write-Host "Authentication successful! Token cached for future use." -ForegroundColor Green
+        Write-Host ""
         return $response.refresh_token
     }
-    
-    throw "No refresh token received from Azure AD"
+
+    throw "No refresh token received from Entra ID"
 }
 
 function New-GraphQuery {
@@ -1862,8 +2424,13 @@ function New-GraphQuery {
         try{
             $token = Get-AccessToken -resource $resource
         }catch{
-            Write-Log "Possible fix: an admin still needs to approve this application at https://login.microsoftonline.com/organizations/adminconsent?client_id=$($ClientID)" -Level "ERROR"
-            Exit 1
+            # do NOT Exit here - that would silently kill the tray process mid-run with no balloon.
+            # Throw a recognizable error instead so Invoke-M365AutoLinkRun's catch can surface it as an
+            # Error balloon (with the consent URL) and keep the tray alive for a retry after consent.
+            $consentUrl = "$($global:octo.idpUrl)/organizations/adminconsent?client_id=$($global:octo.LCClientId)"
+            Write-Log "Token acquisition failed for '$resource': $($_.Exception.Message)" -Level "ERROR"
+            Write-Log "Possible fix: an admin still needs to approve this application at $consentUrl" -Level "ERROR"
+            throw "M365AutoLink needs admin consent (or sign-in failed). Ask IT to approve: $consentUrl"
         }
         $headers = @{
             "Authorization" = "Bearer $token"
@@ -1932,7 +2499,7 @@ function New-GraphQuery {
                     if($delay -le 0 -and $isTransientNetwork){
                         $delay = [math]::Min(5, $attempts)
                     }
-                    Write-Log "[WARNING] Transient error on attempt $attempts/$MaxAttempts, retrying in $($delay)s: $($_.Exception.Message)" -ForegroundColor Yellow
+                    Write-Log "Transient error on attempt $attempts/$MaxAttempts, retrying in $($delay)s: $($_.Exception.Message)" -Level "WARN"
                     Start-Sleep -Seconds (1 + $delay)
                 }     
             }
@@ -1948,7 +2515,6 @@ function New-GraphQuery {
            
         while($Null -ne $nextUrl -and $nextUrl.indexOf("http") -eq 0){
             try {
-                $Null = [System.GC]::GetTotalMemory($true)
                 $attempts = 0
                 while ($attempts -lt $MaxAttempts) {
                     $attempts ++
@@ -1997,21 +2563,28 @@ function New-GraphQuery {
                         if($delay -le 0 -and $isTransientNetwork){
                             $delay = [math]::Min(5, $attempts)
                         }
-                        Write-Log "[WARNING] Transient error on attempt $attempts/$MaxAttempts, retrying in $($delay)s: $($_.Exception.Message)" -ForegroundColor Yellow
+                        Write-Log "Transient error on attempt $attempts/$MaxAttempts, retrying in $($delay)s: $($_.Exception.Message)" -Level "WARN"
                         Start-Sleep -Seconds (1 + $delay)
                     }
                 }
 
                 if($resource -like "*sharepoint.com*"){
                     if($Data -and $Data.PSObject.TypeNames -notcontains "System.Management.Automation.PSCustomObject"){
-                        $Null = Add-Type -AssemblyName System.Web.Extensions
-                        $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
-                        $serializer.MaxJsonLength = 2147483647
-                        $jsonContent = $serializer.DeserializeObject($Data)
-                        if ($jsonContent -is [System.Collections.IDictionary]) {
-                            $Data = New-Object Hashtable $jsonContent
+                        # on PowerShell 7 System.Web.Extensions (JavaScriptSerializer) does not exist,
+                        # so use ConvertFrom-Json -AsHashtable (handles large payloads and returns a
+                        # hashtable natively). Fall back to the serializer only on Windows PowerShell 5.1.
+                        if($PSVersionTable.PSVersion.Major -ge 6){
+                            $Data = ($Data | Out-String | ConvertFrom-Json -AsHashtable)
                         } else {
-                            $Data = $jsonContent
+                            $Null = Add-Type -AssemblyName System.Web.Extensions
+                            $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+                            $serializer.MaxJsonLength = 2147483647
+                            $jsonContent = $serializer.DeserializeObject($Data)
+                            if ($jsonContent -is [System.Collections.IDictionary]) {
+                                $Data = New-Object Hashtable $jsonContent
+                            } else {
+                                $Data = $jsonContent
+                            }
                         }
                     }
                 }
@@ -2058,13 +2631,53 @@ function New-GraphQuery {
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "[$timestamp] [$Level] $Message"
     $color = switch($Level) {
         "ERROR" { "Red" }
         "WARN"  { "Yellow" }
         "SUCCESS" { "Green" }
         default { "White" }
     }
-    Write-Host "[$timestamp] [$Level] $Message" -ForegroundColor $color
+    Write-Host $line -ForegroundColor $color
+
+    # write to the log file directly so we never depend on Start-Transcript (which fights between
+    # two instances and disappears if it fails to start). Best-effort; never let logging break a run.
+    try {
+        $logPath = $global:octo.LogPath
+        if(-not [string]::IsNullOrWhiteSpace($logPath)) {
+            $logDir = [System.IO.Path]::GetDirectoryName($logPath)
+            if(-not [string]::IsNullOrWhiteSpace($logDir) -and -not (Test-Path -LiteralPath $logDir)) {
+                New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+            }
+            Add-Content -LiteralPath $logPath -Value $line -Encoding UTF8 -ErrorAction Stop
+        }
+    } catch {}
+}
+
+function Invoke-LogRotation {
+    # roll the previous lastRun.log to run-<timestamp>.log and prune to $LogHistoryCount files.
+    try {
+        $logPath = $global:octo.LogPath
+        if([string]::IsNullOrWhiteSpace($logPath)) { return }
+        $logDir = [System.IO.Path]::GetDirectoryName($logPath)
+        if([string]::IsNullOrWhiteSpace($logDir)) { return }
+        if(-not (Test-Path -LiteralPath $logDir)) {
+            New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+        }
+
+        if(Test-Path -LiteralPath $logPath) {
+            $stamp = (Get-Item -LiteralPath $logPath).LastWriteTime.ToString("yyyyMMdd-HHmmss")
+            $archivePath = Join-Path -Path $logDir -ChildPath "run-$stamp.log"
+            try { Move-Item -LiteralPath $logPath -Destination $archivePath -Force -ErrorAction Stop } catch {}
+        }
+
+        $keep = [int]$LogHistoryCount
+        if($keep -lt 0) { $keep = 0 }
+        Get-ChildItem -Path $logDir -Filter "run-*.log" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -Skip $keep |
+            ForEach-Object { try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop } catch {} }
+    } catch {}
 }
 
 function Initialize-ProgressBar {
@@ -2159,6 +2772,7 @@ function Initialize-TrayIcon {
             RequestManageShortcuts = $false
             ExitRequested   = $false
             RefreshIconRequested = $false
+            ResumeDetected  = $false
             BalloonTitle    = ""
             BalloonMsg      = ""
             BalloonIcon     = "Info"
@@ -2176,6 +2790,7 @@ function Initialize-TrayIcon {
             HelpLink        = $TrayHelpLink
             CopyrightText   = $TrayCopyrightText
             CopyrightLink   = $TrayCopyrightLink
+            Version         = [string]$ScriptVersion
         })
 
         $script:trayRunspace = [runspacefactory]::CreateRunspace()
@@ -2185,14 +2800,16 @@ function Initialize-TrayIcon {
         $script:trayRunspace.SessionStateProxy.SetVariable("sync", $script:traySync)
 
         $script:trayPS = [powershell]::Create().AddScript({
-            [void][System.Reflection.Assembly]::LoadWithPartialName("System.Drawing")
-            [void][System.Reflection.Assembly]::LoadWithPartialName("System.Windows.Forms")
+            Add-Type -AssemblyName System.Drawing
+            Add-Type -AssemblyName System.Windows.Forms
 
             try {
                 $powerModeHandler = {
                     param($powerSender, $powerArgs)
                     if($powerArgs.Mode -eq [Microsoft.Win32.PowerModes]::Resume) {
                         try { $sync.RefreshIconRequested = $true } catch {}
+                        # let the main loop trigger a refresh shortly after resume (if auto-refresh is on).
+                        try { $sync.ResumeDetected = $true } catch {}
                     }
                 }
                 [Microsoft.Win32.SystemEvents]::add_PowerModeChanged($powerModeHandler)
@@ -2238,7 +2855,7 @@ function Initialize-TrayIcon {
 
             # When only the progress bar is enabled, this runspace still runs but the icon stays hidden.
             $icon.Visible = [bool]$sync.EnableTrayIcon
-            $icon.Text = "M365AutoLink"
+            $icon.Text = if([string]::IsNullOrWhiteSpace([string]$sync.Version)) { "M365AutoLink" } else { "M365AutoLink v$($sync.Version)" }
 
             # Clicking the over/approaching-limit balloon opens the configured knowledgebase article.
             $icon.Add_BalloonTipClicked({
@@ -2351,6 +2968,12 @@ function Initialize-TrayIcon {
                 try { $sync.ExitRequested = $true } catch {}
             })
 
+            # show the running version (single source of truth: $ScriptVersion).
+            $versionItem = New-Object Windows.Forms.ToolStripMenuItem("M365AutoLink v$([string]$sync.Version)")
+            $versionItem.Enabled = $false
+
+            [void]$menu.Items.Add($versionItem)
+            [void]$menu.Items.Add((New-Object Windows.Forms.ToolStripSeparator))
             [void]$menu.Items.Add($itemCountInfoItem)
             [void]$menu.Items.Add($itemCountInfoSeparator)
             [void]$menu.Items.Add($remapItem)
@@ -2373,15 +2996,27 @@ function Initialize-TrayIcon {
             $script:lastIconText = ""
 
             function New-M365ProgressForm {
-                $w = 360
-                $h = 50
-                $pad = 8
-                $iconBox = 24
-                $trackH = 5
-                $script:progressTrackWidth = $w - ($pad * 2) - $iconBox - 8
+                # scale the hand-laid-out floating bar by the primary monitor's DPI so it stays the
+                # right physical size and crisp (the process is per-monitor DPI aware).
+                $scale = 1.0
+                try {
+                    $screenGraphics = [Drawing.Graphics]::FromHwnd([IntPtr]::Zero)
+                    if($screenGraphics.DpiX -gt 0) { $scale = $screenGraphics.DpiX / 96.0 }
+                    $screenGraphics.Dispose()
+                } catch {}
+                function ds { param($v) return [int][math]::Round($v * $scale) }
+
+                $w = ds 360
+                $h = ds 50
+                $pad = ds 8
+                $iconBox = ds 24
+                $trackH = [Math]::Max(2, (ds 5))
+                $gap = ds 8
+                $script:progressTrackWidth = $w - ($pad * 2) - $iconBox - $gap
 
                 $form = New-Object Windows.Forms.Form
                 $form.Text = "M365AutoLink"
+                $form.AutoScaleMode = "None"
                 $form.Size = New-Object Drawing.Size($w, $h)
                 $form.MaximumSize = $form.Size
                 $form.MinimumSize = $form.Size
@@ -2393,7 +3028,7 @@ function Initialize-TrayIcon {
                 $form.TopMost = $true
                 $form.Opacity = 0.90
 
-                $radius = 8
+                $radius = ds 8
                 $gp = New-Object Drawing.Drawing2D.GraphicsPath
                 $gp.AddArc(0, 0, $radius * 2, $radius * 2, 180, 90)
                 $gp.AddArc($w - $radius * 2 - 1, 0, $radius * 2, $radius * 2, 270, 90)
@@ -2404,29 +3039,29 @@ function Initialize-TrayIcon {
                 $gp.Dispose()
 
                 $iconPanel = New-Object Windows.Forms.Panel
-                $iconPanel.Location = New-Object Drawing.Point($pad, 7)
-                $iconPanel.Size = New-Object Drawing.Size($iconBox, 24)
+                $iconPanel.Location = New-Object Drawing.Point($pad, (ds 7))
+                $iconPanel.Size = New-Object Drawing.Size($iconBox, (ds 24))
                 $iconPanel.BackColor = [Drawing.Color]::Transparent
 
-                $iconBitmap = New-Object Drawing.Bitmap($iconBox, 24)
+                $iconBitmap = New-Object Drawing.Bitmap($iconBox, (ds 24))
                 $ig = [Drawing.Graphics]::FromImage($iconBitmap)
                 $ig.SmoothingMode = "AntiAlias"
                 $ig.Clear([Drawing.Color]::Transparent)
                 $iconFill = New-Object Drawing.SolidBrush([Drawing.Color]::FromArgb(0, 163, 255))
-                $ig.FillEllipse($iconFill, 3, 9, 19, 11)
-                $ig.FillEllipse($iconFill, 7, 4, 13, 10)
-                $ig.FillEllipse($iconFill, 1, 10, 10, 9)
-                $ig.FillEllipse($iconFill, 14, 10, 11, 9)
-                $iconPen = New-Object Drawing.Pen([Drawing.Color]::White, 1.7)
+                $ig.FillEllipse($iconFill, (ds 3), (ds 9), (ds 19), (ds 11))
+                $ig.FillEllipse($iconFill, (ds 7), (ds 4), (ds 13), (ds 10))
+                $ig.FillEllipse($iconFill, (ds 1), (ds 10), (ds 10), (ds 9))
+                $ig.FillEllipse($iconFill, (ds 14), (ds 10), (ds 11), (ds 9))
+                $iconPen = New-Object Drawing.Pen([Drawing.Color]::White, [float](1.7 * $scale))
                 $iconPen.StartCap = $iconPen.EndCap = [Drawing.Drawing2D.LineCap]::Round
-                $ig.DrawLine($iconPen, 13, 17, 13, 11)
-                $ig.DrawLine($iconPen, 10, 13, 13, 11)
-                $ig.DrawLine($iconPen, 16, 13, 13, 11)
+                $ig.DrawLine($iconPen, (ds 13), (ds 17), (ds 13), (ds 11))
+                $ig.DrawLine($iconPen, (ds 10), (ds 13), (ds 13), (ds 11))
+                $ig.DrawLine($iconPen, (ds 16), (ds 13), (ds 13), (ds 11))
                 $iconPen.Dispose(); $iconFill.Dispose(); $ig.Dispose()
 
                 $iconPicture = New-Object Windows.Forms.PictureBox
                 $iconPicture.Location = New-Object Drawing.Point(0, 0)
-                $iconPicture.Size = New-Object Drawing.Size($iconBox, 24)
+                $iconPicture.Size = New-Object Drawing.Size($iconBox, (ds 24))
                 $iconPicture.BackColor = [Drawing.Color]::Transparent
                 $iconPicture.Image = $iconBitmap
                 $iconPicture.SizeMode = "CenterImage"
@@ -2434,15 +3069,15 @@ function Initialize-TrayIcon {
 
                 $label = New-Object Windows.Forms.Label
                 $label.Text = [string]$sync.ProgressBarText
-                $label.Location = New-Object Drawing.Point(($pad + $iconBox + 8), 7)
-                $label.Size = New-Object Drawing.Size(($w - ($pad * 2) - $iconBox - 8), 15)
+                $label.Location = New-Object Drawing.Point(($pad + $iconBox + $gap), (ds 7))
+                $label.Size = New-Object Drawing.Size(($w - ($pad * 2) - $iconBox - $gap), (ds 15))
                 $label.Font = New-Object Drawing.Font("Segoe UI", 9)
                 $label.ForeColor = [Drawing.Color]::FromArgb(237, 244, 252)
                 $label.BackColor = [Drawing.Color]::Transparent
                 $label.AutoEllipsis = $true
 
                 $track = New-Object Windows.Forms.Panel
-                $track.Location = New-Object Drawing.Point(($pad + $iconBox + 8), 32)
+                $track.Location = New-Object Drawing.Point(($pad + $iconBox + $gap), (ds 32))
                 $track.Size = New-Object Drawing.Size($script:progressTrackWidth, $trackH)
                 $track.BackColor = [Drawing.Color]::FromArgb(72, 82, 94)
 
@@ -2460,7 +3095,7 @@ function Initialize-TrayIcon {
 
                 [void]$form.Show()
                 $screen = [Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-                $form.SetDesktopLocation(($screen.Right - $w - 12), ($screen.Bottom - $h - 12))
+                $form.SetDesktopLocation(($screen.Right - $w - (ds 12)), ($screen.Bottom - $h - (ds 12)))
 
                 $script:progressForm = $form
                 $script:progressFill = $fill
@@ -2657,13 +3292,23 @@ function Get-SharePointDocumentLibrariesFromSearch {
     $rowLimit = 500
     $startRow = 0
     $foundLibraries = [System.Collections.Generic.List[hashtable]]::new()
+    # track whether discovery completed normally. If a page keeps failing after retries we treat the
+    # whole result set as INCOMPLETE and let the caller skip the destructive delete phase this run rather
+    # than deleting valid shortcuts based on a partial view.
+    $script:searchIncomplete = $false
 
     while($true) {
         $queryText = [System.Web.HttpUtility]::UrlEncode("contentclass:STS_List_DocumentLibrary")
         $selectProperties = [System.Web.HttpUtility]::UrlEncode("Title,Path,ListId,SiteId,WebId,SPWebUrl,SPSiteUrl,SiteName")
         $queryUri = "$SearchRootUrl/_api/search/query?querytext='$queryText'&trimduplicates=false&rowlimit=$rowLimit&startrow=$startRow&selectproperties='$selectProperties'"
 
-        $searchResponse = New-GraphQuery -resource $global:octo.sharepointUrl -Uri $queryUri -Method GET -MaxAttempts 3
+        try {
+            $searchResponse = New-GraphQuery -resource $global:octo.sharepointUrl -Uri $queryUri -Method GET -MaxAttempts 3
+        } catch {
+            Write-Log "SharePoint Search paging failed at startRow=$startRow after retries; treating results as INCOMPLETE so the delete phase is skipped this run: $($_.Exception.Message)" "WARN"
+            $script:searchIncomplete = $true
+            break
+        }
         $rows = @(Get-SearchResultRows -SearchResponse $searchResponse)
 
         if(@($rows).Count -eq 0) {
@@ -2751,34 +3396,114 @@ function Get-ListMetadataWithFallback {
     throw "List metadata lookup failed for list '$listId' using all GetById fallbacks"
 }
 
+function Get-ShortcutMetadataMap {
+    # fetch the target metadata (the hidden A2OD* remote-item fields) for EVERY existing shortcut in
+    # the AutoLink folder in a SINGLE RenderListDataAsStream call, instead of one GetItemByUniqueId per
+    # shortcut (the old N+1 loop). Returns a map keyed by normalized item UniqueId. The caller falls back
+    # to a per-item lookup for any shortcut this bulk call did not fully resolve, so correctness is
+    # preserved even if the tenant does not surface the hidden fields via RenderListDataAsStream.
+    param(
+        [Parameter(Mandatory = $true)][string]$WebUrl,
+        [Parameter(Mandatory = $true)][string]$ListId
+    )
+
+    $map = @{}
+    $viewXml = "<View><ViewFields><FieldRef Name='UniqueId'/><FieldRef Name='FileLeafRef'/><FieldRef Name='A2ODRemoteItemSiteId'/><FieldRef Name='A2ODRemoteItemWebId'/><FieldRef Name='A2ODRemoteItemListId'/><FieldRef Name='A2ODRemoteItemUniqueId'/></ViewFields><RowLimit>5000</RowLimit></View>"
+    $body = @{ parameters = @{ RenderOptions = 2; ViewXml = $viewXml } } | ConvertTo-Json -Depth 5
+    $uri = "$WebUrl/_api/web/lists('$ListId')/RenderListDataAsStream"
+
+    $response = New-GraphQuery -resource $global:octo.sharepointUrl -Uri $uri -Method POST -Body $body
+    foreach($row in @($response.Row)) {
+        $uniqueId = ([string]$row.UniqueId).Trim('{}').ToLowerInvariant()
+        if([string]::IsNullOrWhiteSpace($uniqueId)) { continue }
+        $map[$uniqueId] = @{
+            Name = [string]$row.FileLeafRef
+            targetSiteId = [string]$row.A2ODRemoteItemSiteId
+            targetWebId = [string]$row.A2ODRemoteItemWebId
+            targetListId = [string]$row.A2ODRemoteItemListId
+            targetItemUniqueId = [string]$row.A2ODRemoteItemUniqueId
+        }
+    }
+    return $map
+}
+
+
+function Invoke-PreflightChecks {
+    # cheap, actionable checks before touching Graph. Warnings are logged and surfaced in one balloon;
+    # they never block the run (the consent probe below is the only thing that can, via a friendly error).
+    $warnings = [System.Collections.Generic.List[string]]::new()
+
+    # 1) Is the OneDrive client configured for a work/school account on this device?
+    $oneDriveRoot = Get-LocalOneDriveRootPath
+    if([string]::IsNullOrWhiteSpace($oneDriveRoot)) {
+        $msg = "OneDrive does not appear to be set up for a work/school account here. Shortcuts will be created in your cloud OneDrive but may not appear in File Explorer until OneDrive is signed in and syncing."
+        Write-Log "Pre-flight: $msg" "WARN"
+        $warnings.Add($msg)
+    } else {
+        Write-Log "Pre-flight: local OneDrive folder found at $oneDriveRoot" "INFO"
+    }
+
+    # 2) Is the identity provider reachable? (ICMP is often blocked, so fall back to a TCP 443 probe.)
+    try {
+        $idpHost = ([System.Uri]$global:octo.idpUrl).Host
+        $reachable = $false
+        try { $reachable = [bool](Test-Connection -ComputerName $idpHost -Count 1 -Quiet -ErrorAction SilentlyContinue) } catch {}
+        if(-not $reachable) {
+            try {
+                $tcpClient = New-Object System.Net.Sockets.TcpClient
+                $asyncResult = $tcpClient.BeginConnect($idpHost, 443, $null, $null)
+                if($asyncResult.AsyncWaitHandle.WaitOne(3000)) { $tcpClient.EndConnect($asyncResult); $reachable = $true }
+                $tcpClient.Close()
+            } catch {}
+        }
+        if(-not $reachable) {
+            $msg = "The sign-in service ($idpHost) is not reachable. Check your network or proxy connection."
+            Write-Log "Pre-flight: $msg" "WARN"
+            $warnings.Add($msg)
+        } else {
+            Write-Log "Pre-flight: identity provider $idpHost is reachable" "INFO"
+        }
+    } catch {}
+
+    if($warnings.Count -gt 0) {
+        Update-TrayState -ShowBalloon -BalloonTitle "M365AutoLink" -BalloonMessage ($warnings -join " ") -BalloonIcon "Warning"
+    }
+    return @($warnings)
+}
 
 #endregion
 
 #region Main Script
 
 function Invoke-M365AutoLinkRun {
-    $transcriptStarted = $false
     try {
         Initialize-ProgressBar
 
-        $logDir = [System.IO.Path]::GetDirectoryName($global:octo.LogPath)
-        if(!(Test-Path $logDir)){ New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
-
-        try {
-            Start-Transcript -Path $global:octo.LogPath -Force | Out-Null
-            $transcriptStarted = $true
-        } catch {}
+        # rotate logs and start a fresh lastRun.log. Write-Log appends to the file directly, so we
+        # no longer depend on Start-Transcript.
+        Invoke-LogRotation
 
         Update-TrayState -Text "M365AutoLink - Starting mapping" -Percent 1 -ProgressText "Starting" -IsRunning
 
-        Write-Log "=== M365AutoLink v1.2 Started ===" "INFO"
+        Write-Log "=== M365AutoLink v$ScriptVersion Started ===" "INFO"
         if($DryRun) { Write-Log "*** DRY RUN MODE - no changes will be made ***" "WARN" }
 
-        [void] [System.Reflection.Assembly]::LoadWithPartialName("System.Web")
+        Add-Type -AssemblyName System.Web
 
-        # Pre populate the token cache
+        # pre-flight checks (OneDrive present, IdP reachable) before we touch Graph.
+        Update-TrayState -Text "M365AutoLink - Checking prerequisites" -Percent 3 -ProgressText "Checking prerequisites" -IsRunning
+        [void](Invoke-PreflightChecks)
+
+        # Pre populate the token cache (this doubles as the admin-consent probe).
         Update-TrayState -Text "M365AutoLink - Authenticating" -Percent 5 -ProgressText "Authenticating" -IsRunning
-        [void](Get-AccessToken -resource $global:octo.graphUrl)
+        try {
+            [void](Get-AccessToken -resource $global:octo.graphUrl)
+        } catch {
+            $consentUrl = "$($global:octo.idpUrl)/organizations/adminconsent?client_id=$($global:octo.LCClientId)"
+            Write-Log "Sign-in/consent probe failed: $($_.Exception.Message)" "ERROR"
+            Write-Log "If this persists, an admin may still need to approve M365AutoLink: $consentUrl" "ERROR"
+            throw "M365AutoLink could not sign in. If this keeps happening, ask IT to approve access: $consentUrl"
+        }
 
         $script:userConfig = $null
         $configuredExcludedSiteSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -2955,16 +3680,53 @@ function Invoke-M365AutoLinkRun {
             }
         }
 
+        # try to fetch all shortcut metadata in one RenderListDataAsStream call. Falls back to per-item.
+        $shortcutMetadataMap = @{}
+        try {
+            $shortcutMetadataMap = Get-ShortcutMetadataMap -WebUrl "$rootUrl/personal/$userComponent" -ListId $docLibrary.id
+            Write-Log "Fetched metadata for $($shortcutMetadataMap.Count) shortcut(s) in a single call (RenderListDataAsStream)" "INFO"
+        } catch {
+            Write-Log "Bulk shortcut metadata call failed, falling back to per-item lookups: $($_.Exception.Message)" "WARN"
+        }
+
+        $shortcutMetadataErrorCount = 0
         foreach($shortCut in $folderContents){
-            $shortCutMetaData = (New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$rootUrl/personal/$userComponent/_api/web/lists('$($docLibrary.id)')/GetItemByUniqueId('$($shortCut.UniqueId)')?`$expand=FieldValuesAsText" -Method GET -MaxAttempts 1)
+            $normalizedUniqueId = ([string]$shortCut.UniqueId).Trim('{}').ToLowerInvariant()
+            $meta = $null
+            if($shortcutMetadataMap.ContainsKey($normalizedUniqueId)) {
+                $meta = $shortcutMetadataMap[$normalizedUniqueId]
+            }
+
+            # Fall back to a per-item lookup when the bulk call did not return this row or it lacks the
+            # target fields. one transient error must not abort the whole run - skip+warn instead.
+            if(-not $meta -or [string]::IsNullOrWhiteSpace([string]$meta.targetSiteId) -or [string]::IsNullOrWhiteSpace([string]$meta.targetListId)) {
+                try {
+                    $shortCutMetaData = (New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$rootUrl/personal/$userComponent/_api/web/lists('$($docLibrary.id)')/GetItemByUniqueId('$($shortCut.UniqueId)')?`$expand=FieldValuesAsText" -Method GET)
+                    $meta = @{
+                        Name = $shortCutMetaData.FieldValuesAsText.FileLeafRef
+                        targetSiteId = $shortCutMetaData.FieldValuesAsText.A2ODRemoteItemSiteId
+                        targetWebId = $shortCutMetaData.FieldValuesAsText.A2ODRemoteItemWebId
+                        targetListId = $shortCutMetaData.FieldValuesAsText.A2ODRemoteItemListId
+                        targetItemUniqueId = $shortCutMetaData.FieldValuesAsText.A2ODRemoteItemUniqueId
+                    }
+                } catch {
+                    $shortcutMetadataErrorCount++
+                    Write-Log "  Could not read metadata for existing shortcut '$($shortCut.UniqueId)', skipping it this run: $($_.Exception.Message)" "WARN"
+                    continue
+                }
+            }
+
             $currentShortCuts += @{
                 "ID" = $shortCut.uniqueId
-                "Name" = $shortCutMetaData.FieldValuesAsText.FileLeafRef
-                "targetSiteId" = $shortCutMetaData.FieldValuesAsText.A2ODRemoteItemSiteId
-                "targetWebId" = $shortCutMetaData.FieldValuesAsText.A2ODRemoteItemWebId
-                "targetListId" = $shortCutMetaData.FieldValuesAsText.A2ODRemoteItemListId
-                "targetItemUniqueId" = $shortCutMetaData.FieldValuesAsText.A2ODRemoteItemUniqueId
+                "Name" = $meta.Name
+                "targetSiteId" = $meta.targetSiteId
+                "targetWebId" = $meta.targetWebId
+                "targetListId" = $meta.targetListId
+                "targetItemUniqueId" = $meta.targetItemUniqueId
             }
+        }
+        if($shortcutMetadataErrorCount -gt 0){
+            Write-Log "Skipped $shortcutMetadataErrorCount existing shortcut(s) whose metadata could not be read this run." "WARN"
         }
 
         Write-Log "You currently have $($currentShortCuts.count) shortcuts" "INFO"
@@ -3003,8 +3765,8 @@ function Invoke-M365AutoLinkRun {
 
                 $isExcluded = $false
                 foreach($pattern in $excludedSitesByWildcard){
-                    $wildcardPattern = "^" + [regex]::Escape($pattern) -replace "\\\*",".*"
-                    if($siteUrl -match $wildcardPattern){
+                    # -like has correct anchor semantics (a trailing * is required for prefix matches).
+                    if($siteUrl -like $pattern){
                         Write-Log "  Site URL '$siteUrl' matches exclusion pattern '$pattern', skipping..." "WARN"
                         $isExcluded = $true
                         break
@@ -3018,8 +3780,8 @@ function Invoke-M365AutoLinkRun {
 
                 $isIncluded = $false
                 foreach($pattern in $includedSitesByWildcard){
-                    $wildcardPattern = "^" + [regex]::Escape($pattern) -replace "\\\*",".*"
-                    if($siteUrl -match $wildcardPattern){
+                    # -like has correct anchor semantics (a trailing * is required for prefix matches).
+                    if($siteUrl -like $pattern){
                         $isIncluded = $true
                         break
                     }
@@ -3258,6 +4020,9 @@ function Invoke-M365AutoLinkRun {
         $createIndex = 0
         foreach($desiredShortcut in $desiredShortcuts) {
             $createIndex++
+            # reset per iteration so the shortcutAlreadyExists catch path can never register a stale
+            # name from a previous iteration into $reservedShortcutNameSet.
+            $safeShortcutName = $null
             $createPercent = [int](55 + (25 * ($createIndex / $createTotal)))
             Update-TrayState -Text "M365AutoLink - Creating shortcuts" -Percent $createPercent -ProgressText ("Creating shortcuts {0}/{1}" -f $createIndex, $createTotal) -IsRunning
 
@@ -3330,7 +4095,8 @@ function Invoke-M365AutoLinkRun {
                         Write-Log "  Failed to rename shortcut '$($newShortCut.name)': $($_.Exception.Message)" "WARN"
                     }
                 }
-                Start-Sleep -Milliseconds 500
+                # no fixed sleep - the shared retry core already backs off on 429, so steady-state runs
+                # are not artificially slowed by a per-item delay.
                 Write-Log "  Successfully created shortcut for '$($desiredShortcut.shortcut.siteUrl)'" "SUCCESS"
                 [void]$existingShortcutNameSet.Add($safeShortcutName)
                 [void]$reservedShortcutNameSet.Add($safeShortcutName)
@@ -3354,7 +4120,9 @@ function Invoke-M365AutoLinkRun {
                     if(-not [string]::IsNullOrWhiteSpace($desiredTargetKey)) {
                         [void]$existingShortcutTargetKeys.Add($desiredTargetKey)
                     }
-                    [void]$reservedShortcutNameSet.Add($safeShortcutName)
+                    if(-not [string]::IsNullOrWhiteSpace($safeShortcutName)) {
+                        [void]$reservedShortcutNameSet.Add($safeShortcutName)
+                    }
                     $skipCount++
                     continue
                 }
@@ -3382,7 +4150,6 @@ function Invoke-M365AutoLinkRun {
                         $renameBody = @{ name = $cleanedName } | ConvertTo-Json
                         $Null = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/me/drive/items/$($existing.ID)" -Method PATCH -Body $renameBody
                         Write-Log "  Renamed '$($existing.Name)' to '$cleanedName'" "SUCCESS"
-                        Start-Sleep -Milliseconds 500
                         $renameCount++
                     } catch {
                         Write-Log "  Failed to rename '$($existing.Name)': $($_.Exception.Message)" "WARN"
@@ -3403,25 +4170,52 @@ function Invoke-M365AutoLinkRun {
             }
         }
 
-        foreach($existing in $currentShortCuts) {
-            $deleteIndex++
-            $deletePercent = [int](90 + (8 * ($deleteIndex / $deleteTotal)))
-            Update-TrayState -Text "M365AutoLink - Removing obsolete shortcuts" -Percent $deletePercent -ProgressText ("Removing obsolete shortcuts {0}/{1}" -f $deleteIndex, $deleteTotal) -IsRunning
+        $lastDesiredCount = 0
+        try { $lastDesiredCount = [int]$script:userConfig.diagnostics.lastDesiredCount } catch {}
+        $desiredCount = $desiredTargetKeySet.Count
 
-            $shouldExist = $false
-            $existingTargetKey = Get-ShortcutTargetKey -SiteId ([string]$existing.targetSiteId) -WebId ([string]$existing.targetWebId) -ListId ([string]$existing.targetListId)
-            if(-not [string]::IsNullOrWhiteSpace($existingTargetKey)) {
-                $shouldExist = $desiredTargetKeySet.Contains($existingTargetKey)
-            } else {
-                foreach($desired in $desiredShortcuts) {
-                    if ($existing.targetSiteId -eq $desired.shortcut.siteId -and $existing.targetWebId -eq $desired.shortcut.webId -and $existing.targetListId -eq $desired.shortcut.listId) {
-                        $shouldExist = $true
-                        break
+        # Consume the one-shot bypass: a shrink the user just made on purpose (via Manage shortcuts) is not
+        # the partial-Search-outage scenario the ratio guard protects against, so skip that check this run.
+        $userInitiatedShrink = $script:bypassDeletionRatioOnce
+        $script:bypassDeletionRatioOnce = $false
+
+        $skipDeletion = $false
+        $skipReason = $null
+        if($script:searchIncomplete) {
+            $skipDeletion = $true
+            $skipReason = "SharePoint Search returned incomplete results"
+        } elseif(-not $userInitiatedShrink -and $lastDesiredCount -gt 0 -and $desiredCount -lt [int][math]::Floor($lastDesiredCount * (1 - $DeletionSafetyRatio))) {
+            $skipDeletion = $true
+            $skipReason = ("the desired set shrank from {0} to {1} (more than {2}%)" -f $lastDesiredCount, $desiredCount, [int]($DeletionSafetyRatio * 100))
+        }
+
+        if($skipDeletion) {
+            Write-Log "Deletion phase SKIPPED as a safety measure: $skipReason. No shortcuts were removed this run." "WARN"
+            Update-TrayState -ShowBalloon -BalloonTitle "M365AutoLink" -BalloonMessage "Skipped removing shortcuts this run as a safety measure ($skipReason). Nothing was deleted." -BalloonIcon "Warning"
+        } else {
+            foreach($existing in $currentShortCuts) {
+                $deleteIndex++
+                $deletePercent = [int](90 + (8 * ($deleteIndex / $deleteTotal)))
+                Update-TrayState -Text "M365AutoLink - Removing obsolete shortcuts" -Percent $deletePercent -ProgressText ("Removing obsolete shortcuts {0}/{1}" -f $deleteIndex, $deleteTotal) -IsRunning
+
+                $shouldExist = $false
+                $existingTargetKey = Get-ShortcutTargetKey -SiteId ([string]$existing.targetSiteId) -WebId ([string]$existing.targetWebId) -ListId ([string]$existing.targetListId)
+                if(-not [string]::IsNullOrWhiteSpace($existingTargetKey)) {
+                    $shouldExist = $desiredTargetKeySet.Contains($existingTargetKey)
+                } else {
+                    foreach($desired in $desiredShortcuts) {
+                        if ($existing.targetSiteId -eq $desired.shortcut.siteId -and $existing.targetWebId -eq $desired.shortcut.webId -and $existing.targetListId -eq $desired.shortcut.listId) {
+                            $shouldExist = $true
+                            break
+                        }
                     }
                 }
-            }
 
-            if (-not $shouldExist) {
+                if($shouldExist) {
+                    # Target is back / still valid
+                    continue
+                }
+
                 if($DryRun) {
                     Write-Log "  [DRY RUN] Would delete obsolete shortcut '$($existing.Name)'" "INFO"
                     $deletedCount++
@@ -3430,7 +4224,6 @@ function Invoke-M365AutoLinkRun {
                 try {
                     Write-Log "  Deleting obsolete shortcut '$($existing.Name)' (ID: $($existing.ID))..." "INFO"
                     New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/me/drive/items/$($existing.ID)" -Method DELETE
-                    Start-Sleep -Milliseconds 500
                     $deletedCount++
                     Write-Log "  Successfully deleted obsolete shortcut" "SUCCESS"
                 } catch {
@@ -3470,6 +4263,10 @@ function Invoke-M365AutoLinkRun {
         $script:userConfig.cache.staticExcludedLibraries = @($cachedStaticExcludedLibraryMap.Values | Sort-Object key)
         $script:userConfig.diagnostics.lastAlreadyExisting = @($script:lastAlreadyExistingShortcuts)
         $script:userConfig.diagnostics.totalItemCount = $totalLinkedItemCount
+
+        if(-not $script:searchIncomplete) {
+            $script:userConfig.diagnostics.lastDesiredCount = [int]$desiredCount
+        }
         try {
             Save-OneDriveUserConfig -Config $script:userConfig
         } catch {
@@ -3510,9 +4307,6 @@ function Invoke-M365AutoLinkRun {
         throw
     } finally {
         Stop-ProgressBar
-        if($transcriptStarted) {
-            try { Stop-Transcript | Out-Null } catch {}
-        }
     }
 }
 
@@ -3559,7 +4353,41 @@ if(Test-RunningUnderIntune) {
     return
 }
 
+$script:instanceMutex = $null
+$script:mutexAcquired = $false
+$script:runNowEvent = $null
 try {
+    # single-instance guard for this user session. If another instance already owns the mutex, signal
+    # it to run (via a named event its tray loop polls) and exit cleanly - avoids two tray icons, duplicate
+    # refresh-token rotation, log contention and auth-port collisions. "Local\" scopes it per session so
+    # multi-session hosts (RDS/AVD) still get one instance per user.
+    try {
+        $createdNew = $false
+        $script:instanceMutex = New-Object System.Threading.Mutex($false, "Local\M365AutoLink", [ref]$createdNew)
+        try {
+            $script:mutexAcquired = $script:instanceMutex.WaitOne(0)
+        } catch [System.Threading.AbandonedMutexException] {
+            # Previous owner crashed without releasing; we now own it.
+            $script:mutexAcquired = $true
+        }
+    } catch {
+        # If the mutex machinery is unavailable for any reason, don't block the run.
+        $script:mutexAcquired = $true
+    }
+
+    try {
+        $script:runNowEvent = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, "Local\M365AutoLink_RunNow")
+    } catch {}
+
+    if(-not $script:mutexAcquired) {
+        Write-Log "Another M365AutoLink instance is already running in this session; signaling it to run and exiting." "INFO"
+        try { if($script:runNowEvent) { [void]$script:runNowEvent.Set() } } catch {}
+        return
+    }
+
+    # must run before the tray runspace (same process) creates its first window.
+    Set-M365ProcessDpiAwareness
+
     $script:localOneDriveRootPath = Get-LocalOneDriveRootPath
     $script:localShortcutFolderPath = Get-LocalShortcutFolderPath -FolderName $FolderName
     # Copy the script to its permanent home (if configured) before any persistence is created, so that
@@ -3567,6 +4395,9 @@ try {
     $script:effectiveScriptPath = Invoke-SelfDeployment -DeployToPath $deployToPath
     Initialize-TrayIcon
     Update-TrayState -Text "M365AutoLink - Ready" -Percent 0 -ProgressText "Waiting to start"
+
+    # track the last run time so we can auto-refresh every $AutoRefreshHours while resident in the tray.
+    $script:lastRunCompletedAt = $null
 
     $runRequested = $true
     while($true) {
@@ -3579,6 +4410,10 @@ try {
             if($script:traySync -and $script:traySync.RequestRerun) {
                 $script:traySync.RequestRerun = $false
                 $runRequested = $true
+            } elseif($script:runNowEvent -and $script:runNowEvent.WaitOne(0)) {
+                # another launch signaled us to run instead of starting a second instance.
+                Write-Log "Run requested by another launch (single-instance signal)" "INFO"
+                $runRequested = $true
             } elseif($script:traySync -and $script:traySync.RequestManageShortcuts) {
                 $script:traySync.RequestManageShortcuts = $false
                 Write-Log "Tray action received: Manage shortcuts" "INFO"
@@ -3586,7 +4421,17 @@ try {
                 Invoke-ManageShortcuts
                 Start-Sleep -Milliseconds 100
                 continue
+            } elseif($AutoRefreshHours -gt 0 -and $script:lastRunCompletedAt -and ((Get-Date) - $script:lastRunCompletedAt).TotalHours -ge $AutoRefreshHours) {
+                # periodic auto-refresh interval elapsed.
+                Write-Log "Auto-refresh interval ($AutoRefreshHours h) elapsed; starting a run." "INFO"
+                $runRequested = $true
+            } elseif($AutoRefreshHours -gt 0 -and $script:traySync -and $script:traySync.ResumeDetected) {
+                # refresh shortly after the device resumes from sleep (only when auto-refresh is on).
+                $script:traySync.ResumeDetected = $false
+                Write-Log "Device resumed from sleep; starting a refresh run." "INFO"
+                $runRequested = $true
             } else {
+                if($script:traySync) { $script:traySync.ResumeDetected = $false }
                 Start-Sleep -Milliseconds 250
                 continue
             }
@@ -3602,13 +4447,28 @@ try {
             if($script:traySync) {
                 $script:traySync.HasCompletedRun = $true
             }
+
+            # one-time onboarding after the first successful run that actually resulted in shortcuts -
+            # explain where they are, that OneDrive needs a moment to sync them, and where Manage lives.
+            # If a run produced no shortcuts we skip (and do NOT drop the marker) so onboarding can still
+            # fire on a later run that does create some.
+            $shortcutsPresent = (([int]$summary.successCount) + ([int]$summary.existingConflictCount)) -gt 0
+            try {
+                $onboardMarker = Join-Path -Path ([System.IO.Path]::GetDirectoryName($global:octo.LogPath)) -ChildPath ".onboarded"
+                if($shortcutsPresent -and -not (Test-Path -LiteralPath $onboardMarker)) {
+                    $onboardMessage = "M365AutoLink created your shortcuts in the '$FolderName' folder in OneDrive. Allow a few minutes for OneDrive to sync them into File Explorer. Tip: right-click this tray icon > Manage shortcuts to include or exclude libraries."
+                    $onboardClickTarget = if(-not [string]::IsNullOrWhiteSpace($script:localShortcutFolderPath)) { $script:localShortcutFolderPath } else { [string]$script:localOneDriveRootPath }
+                    Update-TrayState -ShowBalloon -BalloonTitle "M365AutoLink is set up" -BalloonMessage $onboardMessage -BalloonIcon "Info" -BalloonClickUrl $onboardClickTarget
+                    New-Item -ItemType File -Path $onboardMarker -Force | Out-Null
+                }
+            } catch {}
+
+            # Individual per-library/per-item errors during mapping only increment $summary.errorCount and are
+            # recorded in the log - we deliberately do NOT toast the user about them. Only critical failures
+            # (e.g. no Graph access, nothing works) throw and surface the Error balloon in the catch block below.
             $hasIssues = ($summary.errorCount -gt 0)
-            if($hasIssues) {
-                $msg = "Issues detected: errors $($summary.errorCount). Open the log for details."
-                Update-TrayState -Text "M365AutoLink - Idle" -Percent 100 -ProgressText "Idle - click Run now" -IsRunning:$false -ShowBalloon -BalloonMessage $msg -BalloonIcon "Warning"
-            } else {
-                Update-TrayState -Text "M365AutoLink - Idle" -Percent 100 -ProgressText "Idle - click Run now" -IsRunning:$false
-            }
+            $idleProgressText = if($hasIssues) { "Idle - completed with errors (see log)" } else { "Idle - click Run now" }
+            Update-TrayState -Text "M365AutoLink - Idle" -Percent 100 -ProgressText $idleProgressText -IsRunning:$false
         } catch {
             if($script:traySync) {
                 $script:traySync.HasCompletedRun = $true
@@ -3619,12 +4479,20 @@ try {
             }
         }
 
+        $script:lastRunCompletedAt = Get-Date
+
         if(-not $runInTrayMode) {
             break
         }
     }
 } finally {
     Stop-TrayIcon
+    # release + dispose the single-instance mutex so the next launch can become primary.
+    if($script:mutexAcquired -and $script:instanceMutex) {
+        try { $script:instanceMutex.ReleaseMutex() } catch {}
+    }
+    if($script:instanceMutex) { try { $script:instanceMutex.Dispose() } catch {} }
+    if($script:runNowEvent) { try { $script:runNowEvent.Dispose() } catch {} }
 }
 
 #endregion

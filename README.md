@@ -23,6 +23,11 @@ This script (`M365AutoLink.ps1`) runs **as the signed-in user** (delegated authe
 - **Launch persistence**: optionally create Desktop / Start Menu shortcuts, or run automatically at logon.
 - **Dry-run support**: preview every create/rename/delete action without touching OneDrive.
 - **Safety filtering**: automatically skips libraries that require check-out, plus system/hidden libraries that don't work well as shortcuts.
+- **Deletion safety**: a circuit breaker skips mass deletion when SharePoint Search returns partial results, so a transient index hiccup never wipes your shortcuts.
+- **Periodic auto-refresh**: optionally re-run every few hours (and after sleep) so access changes appear without re-logon.
+- **Fleet-friendly**: layered external configuration (JSON file or registry policy) and an Intune bootstrap path: no need to edit the script per customer.
+
+See the [changelog](CHANGELOG.md) for what changed between versions.
 
 ---
 
@@ -94,10 +99,97 @@ These only **warn** — the tool never blocks you from going over the limit.
 | `$EnableSystemTrayIcon` | Show the system tray icon and its menu. | `$true` |
 | `$KeepRunningInTray` | Keep the process alive after a run so tray actions (Run now, Manage shortcuts) stay available. | `$true` |
 | `$WindowStyle` | Browser window style during sign-in (`Normal`, `Hidden`, `Minimized`, `Maximized`). | `"Normal"` |
+| `$TrayHelpLink` | URL opened by the tray **Open help** action. | Microsoft KB article |
+| `$TrayCopyrightText` / `$TrayCopyrightLink` | Text and link of the copyright entry in the tray menu. | Lieben Consultancy |
 | `$LaunchModes` | Persistence options: any of `Desktop`, `Start Menu`, `AtLogon` (see below). | `@('AtLogon')` |
+
+> ⚠️ **`$WindowStyle = "Hidden"` trap:** a hidden browser window makes **first-run interactive sign-in impossible** (the user can't complete sign-in they can't see). Only use `Hidden` when silent SSO is guaranteed (e.g. Entra-joined devices with seamless SSO). Leave it `Normal` for anything that might need an interactive first sign-in.
+
+### Deployment settings
+| Variable | Description | Default |
+|---|---|---|
+| `$deployToPath` | Permanent location the script copies itself to on first run. **Required for Intune** (the temporary Intune location is deleted right after execution, which would break persistence). Accepts a full `.ps1` path or a folder; supports `$env:NAME` and `%NAME%`. Leave `$Null` to run/persist from the current location. | `$Null` |
+| `$Uninstall` | When `$true`, removes **all** persistence, the deployed copy, the token cache and the log, then exits (see [Uninstalling](#uninstalling)). | `$false` |
+| `$DeviceNameIncludeFilter` | Only run on devices whose name contains this string. `$Null` = run everywhere it's deployed. | `$Null` |
+
+### Reliability & maintenance settings
+| Variable | Description | Default |
+|---|---|---|
+| `$AutoRefreshHours` | When `> 0`, auto-runs every N hours while resident in the tray (plus shortly after the device resumes from sleep). `0` = only logon + manual. Requires `$KeepRunningInTray`. | `0` |
+| `$DeletionSafetyRatio` | Deletion circuit breaker: skip the whole delete phase if the desired set shrank by more than this fraction vs. the last successful run (protects against a partial SharePoint Search outage causing mass deletion). `1` disables the ratio guard. | `0.40` |
+| `$LogHistoryCount` | How many timestamped previous run logs (`run-<timestamp>.log`) to keep beside `lastRun.log`. | `5` |
 
 ### System-library exclusions
 The script never turns system/hidden libraries (Style Library, Site Assets, Site Pages, Form Templates, Preservation Hold Library, etc.) into shortcuts. These are controlled by `$excludedLibrariesByWildcard`, `$ExcludedListTitles`, and `$ExcludedListFeatureIDs` — only edit these if you know what you're doing.
+
+> **Wildcard matching note:** include/exclude patterns use PowerShell's `-like` operator. A `*` matches zero or more characters, and matching is anchored at **both** ends — so a trailing `*` is required for prefix matching (e.g. use `*/sites/HR*`, not `*/sites/HR`, to exclude everything under `/sites/HR`).
+
+## External configuration (manage without editing the script)
+Because every script update overwrites the configuration block, admins can supply settings **outside** the script. Sources are checked in this order (first match wins per setting), falling back to the in-script default so zero-config still works:
+
+1. `HKLM\Software\Policies\Lieben\M365AutoLink` (Intune Settings Catalog / registry CSP / GPO — lockable)
+2. `HKCU\Software\Policies\Lieben\M365AutoLink`
+3. `M365AutoLink.config.json` next to the script (survives script updates)
+4. the in-script default
+
+Example `M365AutoLink.config.json`:
+```json
+{
+  "FolderName": "Company Links",
+  "LaunchModes": ["AtLogon"],
+  "deployToPath": "%APPDATA%\\M365AutoLink\\M365AutoLink.ps1",
+  "AutoRefreshHours": 8,
+  "excludedSitesByWildcard": ["*/personal/*", "*/sites/AppCatalog*"]
+}
+```
+Overridable keys include: `FolderName`, `CloudType`, `ClientID`, `WindowStyle`, `DryRun`, `LaunchModes`, `deployToPath`, `Uninstall`, `excludedSitesByWildcard`, `includedSitesByWildcard`, `maxFileCount`, `minFileCount`, `totalItemCountWarningThreshold`, `ShowProgressBar`, `EnableSystemTrayIcon`, `KeepRunningInTray`, `DeviceNameIncludeFilter`, `AutoRefreshHours`, `DeletionSafetyRatio`, `LogHistoryCount`.
+
+### Registry-based configuration
+
+The same keys can be set under `HKLM\Software\Policies\Lieben\M365AutoLink` (machine-wide, lockable, most authoritative) or `HKCU\Software\Policies\Lieben\M365AutoLink` (per-user). The value name matches the setting name exactly. Value types are coerced to the setting's type, so:
+
+- **Text** settings (`deployToPath`, `FolderName`, `CloudType`, `WindowStyle`, `DeviceNameIncludeFilter`) → `REG_SZ`.
+- **Number** settings (`AutoRefreshHours`, `maxFileCount`, `LogHistoryCount`, `totalItemCountWarningThreshold`) → `REG_DWORD` (or `REG_SZ`).
+- **On/off** settings (`DryRun`, `ShowProgressBar`, `EnableSystemTrayIcon`, `KeepRunningInTray`, `Uninstall`) → `REG_DWORD` `1`/`0`, or `REG_SZ` `true`/`false`.
+- **List** settings (`excludedSitesByWildcard`, `includedSitesByWildcard`, `LaunchModes`) → `REG_MULTI_SZ` (one pattern per line).
+
+**Example 1 — set the deploy path and folder name (PowerShell, machine policy):**
+```powershell
+$key = 'HKLM:\Software\Policies\Lieben\M365AutoLink'
+New-Item -Path $key -Force | Out-Null
+New-ItemProperty -Path $key -Name 'deployToPath' -Value '%APPDATA%\M365AutoLink\M365AutoLink.ps1' -PropertyType String -Force
+New-ItemProperty -Path $key -Name 'FolderName'   -Value 'Company Links' -PropertyType String -Force
+```
+
+**Example 2 — exclude sites by wildcard (`REG_MULTI_SZ`, one pattern per line):**
+```powershell
+$key = 'HKLM:\Software\Policies\Lieben\M365AutoLink'
+New-ItemProperty -Path $key -Name 'excludedSitesByWildcard' -PropertyType MultiString -Force -Value @(
+    '*/personal/*'
+    '*/sites/AppCatalog*'
+    '*/sites/TeamTemplates*'
+)
+```
+
+**Example 3 — enable 8-hour auto-refresh and turn on dry-run (numbers/booleans):**
+```powershell
+$key = 'HKLM:\Software\Policies\Lieben\M365AutoLink'
+New-ItemProperty -Path $key -Name 'AutoRefreshHours' -Value 8 -PropertyType DWord  -Force
+New-ItemProperty -Path $key -Name 'DryRun'           -Value 1 -PropertyType DWord  -Force   # or REG_SZ "true"
+```
+
+**Example 4 — a `.reg` file (scalar values; multi-string is easiest via PowerShell above):**
+```reg
+Windows Registry Editor Version 5.00
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Lieben\M365AutoLink]
+"deployToPath"="%APPDATA%\\M365AutoLink\\M365AutoLink.ps1"
+"FolderName"="Company Links"
+"AutoRefreshHours"=dword:00000008
+"DryRun"="false"
+```
+
+These keys are ideal for Intune (Settings Catalog registry / the OMA-URI `./Device/Vendor/MSFT/Registry/...`, or a remediation script) or Group Policy Preferences — the script reads them on every run, so changes apply without repackaging.
 
 ## Launch Persistence
 `$LaunchModes` controls how the script can re-launch itself:
@@ -106,6 +198,42 @@ The script never turns system/hidden libraries (Style Library, Site Assets, Site
 - **`Start Menu`** — creates a Start Menu shortcut.
 
 Set `$LaunchModes = @()` to disable all persistence. Removing a mode also removes the shortcut/task it created on the next run.
+
+---
+
+## Deploying with Intune
+
+M365AutoLink is designed to be deployed per-user via Intune. Because it **runs as the signed-in user** (delegated auth) and stays resident in the tray, there are two things to get right:
+
+1. **Run in the user's context**, not SYSTEM (delegated auth + OneDrive are per-user).
+2. **Set `$deployToPath`** to a permanent per-user path (e.g. `%APPDATA%\M365AutoLink\M365AutoLink.ps1`). Intune stages scripts in a temporary folder that is deleted right after execution — without `$deployToPath`, any persistence (scheduled task / shortcuts) would point at a path that no longer exists.
+
+When Intune runs the script, M365AutoLink detects the Intune context, copies itself to `$deployToPath`, applies persistence, launches a **detached** run (owned by the WMI provider host so it survives Intune's process/timeout), and then exits immediately — so Intune records a fast, successful execution while the user still gets the tray icon and shortcuts.
+
+### Option A — Platform script (simplest)
+Intune admin center → **Devices → Scripts and remediations → Platform scripts → Add (Windows 10 and later)**:
+- Upload `M365AutoLink.ps1` (with `$deployToPath` set, ideally via `M365AutoLink.config.json`/registry policy instead of editing the script).
+- **Run this script using the logged-on credentials** = **Yes**.
+- **Enforce script signature check** = No (unless you sign it).
+- **Run script in 64-bit PowerShell** = Yes.
+
+### Option B — Win32 app (more control: detection, uninstall, supersedence)
+Package the script with the [Win32 Content Prep Tool](https://learn.microsoft.com/mem/intune/apps/apps-win32-prepare) and configure:
+- **Install command:** `powershell.exe -NoProfile -ExecutionPolicy Bypass -File M365AutoLink.ps1`
+- **Uninstall command:** `powershell.exe -NoProfile -ExecutionPolicy Bypass -File M365AutoLink.ps1 -Uninstall` *(or ship a config/registry policy with `Uninstall=true`)*
+- **Install behavior:** User
+- **Detection rule:** file exists at your `$deployToPath` (e.g. `%APPDATA%\M365AutoLink\M365AutoLink.ps1`).
+
+### Managing settings without editing the script
+Prefer the [external configuration](#external-configuration-manage-without-editing-the-script) (`M365AutoLink.config.json` or the `...\Policies\Lieben\M365AutoLink` registry keys) so you can update `$deployToPath`, exclusions, etc. via Intune without repackaging — and so a script update never clobbers customer configuration.
+
+### AppLocker / WDAC environments
+The at-logon task launches a user-writable `.ps1` with `-ExecutionPolicy Bypass`, which some EDR/AppLocker policies flag. For locked-down fleets, deploy a per-machine copy under `Program Files` (run via Intune) with a per-user scheduled task, and/or Authenticode-sign the script.
+
+---
+
+## Uninstalling
+Run the script once with `$Uninstall = $true` (or set `Uninstall=true` via external config, or use the Win32 uninstall command above). This removes the scheduled task / Run key / Startup shortcut, the Desktop and Start Menu shortcuts, the deployed script copy, **and the cached refresh token + log**. It does **not** delete the shortcuts already created in your OneDrive or the `Apps/M365AutoLink/config.json` — delete those manually if desired.
 
 ---
 
@@ -163,14 +291,23 @@ This turns `Marketing - Documents` into `Marketing`. Renaming also applies to ex
 https://www.lieben.nu/liebensraum/commercial-use/
 (Commercial (re)use is not allowed without prior written consent by the author; otherwise free to use/modify as long as headers are kept intact.)
 
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| A site/library is never linked | The site is **excluded from Search**, or its content was only recently added (search index delay). | Check **Settings → Site → Search and offline availability** (`/_layouts/15/srchvis.aspx`); wait for the index to catch up for brand-new sites. |
+| Shortcuts are created but never appear in File Explorer | OneDrive isn't signed in / syncing a work account on the device. | Sign OneDrive into the work account; the pre-flight check warns about this in a tray balloon. |
+| A library shows as a **folder** full of files instead of a shortcut | The library became sync-blocked; OneDrive converted the shortcut to a folder. | The next run detects and removes these automatically. |
+| "Approaching/over limit" warning (amber/red tray icon) | Combined item count across linked libraries is near the ~1,000,000 sync budget. | Exclude large libraries in **Manage shortcuts**; see the linked KB article. |
+| Some libraries are missing and you're a guest/B2B user | Guest accounts often can't run SharePoint Search in the host tenant. | Expected limitation; link those manually via OneDrive. |
+| Sign-in never completes / no browser appears | `$WindowStyle = "Hidden"` on a device without silent SSO. | Set `$WindowStyle = "Normal"`. |
+| "needs admin consent" balloon | The app registration hasn't been admin-consented in your tenant. | Have an admin [grant consent](https://login.microsoftonline.com/organizations/adminconsent?client_id=ae7727e4-0471-4690-b155-76cbf5fdcb30). |
+| Behind a corporate proxy, nothing works | The identity provider or Graph is unreachable. | Configure the proxy for the user; the pre-flight check reports IdP reachability. |
+| `Restricted Content` (Copilot) sites not found | Restricted Content limits discoverability. | Expected; disable Restricted Content on the site if links are required. |
+
 ## Support / Risk
 Best-effort support, use at your own risk.
-When reporting issues on GitHub, please include `lastRun.log` from `%APPDATA%\M365AutoLink\`.
-Before reporting, make sure that:
-- The user can actually open the site in a browser.
-- The site is **not** excluded from Search (`/_layouts/15/srchvis.aspx`).
-- Restricted Content (Copilot) is **not** enabled for the site.
-- You're not already syncing the site some other way (e.g. direct OneDrive sync).
+When reporting issues on GitHub, please include `lastRun.log` (and the rotated `run-*.log` files) from `%APPDATA%\M365AutoLink\`, and confirm the site is browsable, not excluded from Search, and not already synced another way.
 
 ## Author
 Jos Lieben — https://www.lieben.nu
