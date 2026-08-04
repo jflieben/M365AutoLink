@@ -9,7 +9,6 @@
 
 .REQUIREMENTS
     - PowerShell 5.x or 7.x
-    - Microsoft 365 (licensed) account
     - Automatic or Manual app registration (see below)
     - Sites should be included in search (which is default but can be overridden at site level)
 
@@ -23,39 +22,10 @@
 
     MANUAL / PRIVATE:
      
-        You can also create your own app registration in your Azure AD tenant:
-
-        1. In Azure Portal > App Registrations > Your App:
-        a. Go to "Authentication" blade
-        b. Under "Platform configurations", click "Add a platform" > "Mobile and desktop applications"
-        c. Check the box for: https://login.microsoftonline.com/common/oauth2/nativeclient
-        d. Also add: http://localhost (for browser callback)
-        e. Enable "Allow public client flows" (set to Yes)
-        
-        2. Grant Admin Consent (one-time, eliminates consent prompts for all users):
-        a. Go to "API permissions" blade
-        b. Click "Grant admin consent for <tenant>"
-
-        3. Replace the $ClientID variable in this script with your App Registration's Application (client) ID
-
-.PERMISSIONS REQUIRED (Delegated)
-    Microsoft Graph:
-    - Files.ReadWrite.All     - Create/rename/remove the OneDrive shortcuts and read/write the app's config.json
-    - Sites.Read.All          - Read SharePoint site information
-    SharePoint (Office 365 SharePoint Online):
-    - AllSites.Read           - Run the SharePoint Search discovery query and read list metadata via the REST API
-    NOTE: Teams permissions are NOT required (discovery moved to SharePoint Search); do not add Team.ReadBasic.All.
-
-.AUTHENTICATION FLOW
-    1. Cached Refresh Token - From previous successful authentication (completely silent)
-    2. Silent Browser Auth - Opens browser in the background to get tokens silently (if SSO is properly configured)
-    3. Interactive Browser Auth - Opens browser for user to sign in (first time only)
-    
-    After first authentication, the refresh token is cached and all subsequent runs are silent until the token expires
+        see https://github.com/jflieben/M365AutoLink/blob/main/README.md#option-2--your-own-app-registration
 
 .NOTES
     Author: Jos Lieben
-    Version: see $ScriptVersion in the configuration block below
     Updates/Git: https://github.com/jflieben/M365AutoLink
     Copyright/License: https://www.lieben.nu/liebensraum/commercial-use/ (Commercial (re)use not allowed without prior written consent by the author, otherwise free to use/modify as long as header are kept intact)
     Microsoft doc: https://support.microsoft.com/en-us/office/add-shortcuts-to-shared-folders-in-onedrive-d66b1347-99b7-4470-9360-ffc048d35a33
@@ -66,14 +36,14 @@
 #>
 
 ##########START CONFIGURATION#############################
-$ScriptVersion = "1.3.0" #single source of truth for the version (shown in the log + tray tooltip)
+$ScriptVersion = "1.3.0"
 $FolderName = "AutoLink" #this is the folder created in onedrive to house all links this tool will create. Feel free to change this to something localized, the tool will auto-create it if it does not exist
 #WARNING: Any pre-existing folders in above folder will be deleted!
 $CloudType = "global" #global, usgov, usdod, china
-$ClientID = "ae7727e4-0471-4690-b155-76cbf5fdcb30" #Lieben Consultancy public client ID, you can also create your own (see APP REGISTRATION REQUIREMENTS above)
-$WindowStyle = "Normal" #Normal, Hidden, Minimized, Maximized - this controls the browser window style during authentication, Hidden will not show the browser but the user then won't be able to sign in if SSO is not working
+$ClientID = "ae7727e4-0471-4690-b155-76cbf5fdcb30" #Lieben Consultancy public client ID
+$WindowStyle = "Normal" #Normal, Hidden, Minimized, Maximized - Hidden will not show the browser BUT the user then won't be able to sign in if SSO is not working
 
-# Dry-run mode: when $true, no shortcuts are created, deleted, or renamed. The script only shows what it would do.
+# When $true, no shortcuts are changed
 $DryRun = $false
 
 # Auto Launch mode valid values: Desktop, Start Menu, AtLogon
@@ -135,8 +105,8 @@ $minFileCount = 0
 
 # Combined item-count guidance. When the total number of items across ALL linked libraries crosses
 # these thresholds, Windows Explorer may not reliably show all folders/links and (rarely) sync breaks.
-# The tool only WARNS about this (icon color, tooltip, dialogs) - it never blocks going over the limit.
-$totalItemCountWarningThreshold = 1000000   # red "over limit" once the combined total reaches this
+# The tool only WARNS about this (icon color, tooltip, dialogs)
+$totalItemCountWarningThreshold = 1000000   # red "over limit"
 $totalItemCountWarningRatio     = 0.9       # amber "approaching" once the total reaches this fraction of the threshold
 # Knowledgebase article opened when the user clicks the over/approaching-limit tray balloon notification.
 $ItemCountHelpLink = "https://support.microsoft.com/en-US/onedrive/restrictions-and-limitations-in-onedrive-and-sharepoint#numberitemscanbesynced"
@@ -167,7 +137,6 @@ $AutoRefreshHours = 0
 # Set to 1 to effectively disable the ratio guard. 
 $DeletionSafetyRatio = 0.40
 
-# Logging (C5). How many timestamped previous run logs to keep alongside lastRun.log.
 $LogHistoryCount = 5
 
 #system libraries that should never become OneDrive shortcuts even if returned by search
@@ -288,9 +257,6 @@ $LogHistoryCount                = Resolve-Setting -Name 'LogHistoryCount' -Defau
 $TrayHelpLink                   = Resolve-Setting -Name 'TrayHelpLink' -Default $TrayHelpLink
 $ItemCountHelpLink              = Resolve-Setting -Name 'ItemCountHelpLink' -Default $ItemCountHelpLink
 
-# Normalize the wildcard pattern lists: trim each entry and drop empties. Leading/trailing whitespace in a
-# pattern (common when it comes from a hand-edited config) is otherwise matched LITERALLY by -like, so e.g.
-# "*kennisportaal* " would never match a URL that doesn't actually end in a space.
 $excludedSitesByWildcard     = @($excludedSitesByWildcard     | ForEach-Object { ([string]$_).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 $includedSitesByWildcard     = @($includedSitesByWildcard     | ForEach-Object { ([string]$_).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 $excludedLibrariesByWildcard = @($excludedLibrariesByWildcard | ForEach-Object { ([string]$_).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
@@ -315,8 +281,6 @@ $script:trayPS = $null
 $script:userConfig = $null
 $script:lastMappedLibraryOptions = @()
 $script:lastAlreadyExistingShortcuts = @()
-# Set for one run when the user deliberately changes exclusions in Manage shortcuts, so the deletion
-# ratio guard (meant to catch a partial Search outage) doesn't block their intentional shrink.
 $script:bypassDeletionRatioOnce = $false
 $script:localOneDriveRootPath = $null
 $script:localShortcutFolderPath = $null
@@ -346,13 +310,9 @@ switch($CloudType){
     }
 }
 
-# OAuth 2.0 v2 endpoints (B2). The v2 authorize/token endpoints take scopes instead of the legacy
-# v1 resource= parameter and are the current public-client baseline (PKCE, OAuth 2.1).
 $global:octo.authorizeUrl = "$($global:octo.idpUrl)/common/oauth2/v2.0/authorize"
 $global:octo.tokenUrl = "$($global:octo.idpUrl)/common/oauth2/v2.0/token"
 
-# Windows PowerShell 5.1 on older/unmanaged machines can still negotiate TLS 1.0. Force modern TLS
-# once at startup (guarded so we never fail on an older enum that lacks Tls13).
 try {
     $desiredProtocols = [Net.SecurityProtocolType]::Tls12
     try { $desiredProtocols = $desiredProtocols -bor [Net.SecurityProtocolType]::Tls13 } catch {}
@@ -360,8 +320,6 @@ try {
 } catch {}
 
 function Get-RetryAfterSeconds {
-    # read the Retry-After header across both the PS 5.1 (HttpWebResponse) and PS 7
-    # (HttpResponseMessage) exception shapes. Returns 0 when no usable value is present.
     param($ErrorRecord)
 
     if($null -eq $ErrorRecord) { return 0 }
@@ -369,7 +327,6 @@ function Get-RetryAfterSeconds {
     try { $response = $ErrorRecord.Exception.Response } catch {}
     if($null -eq $response) { return 0 }
 
-    # PS 7 / HttpResponseMessage: Headers.RetryAfter.Delta (a TimeSpan) or .Date.
     try {
         $retryAfter = $response.Headers.RetryAfter
         if($retryAfter) {
@@ -383,7 +340,6 @@ function Get-RetryAfterSeconds {
         }
     } catch {}
 
-    # PS 5.1 / HttpWebResponse: Headers.GetValues("Retry-After") returns a numeric string.
     try {
         $values = $response.Headers.GetValues("Retry-After")
         if($values -and $values.Count -gt 0 -and $values[0] -match '^\d+$') {
@@ -402,7 +358,6 @@ function Get-HttpStatusCode {
 }
 
 function Test-IsTransientHttpError {
-    # Shared classifier used by every retry loop: throttling (429) or transport-level blips.
     param($ErrorRecord)
 
     $statusCode = Get-HttpStatusCode -ErrorRecord $ErrorRecord
@@ -411,7 +366,6 @@ function Test-IsTransientHttpError {
 
     $is429 = ($statusCode -eq 429) -or ($message -like "*429*")
     if($is429) { return $true }
-    # Retry 5xx server errors too - they are frequently transient on the SharePoint search endpoint.
     if($null -ne $statusCode -and $statusCode -ge 500 -and $statusCode -lt 600) { return $true }
 
     $isTransientNetwork = $message -like "*No such host is known*" -or $message -like "*name or service not known*" -or $message -like "*network is unreachable*" -or $message -like "*connection was forcibly closed*" -or $message -like "*An existing connection was forcibly closed*" -or $message -like "*The operation has timed out*" -or $message -like "*Unable to connect to the remote server*"
@@ -419,8 +373,6 @@ function Test-IsTransientHttpError {
 }
 
 function Invoke-RestWithRetry {
-    # single retry/throttle core shared by Invoke-GraphRaw (and available to any caller). Honors
-    # Retry-After (A10), retries only 429/5xx/transport errors, and fails fast on other HTTP errors.
     param(
         [Parameter(Mandatory = $true)][string]$Method,
         [Parameter(Mandatory = $true)][string]$Uri,
@@ -462,15 +414,11 @@ function Invoke-RestWithRetry {
 }
 
 function Get-ScopeForResource {
-    # Faithful v2 translation of the v1 "resource=<url>" parameter: request every statically consented
-    # permission for that resource (.default) plus a refresh token (offline_access).
     param([Parameter(Mandatory = $true)][string]$Resource)
     return ("{0}/.default offline_access" -f $Resource.TrimEnd('/'))
 }
 
 function Save-RefreshToken {
-    # DPAPI-protected (current user) persistence of the refresh token. Only called when the token
-    # actually changed (A1) so we are not encrypting + writing to disk on every single API call.
     param([Parameter(Mandatory = $true)][string]$RefreshToken)
     try {
         $tokenDir = [System.IO.Path]::GetDirectoryName($global:octo.TokenCachePath)
@@ -484,7 +432,6 @@ function Save-RefreshToken {
 }
 
 function New-PkceCodeVerifier {
-    # RFC 7636 code_verifier: 32 random bytes, base64url-encoded (43 chars, no padding).
     $bytes = New-Object byte[] 32
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
     try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
@@ -492,7 +439,6 @@ function New-PkceCodeVerifier {
 }
 
 function New-PkceCodeChallenge {
-    # S256 challenge = base64url(SHA256(code_verifier)).
     param([Parameter(Mandatory = $true)][string]$Verifier)
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
@@ -503,9 +449,6 @@ function New-PkceCodeChallenge {
 
 #region Helper Functions
 function Set-M365ProcessDpiAwareness {
-    # declare the process per-monitor-v2 DPI aware BEFORE any window is created, so WinForms renders
-    # crisp (not bitmap-stretched/blurry) at 125-200% display scaling. Falls back through the older APIs
-    # for down-level Windows, and is a no-op if already set.
     try {
         if(-not ("M365AutoLink.DpiNative" -as [type])) {
             Add-Type -Namespace "M365AutoLink" -Name "DpiNative" -MemberDefinition @"
@@ -519,11 +462,8 @@ public static extern bool SetProcessDPIAware();
         }
     } catch { return }
 
-    # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
     try { if([M365AutoLink.DpiNative]::SetProcessDpiAwarenessContext([System.IntPtr](-4))) { return } } catch {}
-    # PROCESS_PER_MONITOR_DPI_AWARE = 2 (Windows 8.1+)
     try { if([M365AutoLink.DpiNative]::SetProcessDpiAwareness(2) -eq 0) { return } } catch {}
-    # System-DPI aware (Vista+)
     try { [void][M365AutoLink.DpiNative]::SetProcessDPIAware() } catch {}
 }
 
@@ -578,7 +518,6 @@ function Get-SafeDriveItemName {
     param([string]$Name)
 
     $safeName = $Name
-    # OneDrive/SharePoint invalid filename characters.
     $safeName = $safeName -replace '[\\/:*?"<>|]', '-'
     $safeName = $safeName.Trim()
     $safeName = $safeName.TrimEnd('.')
@@ -595,8 +534,6 @@ function Test-IsExcludedLibraryName {
 
     if([string]::IsNullOrWhiteSpace($ListName)) { return $false }
     foreach($pattern in $excludedLibrariesByWildcard) {
-        # PowerShell -like is case-insensitive and anchors both ends correctly, unlike the old
-        # start-anchored regex which over-matched (e.g. "*/sites/pwa" also hit "/sites/pwa-archive").
         if($ListName -like $pattern) {
             return $true
         }
@@ -745,8 +682,7 @@ function Get-RawScriptPath {
 }
 
 function Get-M365AutoLinkScriptPath {
-    # Once self-deployment has resolved a permanent location, persistence must target that copy rather
-    # than the (possibly temporary) location the current process is running from.
+    # Once self-deployment has resolved a permanent location, persistence must target that copy
     if(-not [string]::IsNullOrWhiteSpace($script:effectiveScriptPath)) {
         return $script:effectiveScriptPath
     }
@@ -758,13 +694,9 @@ function Get-DeployTargetPath {
     param([string]$DeployToPath)
 
     if([string]::IsNullOrWhiteSpace($DeployToPath)) { return $null }
-
-    # Expand %NAME% style environment variables. $env:NAME style is already expanded at assignment time.
     $expandedPath = [System.Environment]::ExpandEnvironmentVariables($DeployToPath.Trim())
     if([string]::IsNullOrWhiteSpace($expandedPath)) { return $null }
 
-    # A path ending in .ps1 is treated as the full target file; anything else is treated as a folder
-    # into which the script is copied under its standard M365AutoLink.ps1 name.
     if($expandedPath.TrimEnd('\', '/').ToLowerInvariant().EndsWith('.ps1')) {
         $targetFile = $expandedPath
     } else {
@@ -781,8 +713,6 @@ function Get-DeployTargetPath {
 function Invoke-SelfDeployment {
     param([string]$DeployToPath)
 
-    # Resolves the path persistence should target. With no deployment configured (or if it cannot be
-    # performed) this is simply the current script path.
     $currentScriptPath = Get-RawScriptPath
 
     $targetScriptPath = Get-DeployTargetPath -DeployToPath $DeployToPath
@@ -798,7 +728,6 @@ function Invoke-SelfDeployment {
     $resolvedCurrentPath = $currentScriptPath
     try { $resolvedCurrentPath = [System.IO.Path]::GetFullPath($currentScriptPath) } catch {}
 
-    # Already running from the deploy location: nothing to copy, and we must not rewrite the file each run.
     if([string]::Equals($resolvedCurrentPath, $targetScriptPath, [System.StringComparison]::OrdinalIgnoreCase)) {
         Write-Log "Running from the configured deploy location ($targetScriptPath); no copy needed." "INFO"
         return $targetScriptPath
@@ -824,8 +753,7 @@ function Test-PathUnderIntune {
 
     if([string]::IsNullOrWhiteSpace($Path)) { return $false }
 
-    # Well-known locations the Intune Management Extension uses to stage and run PowerShell scripts and
-    # Win32 app payloads. Anything running from here is temporary and gets cleaned up after execution.
+    # Well-known IME uses
     $intunePathFragments = @(
         'Microsoft Intune Management Extension\Policies\Scripts',
         'Microsoft Intune Management Extension\Content',
@@ -842,10 +770,7 @@ function Test-PathUnderIntune {
 }
 
 function Test-RunningUnderIntune {
-    # Intune enforces a timeout on PowerShell scripts and considers the deployment failed if the process
-    # does not exit in time (which the tray "keep running" loop would trigger). Detect Intune either by
-    # the temporary location the script is launched from, or by walking the parent process chain for the
-    # Intune agent processes that spawn it.
+    # Intune enforces a timeout on PowerShell scripts
     try {
         $rawScriptPath = Get-RawScriptPath
         if(Test-PathUnderIntune -Path $rawScriptPath) {
@@ -897,9 +822,6 @@ function Start-DetachedM365AutoLinkRun {
     $launchCommand = Get-PowerShellLaunchCommand -ScriptPath $ScriptPath -PowerShellExe $powerShellExe -HiddenWindow
     $commandLine = '"{0}" {1}' -f $launchCommand.TargetPath, $launchCommand.Arguments
 
-    # Preferred: spawn via WMI so the new process is owned by the WMI provider host and is NOT part of the
-    # Intune agent's process/job tree. That way it keeps running (tray icon + mapping) after this
-    # Intune-launched process exits immediately.
     try {
         $result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $commandLine } -ErrorAction Stop
         if($result -and $result.ReturnValue -eq 0 -and $result.ProcessId) {
@@ -1138,8 +1060,6 @@ function Set-AtLogonPersistence {
             $action = New-ScheduledTaskAction -Execute $launchCommand.TargetPath -Argument $launchCommand.Arguments
             $trigger = New-ScheduledTaskTrigger -AtLogOn -User $principalUser
             $principal = New-ScheduledTaskPrincipal -UserId $principalUser -LogonType Interactive -RunLevel Limited
-            # the default 72h ExecutionTimeLimit would kill the long-lived tray process; disable it.
-            # MultipleInstances IgnoreNew avoids a second logon-triggered instance racing the running one.
             $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
             $task = New-ScheduledTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'Launch M365AutoLink at logon'
             Register-ScheduledTask -TaskName $taskName -InputObject $task -Force -ErrorAction Stop | Out-Null
@@ -1227,7 +1147,6 @@ function Invoke-Uninstall {
     $desktopShortcutPath = Join-Path -Path ([Environment]::GetFolderPath('DesktopDirectory')) -ChildPath 'M365AutoLink.lnk'
     $startMenuShortcutPath = Join-Path -Path ([Environment]::GetFolderPath('Programs')) -ChildPath 'M365AutoLink.lnk'
 
-    # Remove the Desktop + Start Menu launch shortcuts regardless of the configured $LaunchModes.
     foreach($shortcut in @(
         @{ Path = $desktopShortcutPath; Label = 'Desktop launch shortcut' },
         @{ Path = $startMenuShortcutPath; Label = 'Start Menu launch shortcut' }
@@ -1242,7 +1161,6 @@ function Invoke-Uninstall {
         }
     }
 
-    # Remove at-logon persistence (scheduled task + Run key + startup-folder shortcut).
     try {
         $removedAtLogon = Set-AtLogonPersistence -Mode 'AtLogon' -Remove
         if($removedAtLogon) {
@@ -1254,9 +1172,6 @@ function Invoke-Uninstall {
         Write-Log "Failed to remove at-logon persistence: $($_.Exception.Message)" "WARN"
     }
 
-    # always remove M365AutoLink's own credential + log files. RefreshToken.xml is a usable,
-    # long-lived credential and must never survive an uninstall. Deleting the cache is also the
-    # practical way to end the session (there is no refresh-token logout endpoint).
     foreach($ownFile in @(
         @{ Path = $global:octo.TokenCachePath; Label = 'refresh token cache' },
         @{ Path = $global:octo.LogPath; Label = 'run log' }
@@ -1270,12 +1185,10 @@ function Invoke-Uninstall {
             Write-Log "Failed to remove $($ownFile.Label) '$($ownFile.Path)': $($_.Exception.Message)" "WARN"
         }
     }
-    # Also drop the in-memory token so nothing re-writes the cache during this process.
+
     $global:octo.LCRefreshToken = $Null
     $global:octo.LCCachedTokens = @{}
 
-    # Remove the deployed copy of the script from disk - only when a deploy location is configured.
-    # A running .ps1 is not locked on Windows, so this also works when the current process IS that copy.
     $targetScriptPath = Get-DeployTargetPath -DeployToPath $DeployToPath
     if([string]::IsNullOrWhiteSpace($targetScriptPath)) {
         Write-Log "deployToPath is not configured; leaving the script file in place." "INFO"
@@ -1288,8 +1201,6 @@ function Invoke-Uninstall {
                 Write-Log "Deployed script not found at $targetScriptPath; nothing to remove." "INFO"
             }
 
-            # Clean up the deploy folder too, but only when it is now empty so we never delete
-            # unrelated data (e.g. the token cache / log when they share the folder).
             $targetDirectory = [System.IO.Path]::GetDirectoryName($targetScriptPath)
             if(-not [string]::IsNullOrWhiteSpace($targetDirectory) -and (Test-Path -LiteralPath $targetDirectory)) {
                 if(-not (Get-ChildItem -LiteralPath $targetDirectory -Force -ErrorAction SilentlyContinue)) {
@@ -1399,9 +1310,6 @@ function Invoke-GraphRaw {
 
     $token = Get-AccessToken -resource $global:octo.graphUrl
     $headers = @{ Authorization = "Bearer $token" }
-
-    # config load/save (used at the start and end of every run) now survives a transient 429/5xx
-    # instead of dying, because it goes through the shared retry core rather than a bare Invoke-RestMethod.
     if($PSBoundParameters.ContainsKey('Body')) {
         return Invoke-RestWithRetry -Method $Method -Uri $Uri -Headers $headers -Body $Body -ContentType $ContentType
     }
@@ -2426,9 +2334,6 @@ function New-GraphQuery {
         try{
             $token = Get-AccessToken -resource $resource
         }catch{
-            # do NOT Exit here - that would silently kill the tray process mid-run with no balloon.
-            # Throw a recognizable error instead so Invoke-M365AutoLinkRun's catch can surface it as an
-            # Error balloon (with the consent URL) and keep the tray alive for a retry after consent.
             $consentUrl = "$($global:octo.idpUrl)/organizations/adminconsent?client_id=$($global:octo.LCClientId)"
             Write-Log "Token acquisition failed for '$resource': $($_.Exception.Message)" -Level "ERROR"
             Write-Log "Possible fix: an admin still needs to approve this application at $consentUrl" -Level "ERROR"
@@ -2572,9 +2477,6 @@ function New-GraphQuery {
 
                 if($resource -like "*sharepoint.com*"){
                     if($Data -and $Data.PSObject.TypeNames -notcontains "System.Management.Automation.PSCustomObject"){
-                        # on PowerShell 7 System.Web.Extensions (JavaScriptSerializer) does not exist,
-                        # so use ConvertFrom-Json -AsHashtable (handles large payloads and returns a
-                        # hashtable natively). Fall back to the serializer only on Windows PowerShell 5.1.
                         if($PSVersionTable.PSVersion.Major -ge 6){
                             $Data = ($Data | Out-String | ConvertFrom-Json -AsHashtable)
                         } else {
@@ -2595,19 +2497,17 @@ function New-GraphQuery {
                 if($Data.psobject.properties.name -icontains 'value' -or ($Data.PSObject.BaseObject -is [hashtable] -and $Data.Keys -icontains 'value')){ # Added check for hashtable
                     $pageItems = $Data.value
                 }else{
-                    # This case handles responses where the data is the root object (e.g., an array of items directly)
                     $pageItems = $Data
                 }
 
                 if ($null -ne $pageItems) {
-                    # Ensure $pageItems is treated as a collection for .Count, even if it's a single object
                     $pageItemCount = @($pageItems).Count
                     $totalResults += $pageItemCount
 
                     if ($pageItemCount -eq 1 -and -not ($pageItems -is [array])) {
-                        $ReturnedData += @($pageItems) # Add single item as an array element
+                        $ReturnedData += @($pageItems)
                     } elseif ($pageItemCount -gt 0) {
-                            $ReturnedData += $pageItems # Add array of items
+                            $ReturnedData += $pageItems
                     }
                 }     
                 
@@ -2641,9 +2541,6 @@ function Write-Log {
         default { "White" }
     }
     Write-Host $line -ForegroundColor $color
-
-    # write to the log file directly so we never depend on Start-Transcript (which fights between
-    # two instances and disappears if it fails to start). Best-effort; never let logging break a run.
     try {
         $logPath = $global:octo.LogPath
         if(-not [string]::IsNullOrWhiteSpace($logPath)) {
@@ -2657,7 +2554,6 @@ function Write-Log {
 }
 
 function Invoke-LogRotation {
-    # roll the previous lastRun.log to run-<timestamp>.log and prune to $LogHistoryCount files.
     try {
         $logPath = $global:octo.LogPath
         if([string]::IsNullOrWhiteSpace($logPath)) { return }
@@ -2744,15 +2640,12 @@ function Update-TrayState {
         $script:traySync.BalloonTitle = $BalloonTitle
         $script:traySync.BalloonMsg = $BalloonMessage
         $script:traySync.BalloonIcon = $BalloonIcon
-        # Set the click target for this balloon (or clear it, so a previous link never carries over).
         $script:traySync.BalloonClickUrl = $BalloonClickUrl
         $script:traySync.ShowBalloon = $true
     }
 }
 
 function Initialize-TrayIcon {
-    # This runspace owns ALL long-lived WinForms UI (tray icon AND progress form) and pumps
-    # messages continuously via Application.Run().
     if($script:traySync) { return }
     if(-not $EnableSystemTrayIcon -and -not $ShowProgressBar) { return }
 
@@ -2819,9 +2712,6 @@ function Initialize-TrayIcon {
 
             $icon = New-Object Windows.Forms.NotifyIcon
 
-            # Draws the cloud+arrow glyph tinted by item-count status so the icon itself signals
-            # whether the combined linked-library item count is ok (blue), approaching (amber) or
-            # over (red) the limit. Returns a fresh Icon handle the caller is responsible for.
             function New-TrayIconHandle {
                 param([string]$Status)
 
@@ -2855,11 +2745,9 @@ function Initialize-TrayIcon {
             if([string]::IsNullOrWhiteSpace($script:lastIconStatus)) { $script:lastIconStatus = "ok" }
             $icon.Icon = New-TrayIconHandle -Status $script:lastIconStatus
 
-            # When only the progress bar is enabled, this runspace still runs but the icon stays hidden.
             $icon.Visible = [bool]$sync.EnableTrayIcon
             $icon.Text = if([string]::IsNullOrWhiteSpace([string]$sync.Version)) { "M365AutoLink" } else { "M365AutoLink v$($sync.Version)" }
 
-            # Clicking the over/approaching-limit balloon opens the configured knowledgebase article.
             $icon.Add_BalloonTipClicked({
                 try {
                     $balloonUrl = [string]$sync.BalloonClickUrl
@@ -2905,7 +2793,6 @@ function Initialize-TrayIcon {
                         $manageShortcutsItem.Enabled = [bool]$sync.HasMappedSites
                     }
 
-                    # Refresh the read-only combined item-count line (hidden until a run produced data).
                     $itemCountText = [string]$sync.ItemCountText
                     $hasItemCount = -not [string]::IsNullOrWhiteSpace($itemCountText)
                     $itemCountInfoItem.Visible = $hasItemCount
@@ -2970,7 +2857,6 @@ function Initialize-TrayIcon {
                 try { $sync.ExitRequested = $true } catch {}
             })
 
-            # show the running version (single source of truth: $ScriptVersion).
             $versionItem = New-Object Windows.Forms.ToolStripMenuItem("M365AutoLink v$([string]$sync.Version)")
             $versionItem.Enabled = $false
 
@@ -2998,8 +2884,6 @@ function Initialize-TrayIcon {
             $script:lastIconText = ""
 
             function New-M365ProgressForm {
-                # scale the hand-laid-out floating bar by the primary monitor's DPI so it stays the
-                # right physical size and crisp (the process is per-monitor DPI aware).
                 $scale = 1.0
                 try {
                     $screenGraphics = [Drawing.Graphics]::FromHwnd([IntPtr]::Zero)
@@ -3159,7 +3043,6 @@ function Initialize-TrayIcon {
                         $script:progressLabel = $null
                     }
 
-                    # Recolor the tray icon when the combined item-count status changes.
                     $currentItemStatus = [string]$sync.ItemCountStatus
                     if([string]::IsNullOrWhiteSpace($currentItemStatus)) { $currentItemStatus = "ok" }
                     if($currentItemStatus -ne $script:lastIconStatus) {
@@ -3172,7 +3055,6 @@ function Initialize-TrayIcon {
                     }
 
                     if(-not $menu.Visible) {
-                        # When near/over the limit, surface the item-count warning in the tooltip itself.
                         $iconText = [string]$sync.Text
                         if(($currentItemStatus -eq "over" -or $currentItemStatus -eq "approaching") -and -not [string]::IsNullOrWhiteSpace([string]$sync.ItemCountText)) {
                             $iconText = [string]$sync.ItemCountText
@@ -3206,7 +3088,6 @@ function Initialize-TrayIcon {
                         }
                     }
                 } catch {
-                    # Never let a timer tick exception kill tray responsiveness.
                 }
             })
             $timer.Start()
@@ -3294,9 +3175,6 @@ function Get-SharePointDocumentLibrariesFromSearch {
     $rowLimit = 500
     $startRow = 0
     $foundLibraries = [System.Collections.Generic.List[hashtable]]::new()
-    # track whether discovery completed normally. If a page keeps failing after retries we treat the
-    # whole result set as INCOMPLETE and let the caller skip the destructive delete phase this run rather
-    # than deleting valid shortcuts based on a partial view.
     $script:searchIncomplete = $false
 
     while($true) {
@@ -3399,11 +3277,6 @@ function Get-ListMetadataWithFallback {
 }
 
 function Get-ShortcutMetadataMap {
-    # fetch the target metadata (the hidden A2OD* remote-item fields) for EVERY existing shortcut in
-    # the AutoLink folder in a SINGLE RenderListDataAsStream call, instead of one GetItemByUniqueId per
-    # shortcut (the old N+1 loop). Returns a map keyed by normalized item UniqueId. The caller falls back
-    # to a per-item lookup for any shortcut this bulk call did not fully resolve, so correctness is
-    # preserved even if the tenant does not surface the hidden fields via RenderListDataAsStream.
     param(
         [Parameter(Mandatory = $true)][string]$WebUrl,
         [Parameter(Mandatory = $true)][string]$ListId
@@ -3431,8 +3304,6 @@ function Get-ShortcutMetadataMap {
 
 
 function Invoke-PreflightChecks {
-    # cheap, actionable checks before touching Graph. Warnings are logged and surfaced in one balloon;
-    # they never block the run (the consent probe below is the only thing that can, via a friendly error).
     $warnings = [System.Collections.Generic.List[string]]::new()
 
     # 1) Is the OneDrive client configured for a work/school account on this device?
@@ -3445,7 +3316,7 @@ function Invoke-PreflightChecks {
         Write-Log "Pre-flight: local OneDrive folder found at $oneDriveRoot" "INFO"
     }
 
-    # 2) Is the identity provider reachable? (ICMP is often blocked, so fall back to a TCP 443 probe.)
+    # 2) Is the identity provider reachable?
     try {
         $idpHost = ([System.Uri]$global:octo.idpUrl).Host
         $reachable = $false
@@ -3481,8 +3352,6 @@ function Invoke-M365AutoLinkRun {
     try {
         Initialize-ProgressBar
 
-        # rotate logs and start a fresh lastRun.log. Write-Log appends to the file directly, so we
-        # no longer depend on Start-Transcript.
         Invoke-LogRotation
 
         Update-TrayState -Text "M365AutoLink - Starting mapping" -Percent 1 -ProgressText "Starting" -IsRunning
@@ -3492,11 +3361,9 @@ function Invoke-M365AutoLinkRun {
 
         Add-Type -AssemblyName System.Web
 
-        # pre-flight checks (OneDrive present, IdP reachable) before we touch Graph.
         Update-TrayState -Text "M365AutoLink - Checking prerequisites" -Percent 3 -ProgressText "Checking prerequisites" -IsRunning
         [void](Invoke-PreflightChecks)
 
-        # Pre populate the token cache (this doubles as the admin-consent probe).
         Update-TrayState -Text "M365AutoLink - Authenticating" -Percent 5 -ProgressText "Authenticating" -IsRunning
         try {
             [void](Get-AccessToken -resource $global:octo.graphUrl)
@@ -3699,8 +3566,6 @@ function Invoke-M365AutoLinkRun {
                 $meta = $shortcutMetadataMap[$normalizedUniqueId]
             }
 
-            # Fall back to a per-item lookup when the bulk call did not return this row or it lacks the
-            # target fields. one transient error must not abort the whole run - skip+warn instead.
             if(-not $meta -or [string]::IsNullOrWhiteSpace([string]$meta.targetSiteId) -or [string]::IsNullOrWhiteSpace([string]$meta.targetListId)) {
                 try {
                     $shortCutMetaData = (New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$rootUrl/personal/$userComponent/_api/web/lists('$($docLibrary.id)')/GetItemByUniqueId('$($shortCut.UniqueId)')?`$expand=FieldValuesAsText" -Method GET)
@@ -3838,11 +3703,8 @@ function Invoke-M365AutoLinkRun {
 
             $normalizedSiteUrl = Get-NormalizedSiteUrl -SiteUrl $siteUrl
 
-            # Per-library user exclusion. The legacy per-site exclusion list is honoured here too so
-            # existing site exclusions keep working until the user next saves (which migrates them).
             $isUserExcludedLibrary = ($cachedLibraryKey -and $userExcludedLibraryKeySet.Contains($cachedLibraryKey)) -or (-not [string]::IsNullOrWhiteSpace($normalizedSiteUrl) -and $configuredExcludedSiteSet.Contains($normalizedSiteUrl))
             if($isUserExcludedLibrary) {
-                # Record it so it can be re-included from Manage shortcuts, but skip metadata and linking.
                 Write-Log "  $($library.listName) is excluded by the user, skipping..." "INFO"
                 [void]$seenLibraryKeys.Add($libraryKey)
                 if(-not [string]::IsNullOrWhiteSpace($cachedLibraryKey) -and -not $manageableLibraryTable.Contains($cachedLibraryKey)) {
@@ -4022,8 +3884,6 @@ function Invoke-M365AutoLinkRun {
         $createIndex = 0
         foreach($desiredShortcut in $desiredShortcuts) {
             $createIndex++
-            # reset per iteration so the shortcutAlreadyExists catch path can never register a stale
-            # name from a previous iteration into $reservedShortcutNameSet.
             $safeShortcutName = $null
             $createPercent = [int](55 + (25 * ($createIndex / $createTotal)))
             Update-TrayState -Text "M365AutoLink - Creating shortcuts" -Percent $createPercent -ProgressText ("Creating shortcuts {0}/{1}" -f $createIndex, $createTotal) -IsRunning
@@ -4097,8 +3957,6 @@ function Invoke-M365AutoLinkRun {
                         Write-Log "  Failed to rename shortcut '$($newShortCut.name)': $($_.Exception.Message)" "WARN"
                     }
                 }
-                # no fixed sleep - the shared retry core already backs off on 429, so steady-state runs
-                # are not artificially slowed by a per-item delay.
                 Write-Log "  Successfully created shortcut for '$($desiredShortcut.shortcut.siteUrl)'" "SUCCESS"
                 [void]$existingShortcutNameSet.Add($safeShortcutName)
                 [void]$reservedShortcutNameSet.Add($safeShortcutName)
@@ -4176,8 +4034,6 @@ function Invoke-M365AutoLinkRun {
         try { $lastDesiredCount = [int]$script:userConfig.diagnostics.lastDesiredCount } catch {}
         $desiredCount = $desiredTargetKeySet.Count
 
-        # Consume the one-shot bypass: a shrink the user just made on purpose (via Manage shortcuts) is not
-        # the partial-Search-outage scenario the ratio guard protects against, so skip that check this run.
         $userInitiatedShrink = $script:bypassDeletionRatioOnce
         $script:bypassDeletionRatioOnce = $false
 
@@ -4277,8 +4133,6 @@ function Invoke-M365AutoLinkRun {
 
         Update-TrayState -Text "M365AutoLink - Mapping complete" -Percent 100 -ProgressText "Completed" -IsRunning:$false
 
-        # Reflect the combined item count on the tray (icon color + tooltip) and warn once if we are
-        # near/over the limit where Explorer may misbehave. The balloon links to the KB article.
         $totalItemCountStatus = Get-TotalItemCountStatus -TotalItemCount $totalLinkedItemCount
         Update-TrayState -TotalItemCount $totalLinkedItemCount -ItemCountStatus $totalItemCountStatus
         if($totalItemCountStatus -ne "ok") {
@@ -4321,11 +4175,6 @@ if($Uninstall) {
 }
 
 if(Test-RunningUnderIntune) {
-    # Running under Intune: Intune times out PowerShell scripts and would flag M365AutoLink as failed
-    # because the tray "keep running" loop never returns. Instead we only copy the script to its
-    # permanent home, apply the configured persistence, and kick off a fully detached run - then exit
-    # right away. Intune records a quick, successful execution while the user still gets the tray icon,
-    # shortcuts and mapping from the detached process.
     Write-Log "=== M365AutoLink started under Intune - bootstrapping persistence + detached run ===" "INFO"
 
     try {
@@ -4342,10 +4191,6 @@ if(Test-RunningUnderIntune) {
 
     $detachedScriptPath = Get-M365AutoLinkScriptPath
     if(Test-PathUnderIntune -Path $detachedScriptPath) {
-        # No permanent copy was made (deployToPath not configured), so the only path we have is the
-        # temporary Intune one which gets deleted right after we exit. Launching from there would be
-        # unreliable and could re-trigger this same Intune branch, so we skip it and tell the admin how
-        # to fix it.
         Write-Log "The script is still running from a temporary Intune location because `$deployToPath is not configured. Set `$deployToPath to a permanent path so M365AutoLink can copy itself there; skipping the detached run to avoid launching from a location Intune will delete." "WARN"
     } else {
         [void](Start-DetachedM365AutoLinkRun -ScriptPath $detachedScriptPath)
@@ -4359,10 +4204,6 @@ $script:instanceMutex = $null
 $script:mutexAcquired = $false
 $script:runNowEvent = $null
 try {
-    # single-instance guard for this user session. If another instance already owns the mutex, signal
-    # it to run (via a named event its tray loop polls) and exit cleanly - avoids two tray icons, duplicate
-    # refresh-token rotation, log contention and auth-port collisions. "Local\" scopes it per session so
-    # multi-session hosts (RDS/AVD) still get one instance per user.
     try {
         $createdNew = $false
         $script:instanceMutex = New-Object System.Threading.Mutex($false, "Local\M365AutoLink", [ref]$createdNew)
@@ -4387,18 +4228,14 @@ try {
         return
     }
 
-    # must run before the tray runspace (same process) creates its first window.
     Set-M365ProcessDpiAwareness
 
     $script:localOneDriveRootPath = Get-LocalOneDriveRootPath
     $script:localShortcutFolderPath = Get-LocalShortcutFolderPath -FolderName $FolderName
-    # Copy the script to its permanent home (if configured) before any persistence is created, so that
-    # shortcuts/scheduled tasks/run keys point at the permanent copy rather than a temporary deploy path.
     $script:effectiveScriptPath = Invoke-SelfDeployment -DeployToPath $deployToPath
     Initialize-TrayIcon
     Update-TrayState -Text "M365AutoLink - Ready" -Percent 0 -ProgressText "Waiting to start"
 
-    # track the last run time so we can auto-refresh every $AutoRefreshHours while resident in the tray.
     $script:lastRunCompletedAt = $null
 
     $runRequested = $true
@@ -4450,10 +4287,6 @@ try {
                 $script:traySync.HasCompletedRun = $true
             }
 
-            # one-time onboarding after the first successful run that actually resulted in shortcuts -
-            # explain where they are, that OneDrive needs a moment to sync them, and where Manage lives.
-            # If a run produced no shortcuts we skip (and do NOT drop the marker) so onboarding can still
-            # fire on a later run that does create some.
             $shortcutsPresent = (([int]$summary.successCount) + ([int]$summary.existingConflictCount)) -gt 0
             try {
                 $onboardMarker = Join-Path -Path ([System.IO.Path]::GetDirectoryName($global:octo.LogPath)) -ChildPath ".onboarded"
@@ -4465,9 +4298,6 @@ try {
                 }
             } catch {}
 
-            # Individual per-library/per-item errors during mapping only increment $summary.errorCount and are
-            # recorded in the log - we deliberately do NOT toast the user about them. Only critical failures
-            # (e.g. no Graph access, nothing works) throw and surface the Error balloon in the catch block below.
             $hasIssues = ($summary.errorCount -gt 0)
             $idleProgressText = if($hasIssues) { "Idle - completed with errors (see log)" } else { "Idle - click Run now" }
             Update-TrayState -Text "M365AutoLink - Idle" -Percent 100 -ProgressText $idleProgressText -IsRunning:$false
@@ -4489,7 +4319,6 @@ try {
     }
 } finally {
     Stop-TrayIcon
-    # release + dispose the single-instance mutex so the next launch can become primary.
     if($script:mutexAcquired -and $script:instanceMutex) {
         try { $script:instanceMutex.ReleaseMutex() } catch {}
     }
