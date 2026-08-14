@@ -823,22 +823,23 @@ function Start-DetachedM365AutoLinkRun {
     $commandLine = '"{0}" {1}' -f $launchCommand.TargetPath, $launchCommand.Arguments
 
     try {
-        $result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $commandLine } -ErrorAction Stop
-        if($result -and $result.ReturnValue -eq 0 -and $result.ProcessId) {
-            Write-Log "Started detached M365AutoLink run (PID $($result.ProcessId)) via WMI." "SUCCESS"
-            return $true
-        }
-        Write-Log "WMI process creation returned code $($result.ReturnValue); falling back to Start-Process." "WARN"
-    } catch {
-        Write-Log "WMI process creation failed, falling back to Start-Process: $($_.Exception.Message)" "WARN"
-    }
-
-    try {
         Start-Process -FilePath $launchCommand.TargetPath -ArgumentList $launchCommand.Arguments -WindowStyle Hidden -ErrorAction Stop | Out-Null
         Write-Log "Started detached M365AutoLink run via Start-Process." "SUCCESS"
         return $true
     } catch {
         Write-Log "Failed to start a detached M365AutoLink run: $($_.Exception.Message)" "WARN"
+    }
+
+    try {
+        $result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $commandLine } -ErrorAction Stop
+        if($result -and $result.ReturnValue -eq 0 -and $result.ProcessId) {
+            Write-Log "Started detached M365AutoLink run (PID $($result.ProcessId)) via WMI." "SUCCESS"
+            return $true
+        }
+        Write-Log "WMI process creation returned code $($result.ReturnValue);" "WARN"
+        return $false
+    } catch {
+        Write-Log "WMI process creation failed: $($_.Exception.Message)" "WARN"
         return $false
     }
 }
