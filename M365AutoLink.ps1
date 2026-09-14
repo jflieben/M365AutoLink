@@ -1595,6 +1595,14 @@ function Show-ManageShortcutsDialog {
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
 
+    $scale = 1.0
+    try {
+        $screenGraphics = [Drawing.Graphics]::FromHwnd([IntPtr]::Zero)
+        if($screenGraphics.DpiX -gt 0) { $scale = $screenGraphics.DpiX / 96.0 }
+        $screenGraphics.Dispose()
+    } catch {}
+    function ds { param($v) [int][math]::Round($v * $scale) }
+
     $excludedForeColor = [Drawing.Color]::FromArgb(150, 158, 168)
 
     # Build the master item list once; the visible ListView is (re)populated from this by filter + sort.
@@ -1631,18 +1639,17 @@ function Show-ManageShortcutsDialog {
     # a normal sizable window (resizable + remembers its size), rather than the old borderless one.
     $form.FormBorderStyle = [Windows.Forms.FormBorderStyle]::Sizable
     $form.MaximizeBox = $true
-    $form.MinimumSize = New-Object Drawing.Size(760, 460)
+    $form.MinimumSize = New-Object Drawing.Size((ds 760), (ds 460))
     $savedSize = Get-SavedManageDialogSize
     if($savedSize) {
         $form.ClientSize = New-Object Drawing.Size([int]$savedSize.Width, [int]$savedSize.Height)
     } else {
-        $form.ClientSize = New-Object Drawing.Size(1040, 600)
+        $form.ClientSize = New-Object Drawing.Size((ds 1040), (ds 600))
     }
     $form.BackColor = [Drawing.Color]::FromArgb(246, 248, 252)
 
-    $pad = 12
-    $footerH = 48
-    $filterH = 30
+    $pad = ds 12
+    $footerH = ds 48
     $clientW = $form.ClientSize.Width
     $clientH = $form.ClientSize.Height
     $contentWidth = $clientW - ($pad * 2)
@@ -1650,21 +1657,21 @@ function Show-ManageShortcutsDialog {
 
     $headerPanel = New-Object Windows.Forms.Panel
     $headerPanel.Location = New-Object Drawing.Point(0, 0)
-    $headerPanel.Size = New-Object Drawing.Size($clientW, 66)
+    $headerPanel.Size = New-Object Drawing.Size($clientW, (ds 66))
     $headerPanel.BackColor = [Drawing.Color]::FromArgb(33, 37, 43)
     $headerPanel.Anchor = $rightAnchor
 
     $titleLabel = New-Object Windows.Forms.Label
-    $titleLabel.Location = New-Object Drawing.Point($pad, 9)
-    $titleLabel.Size = New-Object Drawing.Size(($clientW - ($pad * 2)), 22)
+    $titleLabel.Location = New-Object Drawing.Point($pad, (ds 9))
+    $titleLabel.Size = New-Object Drawing.Size(($clientW - ($pad * 2)), (ds 24))
     $titleLabel.Font = New-Object Drawing.Font("Segoe UI", 11, [Drawing.FontStyle]::Bold)
     $titleLabel.ForeColor = [Drawing.Color]::FromArgb(237, 244, 252)
     $titleLabel.Text = "Manage shortcuts"
     $titleLabel.Anchor = $rightAnchor
 
     $subLabel = New-Object Windows.Forms.Label
-    $subLabel.Location = New-Object Drawing.Point($pad, 34)
-    $subLabel.Size = New-Object Drawing.Size(($clientW - ($pad * 2)), 26)
+    $subLabel.Location = New-Object Drawing.Point($pad, (ds 35))
+    $subLabel.Size = New-Object Drawing.Size(($clientW - ($pad * 2)), (ds 26))
     $subLabel.Font = New-Object Drawing.Font("Segoe UI", 9)
     $subLabel.ForeColor = [Drawing.Color]::FromArgb(191, 205, 223)
     $subLabel.Text = "Tick Exclude to stop syncing a library. Type to filter, click a column to sort. Saving re-runs automatically."
@@ -1673,69 +1680,75 @@ function Show-ManageShortcutsDialog {
     $headerPanel.Controls.Add($titleLabel)
     $headerPanel.Controls.Add($subLabel)
 
-    # Filter row: a search box plus quick Exclude-all / Include-all buttons.
+    # Filter row: a search box plus quick Exclude-all / Include-all buttons. Widths are DPI-scaled and the
+    # label/buttons get their height synced to the text box (see $form.Add_Shown) so the row always lines up.
+    $rowY = ds 74
+    $labelW = ds 48
+    $buttonW = ds 100
+    $buttonGap = ds 8
+
+    $filterBox = New-Object Windows.Forms.TextBox
+    $filterBox.Location = New-Object Drawing.Point(($pad + $labelW), $rowY)
+    $filterBox.Width = $contentWidth - $labelW - ($buttonW * 2) - ($buttonGap * 2)
+    $filterBox.Font = New-Object Drawing.Font("Segoe UI", 9)
+    $filterBox.Anchor = $rightAnchor
+
     $filterLabel = New-Object Windows.Forms.Label
-    $filterLabel.Location = New-Object Drawing.Point($pad, 74)
-    $filterLabel.Size = New-Object Drawing.Size(40, $filterH)
+    $filterLabel.Location = New-Object Drawing.Point($pad, $rowY)
+    $filterLabel.Size = New-Object Drawing.Size($labelW, (ds 26))
     $filterLabel.Text = "Filter"
     $filterLabel.TextAlign = [Drawing.ContentAlignment]::MiddleLeft
     $filterLabel.Font = New-Object Drawing.Font("Segoe UI", 9)
 
-    $filterBox = New-Object Windows.Forms.TextBox
-    $filterBox.Location = New-Object Drawing.Point(($pad + 44), 76)
-    $filterBox.Size = New-Object Drawing.Size(($contentWidth - 44 - 220), 24)
-    $filterBox.Font = New-Object Drawing.Font("Segoe UI", 9)
-    $filterBox.Anchor = $rightAnchor
-
     $excludeAllButton = New-Object Windows.Forms.Button
     $excludeAllButton.Text = "Exclude all"
-    $excludeAllButton.Size = New-Object Drawing.Size(100, 26)
-    $excludeAllButton.Location = New-Object Drawing.Point(($clientW - $pad - 208), 75)
+    $excludeAllButton.Size = New-Object Drawing.Size($buttonW, (ds 26))
+    $excludeAllButton.Location = New-Object Drawing.Point(($clientW - $pad - ($buttonW * 2) - $buttonGap), $rowY)
     $excludeAllButton.FlatStyle = [Windows.Forms.FlatStyle]::Flat
     $excludeAllButton.BackColor = [Drawing.Color]::FromArgb(231, 236, 244)
     $excludeAllButton.Anchor = [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Right
 
     $includeAllButton = New-Object Windows.Forms.Button
     $includeAllButton.Text = "Include all"
-    $includeAllButton.Size = New-Object Drawing.Size(100, 26)
-    $includeAllButton.Location = New-Object Drawing.Point(($clientW - $pad - 100), 75)
+    $includeAllButton.Size = New-Object Drawing.Size($buttonW, (ds 26))
+    $includeAllButton.Location = New-Object Drawing.Point(($clientW - $pad - $buttonW), $rowY)
     $includeAllButton.FlatStyle = [Windows.Forms.FlatStyle]::Flat
     $includeAllButton.BackColor = [Drawing.Color]::FromArgb(231, 236, 244)
     $includeAllButton.Anchor = [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Right
 
     # Capacity bar: shows how much of the sync "budget" the currently INCLUDED libraries consume.
     $capPanel = New-Object Windows.Forms.Panel
-    $capPanel.Location = New-Object Drawing.Point($pad, 112)
-    $capPanel.Size = New-Object Drawing.Size($contentWidth, 44)
+    $capPanel.Location = New-Object Drawing.Point($pad, (ds 112))
+    $capPanel.Size = New-Object Drawing.Size($contentWidth, (ds 44))
     $capPanel.BackColor = [Drawing.Color]::FromArgb(246, 248, 252)
     $capPanel.Anchor = $rightAnchor
 
     $capLabel = New-Object Windows.Forms.Label
     $capLabel.Location = New-Object Drawing.Point(0, 0)
-    $capLabel.Size = New-Object Drawing.Size($contentWidth, 18)
+    $capLabel.Size = New-Object Drawing.Size($contentWidth, (ds 18))
     $capLabel.Font = New-Object Drawing.Font("Segoe UI", 9, [Drawing.FontStyle]::Bold)
     $capLabel.TextAlign = [Drawing.ContentAlignment]::MiddleLeft
     $capLabel.Anchor = $rightAnchor
 
     $capTrack = New-Object Windows.Forms.Panel
-    $capTrack.Location = New-Object Drawing.Point(0, 22)
-    $capTrack.Size = New-Object Drawing.Size($contentWidth, 14)
+    $capTrack.Location = New-Object Drawing.Point(0, (ds 22))
+    $capTrack.Size = New-Object Drawing.Size($contentWidth, (ds 14))
     $capTrack.BackColor = [Drawing.Color]::FromArgb(225, 230, 238)
     $capTrack.Anchor = $rightAnchor
 
     $capFill = New-Object Windows.Forms.Panel
     $capFill.Location = New-Object Drawing.Point(0, 0)
-    $capFill.Size = New-Object Drawing.Size(0, 14)
+    $capFill.Size = New-Object Drawing.Size(0, (ds 14))
     $capFill.BackColor = [Drawing.Color]::FromArgb(31, 122, 49)
     $capTrack.Controls.Add($capFill)
 
     $capPanel.Controls.Add($capLabel)
     $capPanel.Controls.Add($capTrack)
 
-    $listTop = 164
+    $listTop = ds 164
     $listView = New-Object Windows.Forms.ListView
     $listView.Location = New-Object Drawing.Point($pad, $listTop)
-    $listView.Size = New-Object Drawing.Size($contentWidth, ($clientH - $listTop - $footerH - 8))
+    $listView.Size = New-Object Drawing.Size($contentWidth, ($clientH - $listTop - $footerH - (ds 8)))
     $listView.View = [Windows.Forms.View]::Details
     $listView.FullRowSelect = $true
     $listView.GridLines = $true
@@ -1744,13 +1757,14 @@ function Show-ManageShortcutsDialog {
     $listView.ShowItemToolTips = $true
     $listView.Font = New-Object Drawing.Font("Segoe UI", 9)
     $listView.Anchor = [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Bottom -bor [Windows.Forms.AnchorStyles]::Left -bor [Windows.Forms.AnchorStyles]::Right
-    $siteColumnWidth = [Math]::Max(200, $contentWidth - 584 - 22)
-    [void]$listView.Columns.Add("Exclude", 64)
-    [void]$listView.Columns.Add("Library", 180)
+    $fixedColumnsWidth = (ds 64) + (ds 180) + (ds 100) + (ds 90) + (ds 150)
+    $siteColumnWidth = [Math]::Max((ds 200), $contentWidth - $fixedColumnsWidth - (ds 22))
+    [void]$listView.Columns.Add("Exclude", (ds 64))
+    [void]$listView.Columns.Add("Library", (ds 180))
     [void]$listView.Columns.Add("Site", $siteColumnWidth)
-    [void]$listView.Columns.Add("Items", 100, [Windows.Forms.HorizontalAlignment]::Right)
-    [void]$listView.Columns.Add("Status", 90)
-    [void]$listView.Columns.Add("Reason", 150)
+    [void]$listView.Columns.Add("Items", (ds 100), [Windows.Forms.HorizontalAlignment]::Right)
+    [void]$listView.Columns.Add("Status", (ds 90))
+    [void]$listView.Columns.Add("Reason", (ds 150))
 
     # Suppress capacity recompute while we bulk-repopulate the list (filter/sort), then recompute once.
     $script:mgSuspend = $false
@@ -1882,11 +1896,11 @@ function Show-ManageShortcutsDialog {
     $footerPanel.BackColor = [Drawing.Color]::FromArgb(241, 245, 251)
     $footerPanel.Anchor = [Windows.Forms.AnchorStyles]::Bottom -bor [Windows.Forms.AnchorStyles]::Left -bor [Windows.Forms.AnchorStyles]::Right
 
-    $buttonTop = [int](($footerH - 30) / 2)
+    $buttonTop = [int](($footerH - (ds 30)) / 2)
     $saveButton = New-Object Windows.Forms.Button
     $saveButton.Text = "Save"
-    $saveButton.Location = New-Object Drawing.Point(($clientW - $pad - 176), $buttonTop)
-    $saveButton.Size = New-Object Drawing.Size(80, 30)
+    $saveButton.Location = New-Object Drawing.Point(($clientW - $pad - (ds 176)), $buttonTop)
+    $saveButton.Size = New-Object Drawing.Size((ds 80), (ds 30))
     $saveButton.FlatStyle = [Windows.Forms.FlatStyle]::Flat
     $saveButton.BackColor = [Drawing.Color]::FromArgb(0, 163, 255)
     $saveButton.ForeColor = [Drawing.Color]::White
@@ -1896,8 +1910,8 @@ function Show-ManageShortcutsDialog {
 
     $cancelButton = New-Object Windows.Forms.Button
     $cancelButton.Text = "Cancel"
-    $cancelButton.Location = New-Object Drawing.Point(($clientW - $pad - 88), $buttonTop)
-    $cancelButton.Size = New-Object Drawing.Size(80, 30)
+    $cancelButton.Location = New-Object Drawing.Point(($clientW - $pad - (ds 88)), $buttonTop)
+    $cancelButton.Size = New-Object Drawing.Size((ds 80), (ds 30))
     $cancelButton.FlatStyle = [Windows.Forms.FlatStyle]::Flat
     $cancelButton.BackColor = [Drawing.Color]::FromArgb(231, 236, 244)
     $cancelButton.ForeColor = [Drawing.Color]::FromArgb(33, 37, 43)
@@ -1919,6 +1933,16 @@ function Show-ManageShortcutsDialog {
     $form.Controls.Add($listView)
     $form.Controls.Add($footerPanel)
     $footerPanel.BringToFront()
+
+    $form.Add_Shown({
+        try {
+            $rowHeight = $filterBox.Height
+            foreach($rowControl in @($filterLabel, $excludeAllButton, $includeAllButton)) {
+                $rowControl.Height = $rowHeight
+                $rowControl.Top = $filterBox.Top
+            }
+        } catch {}
+    })
 
     try {
         $dialogResult = $form.ShowDialog()
