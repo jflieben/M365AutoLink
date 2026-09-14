@@ -24,6 +24,14 @@
      
         see https://github.com/jflieben/M365AutoLink/blob/main/README.md#option-2--your-own-app-registration
 
+.SILENT WINDOWS SIGN-IN (WAM)
+    On most managed devices WAM brokers the app's own client id without any extra setup; if a
+    tenant does not, add the public-client broker redirect URI to the app registration to enable it:
+
+        ms-appx-web://microsoft.aad.brokerplugin/<ClientID>
+
+    Whenever WAM fails (no PRT, non-Windows, etc etc) it falls back to the browser authorization
+
 .NOTES
     Author: Jos Lieben
     Updates/Git: https://github.com/jflieben/M365AutoLink
@@ -36,7 +44,7 @@
 #>
 
 ##########START CONFIGURATION#############################
-$ScriptVersion = "1.3.1"
+$ScriptVersion = "1.4.0"
 $FolderName = "AutoLink" #this is the folder created in onedrive to house all links this tool will create. Feel free to change this to something localized, the tool will auto-create it if it does not exist
 #WARNING: Any pre-existing folders in above folder will be deleted!
 $CloudType = "global" #global, usgov, usdod, china
@@ -1274,90 +1282,6 @@ function Invoke-Uninstall {
     Write-Log "=== M365AutoLink Uninstall complete ===" "SUCCESS"
 }
 
-function Set-RoundedFormRegion {
-    param(
-        [Parameter(Mandatory = $true)]$Form,
-        [int]$Radius = 10
-    )
-
-    if($Radius -lt 2) { $Radius = 2 }
-
-    $applyRegion = {
-        param($targetForm, $cornerRadius)
-
-        if(-not $targetForm -or $targetForm.IsDisposed) { return }
-        if($targetForm.ClientSize.Width -lt 4 -or $targetForm.ClientSize.Height -lt 4) { return }
-
-        $path = New-Object Drawing.Drawing2D.GraphicsPath
-        $diameter = $cornerRadius * 2
-        $width = $targetForm.ClientSize.Width
-        $height = $targetForm.ClientSize.Height
-
-        $path.AddArc(0, 0, $diameter, $diameter, 180, 90)
-        $path.AddArc($width - $diameter, 0, $diameter, $diameter, 270, 90)
-        $path.AddArc($width - $diameter, $height - $diameter, $diameter, $diameter, 0, 90)
-        $path.AddArc(0, $height - $diameter, $diameter, $diameter, 90, 90)
-        $path.CloseFigure()
-
-        if($targetForm.Region) {
-            try { $targetForm.Region.Dispose() } catch {}
-        }
-        $targetForm.Region = New-Object Drawing.Region($path)
-        $path.Dispose()
-    }
-
-    & $applyRegion $Form $Radius
-}
-
-function Enable-FormDrag {
-    param(
-        [Parameter(Mandatory = $true)]$Form,
-        [Parameter(Mandatory = $true)][array]$DragControls
-    )
-
-    try {
-        if(-not ("Win32.NativeMethods" -as [type])) {
-            Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-
-namespace Win32 {
-    public static class NativeMethods {
-        [DllImport("user32.dll")]
-        public static extern bool ReleaseCapture();
-
-        [DllImport("user32.dll")]
-        public static extern IntPtr SendMessage(IntPtr hWnd, int Msg, int wParam, int lParam);
-    }
-}
-"@ -Language CSharp -ErrorAction Stop
-        }
-    } catch {
-        Write-Log "Enable-FormDrag initialization failed: $($_.Exception.Message)" "WARN"
-        return
-    }
-
-    foreach($control in $DragControls) {
-        if($null -eq $control) { continue }
-        $control.Add_MouseDown({
-            param($sender, $e)
-            if($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
-                # resolve the form from the sender at event time; the captured $Form is out of scope
-                # once Enable-FormDrag has returned, so dragging would otherwise fail silently.
-                $topLevelForm = $null
-                try { $topLevelForm = $sender.FindForm() } catch {}
-                if($null -eq $topLevelForm){
-                    try { $topLevelForm = ($sender -as [System.Windows.Forms.Control]).TopLevelControl } catch {}
-                }
-                if($null -ne $topLevelForm){
-                    [void][Win32.NativeMethods]::ReleaseCapture()
-                    [void][Win32.NativeMethods]::SendMessage($topLevelForm.Handle, 0xA1, 0x2, 0)
-                }
-            }
-        })
-    }
-}
-
 function Invoke-GraphRaw {
     param(
         [Parameter(Mandatory = $true)][ValidateSet('GET','POST','PATCH','DELETE','PUT')][string]$Method,
@@ -1407,21 +1331,7 @@ function ConvertTo-UserConfig {
     $defaultConfig = Get-DefaultUserConfig
     if($null -eq $ConfigObject) { return $defaultConfig }
 
-    $config = @{
-        version = 1
-        preferences = @{
-            excludedSiteUrls = @()
-            excludedLibraryKeys = @()
-        }
-        diagnostics = @{
-            lastAlreadyExisting = @()
-            totalItemCount = 0
-            lastDesiredCount = 0
-        }
-        cache = @{
-            staticExcludedLibraries = @()
-        }
-    }
+    $config = Get-DefaultUserConfig
 
     try { if($ConfigObject.version) { $config.version = [int]$ConfigObject.version } } catch {}
 
@@ -2120,13 +2030,181 @@ function Invoke-RefreshTokenExchange {
     return $response
 }
 
+# The WinRT broker helper (idea by dirkjanm/askWAM).
+$script:WamHelperCSharp = @'
+using System;
+using System.Threading;
+using Windows.Foundation;
+using Windows.Security.Authentication.Web.Core;
+using Windows.Security.Credentials;
+
+public static class M365AutoLinkWam
+{
+    public static string GetToken(string clientId, string resource, string authority, int timeoutMs, out string status)
+    {
+        status = "";
+        var provider = WaitOp(WebAuthenticationCoreManager.FindAccountProviderAsync("https://login.microsoft.com", authority), timeoutMs);
+        if (provider == null) { status = "no_provider"; return null; }
+
+        string scope = resource.TrimEnd('/') + "/.default openid offline_access profile";
+        var request = new WebTokenRequest(provider, scope, clientId, WebTokenRequestPromptType.Default);
+        request.Properties["wam_compat"] = "2.0";
+
+        var result = WaitOp(WebAuthenticationCoreManager.GetTokenSilentlyAsync(request), timeoutMs);
+        if (result == null) { status = "timeout"; return null; }
+        status = result.ResponseStatus.ToString();
+        if (result.ResponseStatus != WebTokenRequestStatus.Success)
+        {
+            try { if (result.ResponseError != null) status += string.Format(" 0x{0:X8}: {1}", result.ResponseError.ErrorCode, result.ResponseError.ErrorMessage); } catch { }
+            return null;
+        }
+        return result.ResponseData[0].Token;
+    }
+
+    private static T WaitOp<T>(IAsyncOperation<T> op, int timeoutMs)
+    {
+        using (var done = new ManualResetEventSlim(false))
+        {
+            T value = default(T);
+            op.Completed = (o, s) => { try { if (s == AsyncStatus.Completed) value = o.GetResults(); } catch { } done.Set(); };
+            if (!done.Wait(timeoutMs)) { try { op.Cancel(); } catch { } return default(T); }
+            return value;
+        }
+    }
+}
+'@
+
+function Initialize-WamHelperType {
+    if('M365AutoLinkWam' -as [type]){ return $true }
+    try {
+        $winMeta    = Join-Path $env:WINDIR 'System32\WinMetadata'
+        $sysRuntime = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\System.Runtime.dll'
+        if(-not (Test-Path $sysRuntime)){ $sysRuntime = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\System.Runtime.dll' }
+
+        $codeProvider = New-Object Microsoft.CSharp.CSharpCodeProvider
+        $compilerParams = New-Object System.CodeDom.Compiler.CompilerParameters
+        $compilerParams.GenerateInMemory = $true
+        foreach($ref in @(
+            'System.dll', 'System.Core.dll', $sysRuntime,
+            'System.Runtime.WindowsRuntime.dll', 'System.Runtime.InteropServices.WindowsRuntime.dll',
+            (Join-Path $winMeta 'Windows.Foundation.winmd'),
+            (Join-Path $winMeta 'Windows.Security.winmd')
+        )){ [void]$compilerParams.ReferencedAssemblies.Add($ref) }
+
+        $compile = $codeProvider.CompileAssemblyFromSource($compilerParams, $script:WamHelperCSharp)
+        if($compile.Errors.HasErrors){
+            Write-Verbose ("WAM helper compile failed: " + ((@($compile.Errors) | ForEach-Object { $_.ErrorText }) -join '; '))
+            return $false
+        }
+        return $true
+    } catch {
+        Write-Verbose "WAM helper unavailable on this host: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Get-WamTokenViaWindowsPowerShell {
+    param([Parameter(Mandatory = $true)][string]$Resource)
+
+    $psExe = Get-PowerShellExecutablePath
+    if([string]::IsNullOrWhiteSpace($psExe) -or -not (Test-Path -LiteralPath $psExe)){
+        $global:octo.WamUnavailable = $true
+        Write-Verbose "WAM bridge unavailable: Windows PowerShell (powershell.exe) was not found"
+        return $null
+    }
+
+    $srcB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($script:WamHelperCSharp))
+    $worker = @'
+param([string]$ClientId, [string]$Resource)
+$ErrorActionPreference = 'SilentlyContinue'
+try {
+    $src = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__SRCB64__'))
+    $winMeta    = Join-Path $env:WINDIR 'System32\WinMetadata'
+    $sysRuntime = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\System.Runtime.dll'
+    if(-not (Test-Path $sysRuntime)){ $sysRuntime = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\System.Runtime.dll' }
+    $cp = New-Object System.CodeDom.Compiler.CompilerParameters
+    $cp.GenerateInMemory = $true
+    foreach($ref in @('System.dll','System.Core.dll',$sysRuntime,'System.Runtime.WindowsRuntime.dll','System.Runtime.InteropServices.WindowsRuntime.dll',(Join-Path $winMeta 'Windows.Foundation.winmd'),(Join-Path $winMeta 'Windows.Security.winmd'))){ [void]$cp.ReferencedAssemblies.Add($ref) }
+    $compile = (New-Object Microsoft.CSharp.CSharpCodeProvider).CompileAssemblyFromSource($cp, $src)
+    if($compile.Errors.HasErrors){ exit 2 }
+    $status = ""
+    $token = [M365AutoLinkWam]::GetToken($ClientId, $Resource, "organizations", 30000, [ref]$status)
+    if($token){ [Console]::Out.Write($token) }
+} catch { exit 3 }
+'@
+    $worker = $worker.Replace('__SRCB64__', $srcB64)
+
+    $tempScript = Join-Path ([System.IO.Path]::GetTempPath()) ("M365AutoLinkWam_{0}.ps1" -f ([guid]::NewGuid().ToString('N')))
+    try {
+        Set-Content -LiteralPath $tempScript -Value $worker -Encoding UTF8 -ErrorAction Stop
+        $raw = & $psExe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $tempScript $global:octo.LCClientId $Resource 2>$null
+        $raw = (@($raw) -join "`n")
+        $match = [regex]::Match($raw, 'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+')
+        if($match.Success){ return $match.Value }
+        Write-Verbose "WAM bridge did not return a token for '$Resource'"
+        return $null
+    } catch {
+        Write-Verbose "WAM bridge failed: $($_.Exception.Message)"
+        return $null
+    } finally {
+        Remove-Item -LiteralPath $tempScript -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-WAMToken {
+    param([Parameter(Mandatory = $true)][string]$Resource)
+
+    if($env:OS -ne 'Windows_NT'){ return $null }
+    if($CloudType -ne 'global'){ return $null }
+    if($global:octo.WamUnavailable){ return $null }
+
+    $token = $null
+    if($PSVersionTable.PSEdition -eq 'Core'){
+        $token = Get-WamTokenViaWindowsPowerShell -Resource $Resource
+    } else {
+        if(-not (Initialize-WamHelperType)){
+            $global:octo.WamUnavailable = $true
+            return $null
+        }
+        try {
+            $status = ""
+            $token = [M365AutoLinkWam]::GetToken($global:octo.LCClientId, $Resource, "organizations", 30000, [ref]$status)
+            if([string]::IsNullOrWhiteSpace($token)){
+                Write-Verbose "WAM did not grant a silent token for '$Resource' (status: $status)"
+                $token = $null
+            }
+        } catch {
+            Write-Verbose "WAM silent authentication failed: $($_.Exception.Message)"
+            $token = $null
+        }
+    }
+
+    if([string]::IsNullOrWhiteSpace($token)){ return $null }
+
+    $expiresInSeconds = 3300
+    try {
+        $parts = $token.Split('.')
+        if($parts.Count -ge 2){
+            $payload = $parts[1].Replace('-','+').Replace('_','/')
+            switch($payload.Length % 4){ 2 { $payload += '==' } 3 { $payload += '=' } }
+            $claims = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) | ConvertFrom-Json
+            if($claims.exp){
+                $delta = ([DateTimeOffset]::FromUnixTimeSeconds([long]$claims.exp).UtcDateTime - (Get-Date).ToUniversalTime()).TotalSeconds
+                if($delta -gt 60){ $expiresInSeconds = [int]$delta }
+            }
+        }
+    } catch {}
+
+    Write-Verbose "WAM silently issued an access token for '$Resource' (no browser needed)"
+    return @{ accessToken = $token; expiresInSeconds = $expiresInSeconds }
+}
+
 function get-AccessToken{
     Param(
         [Parameter(Mandatory=$true)]$resource,
         [Switch]$returnHeader
     )
 
-    # Try to load refresh token from disk (once per process)
     if(!$global:octo.LCRefreshToken -and (Test-Path $global:octo.TokenCachePath)){
         try {
             $global:octo.LCRefreshToken = (Import-Clixml $global:octo.TokenCachePath).GetNetworkCredential().Password
@@ -2137,16 +2215,21 @@ function get-AccessToken{
         }
     }
 
-    # hot path: serve a still-valid cached access token WITHOUT any network/DPAPI/disk work.
-    # Renew 5 minutes ahead of the real expiry reported by Entra.
     $cached = $global:octo.LCCachedTokens[$resource]
     if($cached -and $cached.accessToken -and $cached.expiresOn -gt (Get-Date).AddMinutes(5)){
         if($returnHeader){ return @{ "Authorization" = "Bearer $($cached.accessToken)" } }
         return $cached.accessToken
     }
+    $emitToken = {
+        param($accessToken, $expiresOn)
+        $global:octo.LCCachedTokens[$resource] = @{ accessToken = $accessToken; expiresOn = $expiresOn }
+        if($returnHeader){ return @{ "Authorization" = "Bearer $accessToken" } }
+        return $accessToken
+    }
 
-    # No usable cached access token: make sure we have a refresh token, then exchange it.
     if(!$global:octo.LCRefreshToken){
+        $wam = Get-WAMToken -Resource $resource
+        if($wam){ return (& $emitToken $wam.accessToken ((Get-Date).AddSeconds($wam.expiresInSeconds))) }
         $global:octo.LCRefreshToken = Get-BrowserAuthorizationCode
     }
 
@@ -2154,10 +2237,12 @@ function get-AccessToken{
     try {
         $response = Invoke-RefreshTokenExchange -Resource $resource
     } catch {
-        # Refresh token invalid/expired/revoked -> drop it and fall back to an interactive sign-in once.
+        # Refresh token invalid/expired/revoked -> drop it, retry WAM once, then fall back to browser.
         Write-Warning "Cached refresh token invalid or expired, will re-authenticate..."
         $global:octo.LCRefreshToken = $Null
         Remove-Item $global:octo.TokenCachePath -ErrorAction SilentlyContinue
+        $wam = Get-WAMToken -Resource $resource
+        if($wam){ return (& $emitToken $wam.accessToken ((Get-Date).AddSeconds($wam.expiresInSeconds))) }
         $global:octo.LCRefreshToken = Get-BrowserAuthorizationCode
         $response = Invoke-RefreshTokenExchange -Resource $resource
     }
@@ -2426,188 +2511,109 @@ function New-GraphQuery {
         return $headers
     }
 
+    function Invoke-RequestOnce {
+        param([Parameter(Mandatory = $true)][string]$RequestUri, [switch]$IncludeBody)
+
+        $attempts = 0
+        while($true) {
+            $attempts++
+            try {
+                $headers = get-resourceHeaders -resource $resource
+                if($IncludeBody){
+                    return (Invoke-RestMethod -Uri $RequestUri -Method $Method -Headers $headers -Body $Body -ContentType $ContentType -Verbose:$False -ErrorAction Stop -UserAgent "ISV|LiebenConsultancy|M365AutoLink|1.0")
+                }
+                return (Invoke-RestMethod -Uri $RequestUri -Method $Method -Headers $headers -ContentType $ContentType -Verbose:$False -ErrorAction Stop -UserAgent "ISV|LiebenConsultancy|M365AutoLink|1.0")
+            } catch {
+                $statusCode = $null
+                try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+                $is429 = $statusCode -eq 429 -or $_.Exception.Message -like "*429*"
+                $isTransientNetwork = $_.Exception.Message -like "*No such host is known*" -or $_.Exception.Message -like "*name or service not known*" -or $_.Exception.Message -like "*network is unreachable*" -or $_.Exception.Message -like "*connection was forcibly closed*" -or $_.Exception.Message -like "*An existing connection was forcibly closed*"
+
+                $retryable = ($is429 -or $isTransientNetwork) -and ($null -eq $statusCode -or $is429)
+                if(-not $retryable -or $attempts -ge $MaxAttempts){
+                    Write-RequestFailure -ErrorRecord $_ -RequestUri $RequestUri
+                    throw $_
+                }
+
+                $delay = 0
+                if($is429){
+                    try {
+                        $retryAfter = $_.Exception.Response.Headers.GetValues("Retry-After")
+                        if($retryAfter -and $retryAfter.Count -gt 0 -and $retryAfter[0] -match '^\d+$'){ $delay = [int]$retryAfter[0] }
+                    } catch {}
+                    if($delay -le 0){ $delay = [math]::Min(15, 2 * [math]::Max(1, $attempts)) }
+                }
+                if($delay -le 0 -and $isTransientNetwork){ $delay = [math]::Min(5, $attempts) }
+                Write-Log "Transient error on attempt $attempts/$MaxAttempts, retrying in $($delay)s: $($_.Exception.Message)" -Level "WARN"
+                Start-Sleep -Seconds (1 + $delay)
+            }
+        }
+    }
+
     $nextURL = $uri
 
     if($Method -in ('POST', 'PATCH', 'PUT')){
         try {
-            $attempts = 0
-            while ($attempts -lt $MaxAttempts) {
-                $attempts++
-                try {
-                    $headers = get-resourceHeaders -resource $resource
-                    $Data = $Null; $Data = (Invoke-RestMethod -Uri $nextURL -Method $Method -Headers $headers -Body $Body -ContentType $ContentType -Verbose:$False -ErrorAction Stop -UserAgent "ISV|LiebenConsultancy|M365AutoLink|1.0")
-                    $attempts = $MaxAttempts
-                }catch {
-                    $statusCode = $null
-                    try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
-                    $is429 = $statusCode -eq 429 -or $_.Exception.Message -like "*429*"
-                    $isTransientNetwork = $_.Exception.Message -like "*No such host is known*" -or $_.Exception.Message -like "*name or service not known*" -or $_.Exception.Message -like "*network is unreachable*" -or $_.Exception.Message -like "*connection was forcibly closed*" -or $_.Exception.Message -like "*An existing connection was forcibly closed*"
-
-                    # Fail fast on all HTTP errors except 429 (including 500/403/404).
-                    if($null -ne $statusCode -and -not $is429){
-                        Write-RequestFailure -ErrorRecord $_ -RequestUri $nextURL
-                        $nextUrl = $Null
-                        throw $_
-                    }
-
-                    # Retry only throttling or transport-level transient failures.
-                    if(-not $is429 -and -not $isTransientNetwork){
-                        Write-RequestFailure -ErrorRecord $_ -RequestUri $nextURL
-                        $nextUrl = $Null
-                        throw $_
-                    }
-
-                    if ($attempts -ge $MaxAttempts) {
-                        Write-RequestFailure -ErrorRecord $_ -RequestUri $nextURL
-                        Throw $_
-                    }
-
-                    $delay = 0
-                    if ($is429){
-                        try {
-                            $retryAfter = $_.Exception.Response.Headers.GetValues("Retry-After")
-                            if ($retryAfter -and $retryAfter.Count -gt 0) {
-                                $retryAfterValue = $retryAfter[0]
-                                if ($retryAfterValue -match '^\d+$') {
-                                    $delay = [int]$retryAfterValue
-                                }
-                            }
-                        }catch {}
-                        if($delay -le 0){
-                            $delay = [math]::Min(15, 2 * [math]::Max(1, $attempts))
-                        }
-                    }
-                    if($delay -le 0 -and $isTransientNetwork){
-                        $delay = [math]::Min(5, $attempts)
-                    }
-                    Write-Log "Transient error on attempt $attempts/$MaxAttempts, retrying in $($delay)s: $($_.Exception.Message)" -Level "WARN"
-                    Start-Sleep -Seconds (1 + $delay)
-                }     
-            }
-        }catch {
-            $Message = ($_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction SilentlyContinue).error.message
-            if ($null -eq $Message) { $Message = $($_.Exception.Message) }
+            return (Invoke-RequestOnce -RequestUri $nextURL -IncludeBody)
+        } catch {
             # This branch throws a string, so the HTTP status has to be carried in the message itself.
+            $Message = ($_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction SilentlyContinue).error.message
+            if($null -eq $Message) { $Message = $($_.Exception.Message) }
             $failedStatusCode = Get-HttpStatusCode -ErrorRecord $_
-            if ($failedStatusCode) { $Message = "HTTP $failedStatusCode - $Message" }
+            if($failedStatusCode) { $Message = "HTTP $failedStatusCode - $Message" }
             throw $Message
         }
-        return $Data
-    }else{
-        $ReturnedData = @()
-        $totalResults = 0     
-           
-        while($Null -ne $nextUrl -and $nextUrl.indexOf("http") -eq 0){
-            try {
-                $attempts = 0
-                while ($attempts -lt $MaxAttempts) {
-                    $attempts ++
-                    try {
-                        $headers = get-resourceHeaders -resource $resource
-                        $Data = $Null; $Data = (Invoke-RestMethod -Uri $nextURL -Method $Method -Headers $headers -ContentType $ContentType -Verbose:$False -ErrorAction Stop -UserAgent "ISV|LiebenConsultancy|M365AutoLink|1.0")
-                        $attempts = $MaxAttempts
-                    }catch {                 
-                        $statusCode = $null
-                        try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
-                        $is429 = $statusCode -eq 429 -or $_.Exception.Message -like "*429*"
-                        $isTransientNetwork = $_.Exception.Message -like "*No such host is known*" -or $_.Exception.Message -like "*name or service not known*" -or $_.Exception.Message -like "*network is unreachable*" -or $_.Exception.Message -like "*connection was forcibly closed*" -or $_.Exception.Message -like "*An existing connection was forcibly closed*"
+    }
 
-                        # Fail fast on all HTTP errors except 429 (including 500/403/404).
-                        if($null -ne $statusCode -and -not $is429){
-                            Write-RequestFailure -ErrorRecord $_ -RequestUri $nextURL
-                            $nextUrl = $Null
-                            throw $_
-                        }
+    $ReturnedData = @()
+    while($Null -ne $nextUrl -and $nextUrl.indexOf("http") -eq 0){
+        $Data = Invoke-RequestOnce -RequestUri $nextURL
 
-                        # Retry only throttling or transport-level transient failures.
-                        if(-not $is429 -and -not $isTransientNetwork){
-                            Write-RequestFailure -ErrorRecord $_ -RequestUri $nextURL
-                            $nextUrl = $Null
-                            throw $_
-                        }
-
-                        if ($attempts -ge $MaxAttempts) {
-                            Write-RequestFailure -ErrorRecord $_ -RequestUri $nextURL
-                            $nextURL = $null
-                            Throw $_
-                        }
-                       
-                        $delay = 0
-                        if ($is429){
-                            try {
-                                $retryAfter = $_.Exception.Response.Headers.GetValues("Retry-After")
-                                if ($retryAfter -and $retryAfter.Count -gt 0) {
-                                    $retryAfterValue = $retryAfter[0]
-                                    if ($retryAfterValue -match '^\d+$') {
-                                        $delay = [int]$retryAfterValue
-                                    }
-                                }
-                            }catch {}
-                            if($delay -le 0){
-                                $delay = [math]::Min(15, 2 * [math]::Max(1, $attempts))
-                            }
-                        }
-                        if($delay -le 0 -and $isTransientNetwork){
-                            $delay = [math]::Min(5, $attempts)
-                        }
-                        Write-Log "Transient error on attempt $attempts/$MaxAttempts, retrying in $($delay)s: $($_.Exception.Message)" -Level "WARN"
-                        Start-Sleep -Seconds (1 + $delay)
+        if($resource -like "*sharepoint.com*"){
+            if($Data -and $Data.PSObject.TypeNames -notcontains "System.Management.Automation.PSCustomObject"){
+                if($PSVersionTable.PSVersion.Major -ge 6){
+                    $Data = ($Data | Out-String | ConvertFrom-Json -AsHashtable)
+                } else {
+                    $Null = Add-Type -AssemblyName System.Web.Extensions
+                    $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+                    $serializer.MaxJsonLength = 2147483647
+                    $jsonContent = $serializer.DeserializeObject($Data)
+                    if($jsonContent -is [System.Collections.IDictionary]) {
+                        $Data = New-Object Hashtable $jsonContent
+                    } else {
+                        $Data = $jsonContent
                     }
                 }
-
-                if($resource -like "*sharepoint.com*"){
-                    if($Data -and $Data.PSObject.TypeNames -notcontains "System.Management.Automation.PSCustomObject"){
-                        if($PSVersionTable.PSVersion.Major -ge 6){
-                            $Data = ($Data | Out-String | ConvertFrom-Json -AsHashtable)
-                        } else {
-                            $Null = Add-Type -AssemblyName System.Web.Extensions
-                            $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
-                            $serializer.MaxJsonLength = 2147483647
-                            $jsonContent = $serializer.DeserializeObject($Data)
-                            if ($jsonContent -is [System.Collections.IDictionary]) {
-                                $Data = New-Object Hashtable $jsonContent
-                            } else {
-                                $Data = $jsonContent
-                            }
-                        }
-                    }
-                }
-
-                $pageItems = $null
-                if($Data.psobject.properties.name -icontains 'value' -or ($Data.PSObject.BaseObject -is [hashtable] -and $Data.Keys -icontains 'value')){ # Added check for hashtable
-                    $pageItems = $Data.value
-                }else{
-                    $pageItems = $Data
-                }
-
-                if ($null -ne $pageItems) {
-                    $pageItemCount = @($pageItems).Count
-                    $totalResults += $pageItemCount
-
-                    if ($pageItemCount -eq 1 -and -not ($pageItems -is [array])) {
-                        $ReturnedData += @($pageItems)
-                    } elseif ($pageItemCount -gt 0) {
-                            $ReturnedData += $pageItems
-                    }
-                }     
-                
-                if($Data.'@odata.nextLink'){
-                    $nextURL = $Data.'@odata.nextLink'  
-                }elseif($Data.'odata.nextLink'){
-                    $nextURL = $Data.'odata.nextLink'                      
-                }elseif($Data.nextLink){
-                    $nextURL = $Data.nextLink
-                }else{
-                    $nextURL = $null
-                }            
-            }catch {
-                throw $_
             }
         }
 
-        if ($ReturnedData -and !$ReturnedData.value -and $ReturnedData.PSObject.Properties["value"]) { return $null }
-        return $ReturnedData
+        if($Data.psobject.properties.name -icontains 'value' -or ($Data.PSObject.BaseObject -is [hashtable] -and $Data.Keys -icontains 'value')){
+            $pageItems = $Data.value
+        }else{
+            $pageItems = $Data
+        }
+
+        if($null -ne $pageItems) {
+            if(@($pageItems).Count -eq 1 -and -not ($pageItems -is [array])) {
+                $ReturnedData += @($pageItems)
+            } elseif(@($pageItems).Count -gt 0) {
+                $ReturnedData += $pageItems
+            }
+        }
+
+        if($Data.'@odata.nextLink'){
+            $nextURL = $Data.'@odata.nextLink'
+        }elseif($Data.'odata.nextLink'){
+            $nextURL = $Data.'odata.nextLink'
+        }elseif($Data.nextLink){
+            $nextURL = $Data.nextLink
+        }else{
+            $nextURL = $null
+        }
     }
+
+    if ($ReturnedData -and !$ReturnedData.value -and $ReturnedData.PSObject.Properties["value"]) { return $null }
+    return $ReturnedData
 }
 
 function Write-Log {

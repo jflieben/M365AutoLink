@@ -2,6 +2,15 @@
 
 All notable changes to the delegated (per-user) edition of **M365AutoLink** (`M365AutoLink.ps1`) are documented here.
 
+## [1.4.0]
+
+### Security & authentication
+- **Silent Windows sign-in via WAM.** On Entra devices the script now tries the Windows Web Account Manager (WAM) before ever opening a browser, reusing the device Primary Refresh Token. The approach mirrors [dirkjanm/askWAM](https://github.com/dirkjanm/askWAM): a `WebAuthenticationCoreManager` scope-mode `WebTokenRequest` (`wam_compat=2.0`) resolved through `GetTokenSilentlyAsync`.
+- **Safe, transparent fallback.** WAM is attempted on the global cloud. If WAM is unavailable, the device has no PRT, or the request cannot be brokered, the script silently falls back to the existing refresh-token / browser authorization-code flow.
+
+## [1.3.1]
+- **Logging** Better logging to help troubleshoot shortcut retrieval debugging
+
 ## [1.3.0]
 
 ### Security & authentication
