@@ -36,7 +36,7 @@
 #>
 
 ##########START CONFIGURATION#############################
-$ScriptVersion = "1.3.0"
+$ScriptVersion = "1.3.1"
 $FolderName = "AutoLink" #this is the folder created in onedrive to house all links this tool will create. Feel free to change this to something localized, the tool will auto-create it if it does not exist
 #WARNING: Any pre-existing folders in above folder will be deleted!
 $CloudType = "global" #global, usgov, usdod, china
@@ -355,6 +355,63 @@ function Get-HttpStatusCode {
     if($null -eq $ErrorRecord) { return $null }
     try { return [int]$ErrorRecord.Exception.Response.StatusCode } catch {}
     return $null
+}
+
+function Get-HttpErrorDetail {
+    # Status, headers and body of a failed web request, formatted for the log.
+    param($ErrorRecord, [string]$Context = "")
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    if($Context) { $lines.Add("  request : $Context") }
+    if($null -eq $ErrorRecord) { return ($lines -join [Environment]::NewLine) }
+    try { $lines.Add("  message : $([string]$ErrorRecord.Exception.Message)") } catch {}
+
+    $response = $null
+    try { $response = $ErrorRecord.Exception.Response } catch {}
+    if($null -ne $response) {
+        # StatusDescription exists on 5.1, ReasonPhrase on 7, the other one is empty.
+        try { $lines.Add("  status  : $([int]$response.StatusCode) $([string]$response.StatusDescription)$([string]$response.ReasonPhrase)") } catch {}
+
+        # 5.1 exposes a WebHeaderCollection (AllKeys), 7 an HttpResponseHeaders (key/value pairs).
+        $headers = [ordered]@{}
+        try {
+            if($response.Headers.AllKeys) {
+                foreach($key in $response.Headers.AllKeys) { $headers[[string]$key] = [string]$response.Headers[$key] }
+            } else {
+                foreach($header in $response.Headers) { $headers[[string]$header.Key] = (@($header.Value) -join ", ") }
+            }
+        } catch {}
+        foreach($key in $headers.Keys) {
+            # Cookies can carry session material, so log their presence but not their value.
+            $value = if($key -match 'cookie|authorization') { "<redacted>" } else { $headers[$key] }
+            $lines.Add("  header  : $($key): $value")
+        }
+    }
+
+    $body = ""
+    try { $body = [string]$ErrorRecord.ErrorDetails.Message } catch {}
+    if(-not $body -and $null -ne $response) {
+        # 5.1 often leaves ErrorDetails empty while the raw stream still holds the server explanation.
+        try {
+            $reader = New-Object System.IO.StreamReader($response.GetResponseStream())
+            try { $body = $reader.ReadToEnd() } finally { $reader.Dispose() }
+        } catch {}
+    }
+    if($body) {
+        $body = ($body -replace '\s+', ' ').Trim()
+        if($body.Length -gt 1500) { $body = $body.Substring(0, 1500) + "...(truncated)" }
+        $lines.Add("  body    : $body")
+    }
+
+    return ($lines -join [Environment]::NewLine)
+}
+
+function Write-HttpErrorDetail {
+    param($ErrorRecord, [string]$Context = "", [string]$Level = "WARN")
+    # One Write-Log per line, so every line keeps its timestamp and level in the log file.
+    foreach($line in ((Get-HttpErrorDetail -ErrorRecord $ErrorRecord -Context $Context) -split "`r?`n")) {
+        if($line) { Write-Log $line -Level $Level }
+    }
 }
 
 function Test-IsTransientHttpError {
@@ -2324,8 +2381,21 @@ function New-GraphQuery {
         [String]$resource = "https://graph.microsoft.com",
 
         [Parameter(Mandatory = $false)]
-        [String]$ContentType = 'application/json; charset=utf-8'
+        [String]$ContentType = 'application/json; charset=utf-8',
+
+        # Set for calls where a failure is expected and handled by the caller (e.g. a 404 probe), to keep the log clean.
+        [Parameter(Mandatory = $false)]
+        [switch]$SuppressErrorDetail
     )
+
+    function Write-RequestFailure{
+        Param($ErrorRecord, [string]$RequestUri)
+        if($SuppressErrorDetail) { return }
+        try {
+            Write-Log "Request failed: $Method $RequestUri" -Level "WARN"
+            Write-HttpErrorDetail -ErrorRecord $ErrorRecord -Level "WARN"
+        } catch {}
+    }
 
     function get-resourceHeaders{
         Param(
@@ -2375,17 +2445,20 @@ function New-GraphQuery {
 
                     # Fail fast on all HTTP errors except 429 (including 500/403/404).
                     if($null -ne $statusCode -and -not $is429){
+                        Write-RequestFailure -ErrorRecord $_ -RequestUri $nextURL
                         $nextUrl = $Null
                         throw $_
                     }
 
                     # Retry only throttling or transport-level transient failures.
                     if(-not $is429 -and -not $isTransientNetwork){
+                        Write-RequestFailure -ErrorRecord $_ -RequestUri $nextURL
                         $nextUrl = $Null
                         throw $_
                     }
 
-                    if ($attempts -ge $MaxAttempts) { 
+                    if ($attempts -ge $MaxAttempts) {
+                        Write-RequestFailure -ErrorRecord $_ -RequestUri $nextURL
                         Throw $_
                     }
 
@@ -2414,8 +2487,11 @@ function New-GraphQuery {
         }catch {
             $Message = ($_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction SilentlyContinue).error.message
             if ($null -eq $Message) { $Message = $($_.Exception.Message) }
+            # This branch throws a string, so the HTTP status has to be carried in the message itself.
+            $failedStatusCode = Get-HttpStatusCode -ErrorRecord $_
+            if ($failedStatusCode) { $Message = "HTTP $failedStatusCode - $Message" }
             throw $Message
-        }                               
+        }
         return $Data
     }else{
         $ReturnedData = @()
@@ -2438,17 +2514,20 @@ function New-GraphQuery {
 
                         # Fail fast on all HTTP errors except 429 (including 500/403/404).
                         if($null -ne $statusCode -and -not $is429){
+                            Write-RequestFailure -ErrorRecord $_ -RequestUri $nextURL
                             $nextUrl = $Null
                             throw $_
                         }
 
                         # Retry only throttling or transport-level transient failures.
                         if(-not $is429 -and -not $isTransientNetwork){
+                            Write-RequestFailure -ErrorRecord $_ -RequestUri $nextURL
                             $nextUrl = $Null
                             throw $_
                         }
-              
-                        if ($attempts -ge $MaxAttempts) { 
+
+                        if ($attempts -ge $MaxAttempts) {
+                            Write-RequestFailure -ErrorRecord $_ -RequestUri $nextURL
                             $nextURL = $null
                             Throw $_
                         }
@@ -3304,6 +3383,89 @@ function Get-ShortcutMetadataMap {
 }
 
 
+function Test-IsShortcutFolder {
+    # A real shortcut carries A2OD* fields, anything else in the folder is not ours to keep.
+    param($Folder)
+    foreach($fieldName in @("A2ODRemoteItemUniqueId", "A2ODRemoteItemListId", "A2ODRemoteItemSiteId")) {
+        try { if([string]$Folder.ListItemAllFields.$fieldName) { return $true } } catch {}
+    }
+    return $false
+}
+
+function Remove-SharePointFolder {
+    # Recycles instead of hard deleting, so a folder that still held user files stays recoverable.
+    # Tries each route in turn because GetFolderById returns a 500 on some tenants.
+    param(
+        [Parameter(Mandatory = $true)][string]$WebUrl,
+        [Parameter(Mandatory = $true)][string]$ServerRelativeUrl,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [string]$UniqueId,
+        [string]$GraphPath
+    )
+
+    # decodedUrl travels as a query string alias, which copes with names GetFolderByServerRelativeUrl chokes on.
+    $pathLiteral = [System.Uri]::EscapeDataString($ServerRelativeUrl.Replace("'", "''"))
+    $strategies = @(@{ Name = "recycle by path"; Method = "POST"; Uri = "$WebUrl/_api/web/GetFolderByServerRelativePath(decodedUrl=@u)/Recycle()?@u='$pathLiteral'" })
+    if($UniqueId) { $strategies += @{ Name = "recycle by id"; Method = "POST"; Uri = "$WebUrl/_api/web/GetFolderById('$($UniqueId.Trim('{}'))')/Recycle()" } }
+    if($GraphPath) { $strategies += @{ Name = "Graph delete"; Method = "DELETE"; Graph = $true; Uri = "$($global:octo.graphUrl)/v1.0/me/drive/root:/$GraphPath" } }
+
+    foreach($strategy in $strategies) {
+        try {
+            if($strategy.Graph) {
+                $null = New-GraphQuery -Uri $strategy.Uri -Method $strategy.Method -MaxAttempts 2
+            } else {
+                $null = New-GraphQuery -resource $global:octo.sharepointUrl -Uri $strategy.Uri -Method $strategy.Method -MaxAttempts 2
+            }
+            return $true
+        } catch {
+            Write-Log "  Removing '$Name' using $($strategy.Name) failed: $($_.Exception.Message)" "WARN"
+        }
+    }
+
+    return $false
+}
+
+function Remove-UnexpectedShortcutFolder {
+    # Sometimes, e.g. when a library becomes sync-blocked, OneDrive turns a shortcut into a real folder. Those only confuse
+    # the user, so they are recycled. Errors here never fail the run, the folder is retried on the next one.
+    param(
+        [Parameter(Mandatory = $true)][string]$WebUrl,
+        [Parameter(Mandatory = $true)][string]$FolderServerRelativeUrl,
+        [Parameter(Mandatory = $true)][string]$FolderName
+    )
+
+    # ListItemAllFields carries the fields that tell a shortcut apart from a folder, but not every tenant returns it.
+    $uri = "$WebUrl/_api/web/GetFolderByServerRelativeUrl('$FolderServerRelativeUrl')/Folders?`$top=5000&`$format=json"
+    $subFolders = @()
+    try {
+        try {
+            $subFolders = @(New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$uri&`$expand=ListItemAllFields" -Method GET -SuppressErrorDetail)
+        } catch {
+            $subFolders = @(New-GraphQuery -resource $global:octo.sharepointUrl -Uri $uri -Method GET)
+        }
+    } catch {
+        Write-Log "Could not list the contents of '$FolderName', skipping folder cleanup this run: $($_.Exception.Message)" "WARN"
+        Write-HttpErrorDetail -ErrorRecord $_ -Context "listing subfolders of $FolderServerRelativeUrl"
+        return
+    }
+
+    foreach($subFolder in $subFolders) {
+        $name = [string]$subFolder.Name
+        if(-not $name -or (Test-IsShortcutFolder -Folder $subFolder)) { continue }
+
+        Write-Log "Found an unexpected folder where only links should exist, removing it. Name: $name, items: $([int]$subFolder.ItemCount)" "WARN"
+        $serverRelativeUrl = [string]$subFolder.ServerRelativeUrl
+        if(-not $serverRelativeUrl) { $serverRelativeUrl = "$FolderServerRelativeUrl/$name" }
+        $graphPath = "$([System.Uri]::EscapeDataString($FolderName))/$([System.Uri]::EscapeDataString($name))"
+
+        if(Remove-SharePointFolder -WebUrl $WebUrl -ServerRelativeUrl $serverRelativeUrl -Name $name -UniqueId ([string]$subFolder.UniqueId) -GraphPath $graphPath) {
+            Write-Log "Removed '$name', it can be restored from the OneDrive recycle bin" "WARN"
+        } else {
+            Write-Log "Could not remove '$name' from '$FolderName', mapping continues and it is retried next run" "ERROR"
+        }
+    }
+}
+
 function Invoke-PreflightChecks {
     $warnings = [System.Collections.Generic.List[string]]::new()
 
@@ -3473,7 +3635,7 @@ function Invoke-M365AutoLinkRun {
         $targetFolder = $null
 
         try {
-            $targetFolder = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/me/drive/root:/$($FolderName)?`$expand=listItem" -Method "GET"
+            $targetFolder = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/me/drive/root:/$($FolderName)?`$expand=listItem" -Method "GET" -SuppressErrorDetail
             Write-Log "Folder '$FolderName' already exists" "INFO"
         } catch {
             if ($_.Exception.Response.StatusCode -eq 404) {
@@ -3543,11 +3705,11 @@ function Invoke-M365AutoLinkRun {
         $folderContents = New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$rootUrl/personal/$userComponent/_api/web/GetFolderByServerRelativeUrl('/personal/$userComponent/$libraryName/$FolderName')/Files?`$top=5000&`$format=json&`$expand=listItem" -Method GET
 
         #sometimes, e.g. when a library is changed to sync-blocked, onedrive changes it to a folder. These should be wiped as they would only confuse the user
-        New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$rootUrl/personal/$userComponent/_api/web/GetFolderByServerRelativeUrl('/personal/$userComponent/$libraryName/$FolderName')/Folders?`$top=5000&`$format=json&`$expand=listItem" -Method GET | ForEach-Object {
-            if($_.UniqueId){
-                New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$rootUrl/personal/$userComponent/_api/web/GetFolderById('$($_.UniqueId)')/DeleteObject()" -Method POST
-                Write-Log "Found and deleted an unexpected folder where only links should exist. Name: $($_.Name)" "ERROR"
-            }
+        try {
+            Remove-UnexpectedShortcutFolder -WebUrl "$rootUrl/personal/$userComponent" -FolderServerRelativeUrl "/personal/$userComponent/$libraryName/$FolderName" -FolderName $FolderName
+        } catch {
+            Write-Log "Cleanup of unexpected folders failed, continuing run: $($_.Exception.Message)" "WARN"
+            Write-HttpErrorDetail -ErrorRecord $_ -Context "unexpected folder cleanup" -Level "WARN"
         }
 
         # try to fetch all shortcut metadata in one RenderListDataAsStream call. Falls back to per-item.
@@ -4160,6 +4322,9 @@ function Invoke-M365AutoLinkRun {
     } catch {
         Update-TrayState -Text "M365AutoLink - Error" -ProgressText "Failed" -IsRunning:$false
         Write-Log "Fatal error: $($_.Exception.Message)" "ERROR"
+        if($null -ne $_.Exception.Response) {
+            Write-HttpErrorDetail -ErrorRecord $_ -Context "fatal error" -Level "ERROR"
+        }
         Write-Log $_.ScriptStackTrace "ERROR"
         throw
     } finally {
