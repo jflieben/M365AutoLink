@@ -1,13 +1,20 @@
-<#
-.SYNOPSIS
-    Automatically links all Microsoft Teams and Normal SharePoint sites to a user's OneDrive so they become client-side navigable
+<#PSScriptInfo
 
-.DESCRIPTION
-    This script authenticates to Microsoft Graph using cached tokens when possible,
-    retrieves all Microsoft Teams and Sharepoint sites the user has access to, and creates shortcuts 
-    to them in the user's OneDrive under an "AutoLink" (configurable) folder.
+.VERSION 1.5.0
 
-.REQUIREMENTS
+.GUID 4ed75660-e426-4553-a432-7817d1f7d02b
+
+.AUTHOR Jos Lieben
+
+.COMPANYNAME JSolve B.V.
+
+.COPYRIGHT https://jsolve.nl/commercial-use.html
+
+.LICENSEURI https://jsolve.nl/commercial-use.html
+
+.PROJECTURI https://github.com/jflieben/M365AutoLink
+
+.EXTERNALSCRIPTDEPENDENCIES
     - PowerShell 5.x or 7.x
     - Automatic or Manual app registration (see below)
     - Sites should be included in search (which is default but can be overridden at site level)
@@ -23,16 +30,15 @@
     MANUAL / PRIVATE:
      
         see https://github.com/jflieben/M365AutoLink/blob/main/README.md#option-2--your-own-app-registration
+#>
 
-.NOTES
-    Author: Jos Lieben
-    Updates/Git: https://github.com/jflieben/M365AutoLink
-    Copyright/License: https://jsolve.nl/commercial-use.html (Commercial (re)use not allowed without consent by the author)
+<#
+
+.DESCRIPTION
+    This script authenticates to Microsoft Graph using cached tokens when possible,
+    retrieves all Microsoft Teams and Sharepoint sites the user has access to, and creates shortcuts 
+    to them in the user's OneDrive under an "AutoLink" (configurable) folder so they become client-navigable
     Microsoft doc: https://support.microsoft.com/en-us/office/add-shortcuts-to-shared-folders-in-onedrive-d66b1347-99b7-4470-9360-ffc048d35a33
-    Always test carefully, use at your own risk
-    
-.EXAMPLE
-    .\M365AutoLink.ps1
 #>
 
 ##########START CONFIGURATION#############################
