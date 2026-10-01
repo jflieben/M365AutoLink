@@ -16,39 +16,31 @@
     AUTOMATIC: 
     
         go to https://login.microsoftonline.com/organizations/adminconsent?client_id=ae7727e4-0471-4690-b155-76cbf5fdcb30
-        and sign in as an admin to provide consent for the Lieben Consultancy public client app registration.
-        Lieben Consultancy will in no way be able to access your data, the app registration is only used
+        and sign in as an admin to provide consent for the JSolve B.V. public client app registration.
+        JSolve B.V. will in no way be able to access your data, the app registration is only used
         for OAuth authentication purposes (delegated).
 
     MANUAL / PRIVATE:
      
         see https://github.com/jflieben/M365AutoLink/blob/main/README.md#option-2--your-own-app-registration
 
-.SILENT WINDOWS SIGN-IN (WAM)
-    On most managed devices WAM brokers the app's own client id without any extra setup; if a
-    tenant does not, add the public-client broker redirect URI to the app registration to enable it:
-
-        ms-appx-web://microsoft.aad.brokerplugin/<ClientID>
-
-    Whenever WAM fails (no PRT, non-Windows, etc etc) it falls back to the browser authorization
-
 .NOTES
     Author: Jos Lieben
     Updates/Git: https://github.com/jflieben/M365AutoLink
-    Copyright/License: https://www.lieben.nu/liebensraum/commercial-use/ (Commercial (re)use not allowed without prior written consent by the author, otherwise free to use/modify as long as header are kept intact)
+    Copyright/License: https://jsolve.nl/commercial-use.html (Commercial (re)use not allowed without consent by the author)
     Microsoft doc: https://support.microsoft.com/en-us/office/add-shortcuts-to-shared-folders-in-onedrive-d66b1347-99b7-4470-9360-ffc048d35a33
-    Always test carefully, use at your own risk, author takes no responsibility for this script
+    Always test carefully, use at your own risk
     
 .EXAMPLE
     .\M365AutoLink.ps1
 #>
 
 ##########START CONFIGURATION#############################
-$ScriptVersion = "1.4.0"
-$FolderName = "AutoLink" #this is the folder created in onedrive to house all links this tool will create. Feel free to change this to something localized, the tool will auto-create it if it does not exist
+$ScriptVersion = "1.5.0"
+$FolderName = "AutoLink" #folder that will be created in onedrive to house all links
 #WARNING: Any pre-existing folders in above folder will be deleted!
 $CloudType = "global" #global, usgov, usdod, china
-$ClientID = "ae7727e4-0471-4690-b155-76cbf5fdcb30" #Lieben Consultancy public client ID
+$ClientID = "ae7727e4-0471-4690-b155-76cbf5fdcb30" #JSolve B.V. public client ID
 $WindowStyle = "Normal" #Normal, Hidden, Minimized, Maximized - Hidden will not show the browser BUT the user then won't be able to sign in if SSO is not working
 
 # When $true, no shortcuts are changed
@@ -56,31 +48,24 @@ $DryRun = $false
 
 # Auto Launch mode valid values: Desktop, Start Menu, AtLogon
 # Do not configure this if you want to run 100% manual or e.g. use this as a logon script in Group Policy
-# Not configured would look like this: 
-# $LaunchModes = @()
+# Not configured = $LaunchModes = @()
 $LaunchModes = @('AtLogon')
 
 # When the script is deployed through Intune it runs from a temporary location that is deleted again right after execution. 
-# Any persistence (see $LaunchModes) would then create shortcuts pointing at a path that no longer exists.
 # Set $deployToPath to a permanent location and on first run the script copies itself there
 #
-# - Use a full file path (ending in .ps1) or a folder (the script keeps its M365AutoLink.ps1 name).
 # - Environment variables are supported in both $env:NAME (PowerShell) and %NAME% (Windows) form.
-# - The target folder is created automatically if it does not exist.
+# - Folders created automatically if they dont exist.
 #
 # Examples:
 #   $deployToPath = "$env:APPDATA\M365AutoLink\M365AutoLink.ps1"        # roaming AppData (per-user, roams with the profile)
 #   $deployToPath = "$env:OneDrive\Apps\M365AutoLink\M365AutoLink.ps1"  # OneDrive (per-user, survives device reset/reinstall)
-#
-# Leave as $Null to never copy the script (it runs and persists from wherever it currently is).
 $deployToPath = $Null
 
-# Uninstall mode: when $true the script removes ALL persistence, to cleanly remove M365AutoLink from a device.
+# Uninstall mode: when $true the script removes ALL persistence
 $Uninstall = $false
 
-#excluded sites will not be added a link if below pattern occurs in the site's URL. Use a * to match 1 or more characters
-#the default list is recommended
-#e.g. https://contoso.sharepoint.com/sites/HR*" would exclude all sites where the name starts with HR"
+#ignore sites, use * to match 1 or more characters
 $excludedSitesByWildcard = @(
     "*/groupforanswersinvivaengagedonotdelete*"
     "*/sites/Streamvideo*"
@@ -92,62 +77,62 @@ $excludedSitesByWildcard = @(
     "*/sites/pwa"
     "*/sites/AppCatalog*"
 )
-#if you define included site, only sites matching one of the patterns you enter will be linked. Use a * to match 1 or more characters
-#e.g. https://contoso.sharepoint.com/sites/HR*" would include all sites where the name starts with HR"
+#include sites, exclusion takes precedence
 $includedSitesByWildcard = @(
     "https://*.sharepoint.com/sites/*"
 )
 
-#link name cleanup patterns - applied to shortcut names after creation and to existing shortcuts on each run
+#link name cleanup patterns (in order)
 #each entry has a Pattern (string to find) and Replacement (string to replace with)
-#patterns are applied in order, final name is trimmed of leading/trailing whitespace
 $linkNameReplacements = @(
     @{ Pattern = " - Documents"; Replacement = "" }
     @{ Pattern = "- Documents"; Replacement = "" }
     @{ Pattern = "- Documenten"; Replacement = "" }
 )
 
-#below variables can be used to filter based on the number of existing files in the target location before creating a link
+#below filters based on the number of existing files in the target location linking
 $maxFileCount = 300000
 $minFileCount = 0
 
-# Combined item-count guidance. When the total number of items across ALL linked libraries crosses
-# these thresholds, Windows Explorer may not reliably show all folders/links and (rarely) sync breaks.
-# The tool only WARNS about this (icon color, tooltip, dialogs)
-$totalItemCountWarningThreshold = 1000000   # red "over limit"
-$totalItemCountWarningRatio     = 0.9       # amber "approaching" once the total reaches this fraction of the threshold
-# Knowledgebase article opened when the user clicks the over/approaching-limit tray balloon notification.
-$ItemCountHelpLink = "https://support.microsoft.com/en-US/onedrive/restrictions-and-limitations-in-onedrive-and-sharepoint#numberitemscanbesynced"
+# Combined item-count guidance for everything OneDrive syncs: the user's own OneDrive plus ALL linked libraries.
+# Above these totals sync slows down and Windows Explorer may not reliably show all folders/links.
+# The tool only WARNS about this (icon color, tooltip, dialogs). Set a threshold to 0 to disable it.
+$totalItemCountYellowThreshold  = 100000    # yellow, may be slow on virtual desktops (VDI)
+$totalItemCountOrangeThreshold  = 250000    # orange, too many for most virtual desktops
+$totalItemCountWarningThreshold = 1000000   # red "over limit", also for modern physical PCs
 
-# Basic floating progress bar (bottom-right)
+# On a user's first run (no AutoLink folder yet), only link libraries up to $totalItemCountYellowThreshold,
+# smallest first. The rest is held back until the user includes it via Manage shortcuts.
+$LimitFirstRun = $true
+# Knowledgebase article opened when the user clicks the tray balloon.
+$ItemCountHelpLink = "https://support.microsoft.com/en-us/onedrive/restrictions-and-limitations-in-onedrive-and-sharepoint#number-of-items-that-can-be-synced-or-copied"
+
+# progress bar
 $ShowProgressBar = $true
 $ProgressBarColor = "#00A3FF"
 $ProgressBarText = "M365AutoLink is updating your shortcuts..."
 
-# System tray behavior
+# if you disable these, users cant manage shortcut exclusions
 $EnableSystemTrayIcon = $true
-$KeepRunningInTray = $true # keeps process alive so tray can trigger runs and manage excluded sites
+$KeepRunningInTray = $true
 $TrayHelpLink = "https://support.microsoft.com/en-us/office/add-shortcuts-to-shared-folders-in-onedrive-d66b1347-99b7-4470-9360-ffc048d35a33"
-$TrayCopyrightText = "Copyright (c) Lieben Consultancy"
-$TrayCopyrightLink = "https://www.lieben.nu/liebensraum/commercial-use/"
+$TrayCopyrightText = "Copyright (c) JSolve B.V."
+$TrayCopyrightLink = "https://jsolve.nl/commercial-use.html"
 
-# Device name inclusion filter - only run on devices where the name contains a specific string. Leave as $Null to run on all devices the script is deployed to
+# Device name inclusion filter (contains). Leave as $Null to run on all
 $DeviceNameIncludeFilter = $Null
 
-# Periodic auto-refresh. When > 0, a run is triggered automatically every N hours while the tray
-# process is alive (in addition to logon and manual "Run now"), plus shortly after the device resumes
-# from sleep. 0 = off (only logon + manual). Requires $KeepRunningInTray.
+# Periodic auto-refresh. When > 0, a run is triggered automatically every N hours plus shortly after the device resumes
+# 0 = off (only logon + manual)
 $AutoRefreshHours = 0
 
 # Deletion circuit breaker. To protect against a partial SharePoint Search outage causing mass
-# deletion of valid shortcuts, the delete phase is SKIPPED for this run when the desired set shrank by
-# more than this fraction versus the last successful run, or when search paging ended abnormally.
-# Set to 1 to effectively disable the ratio guard. 
+# deletion of valid shortcuts set to 1 to disable the ratio guard. 
 $DeletionSafetyRatio = 0.40
 
 $LogHistoryCount = 5
 
-#system libraries that should never become OneDrive shortcuts even if returned by search
+#system libraries to always exclude
 $excludedLibrariesByWildcard = @(
     "*style library*"
     "*stijlbibliotheek*"
@@ -158,7 +143,7 @@ $excludedLibrariesByWildcard = @(
     "*preservation hold library*"
 )
 
-# Additional exact title exclusions (case-insensitive) and feature IDs.
+# Additional exact exclusions (case-insensitive) and feature IDs.
 $ExcludedListTitles = @(
     "Access Requests","App Packages","appdata","appfiles","Apps in Testing","Cache Profiles","Composed Looks","Content and Structure Reports","Content type publishing error log","Converted Forms",
     "Device Channels","Form Templates","fpdatasources","Get started with Apps for Office and SharePoint","List Template Gallery", "Long Running Operation Status","Maintenance Log Library", "Images", "site collection images",
@@ -177,12 +162,11 @@ $ExcludedListFeatureIDs = @(
 ##########END CONFIGURATION#############################
 
 #region External configuration (F1)
-# Layered configuration so admins can manage settings WITHOUT editing the script (which every update would
-# overwrite - especially painful with $deployToPath self-copy). Precedence, first match wins per setting:
+# Layered configuration so admins can manage settings WITHOUT editing the script. Precedence, first match wins per setting:
 #   1. HKLM\Software\Policies\Lieben\M365AutoLink   (Intune/GPO manageable + lockable, most authoritative)
 #   2. HKCU\Software\Policies\Lieben\M365AutoLink
-#   3. M365AutoLink.config.json next to the script  (admin-managed, survives script updates)
-#   4. the in-script default assigned above         (zero-config still works unchanged)
+#   3. M365AutoLink.config.json next to the script
+#   4. the in-script default assigned above
 $script:externalConfigJson = $null
 try {
     $selfConfigPath = if(-not [string]::IsNullOrWhiteSpace($PSCommandPath)) { $PSCommandPath }
@@ -200,7 +184,6 @@ try {
 }
 
 function Convert-SettingValue {
-    # Coerce an external (string/registry/json) value to the type of the in-script default template.
     param($Value, $Template)
     try {
         if($Template -is [bool]) {
@@ -241,7 +224,7 @@ function Resolve-Setting {
     return $Default
 }
 
-# Apply external overrides to the configurable settings (no-op when nothing external is present).
+# Apply external overrides to the configurable settings
 $FolderName                     = Resolve-Setting -Name 'FolderName' -Default $FolderName
 $CloudType                      = Resolve-Setting -Name 'CloudType' -Default $CloudType
 $ClientID                       = Resolve-Setting -Name 'ClientID' -Default $ClientID
@@ -254,7 +237,10 @@ $excludedSitesByWildcard        = Resolve-Setting -Name 'excludedSitesByWildcard
 $includedSitesByWildcard        = Resolve-Setting -Name 'includedSitesByWildcard' -Default $includedSitesByWildcard
 $maxFileCount                   = Resolve-Setting -Name 'maxFileCount' -Default $maxFileCount
 $minFileCount                   = Resolve-Setting -Name 'minFileCount' -Default $minFileCount
+$totalItemCountYellowThreshold  = Resolve-Setting -Name 'totalItemCountYellowThreshold' -Default $totalItemCountYellowThreshold
+$totalItemCountOrangeThreshold  = Resolve-Setting -Name 'totalItemCountOrangeThreshold' -Default $totalItemCountOrangeThreshold
 $totalItemCountWarningThreshold = Resolve-Setting -Name 'totalItemCountWarningThreshold' -Default $totalItemCountWarningThreshold
+$LimitFirstRun                  = Resolve-Setting -Name 'LimitFirstRun' -Default $LimitFirstRun
 $ShowProgressBar                = Resolve-Setting -Name 'ShowProgressBar' -Default $ShowProgressBar
 $EnableSystemTrayIcon           = Resolve-Setting -Name 'EnableSystemTrayIcon' -Default $EnableSystemTrayIcon
 $KeepRunningInTray              = Resolve-Setting -Name 'KeepRunningInTray' -Default $KeepRunningInTray
@@ -275,7 +261,7 @@ if($DeviceNameIncludeFilter -and -not $env:COMPUTERNAME.ToLowerInvariant().Conta
     return
 }
 
-#base vars
+
 $global:octo = @{}
 $global:octo.LCRefreshToken = $Null
 $global:octo.LCCachedTokens = @{}
@@ -288,13 +274,13 @@ $script:trayRunspace = $null
 $script:trayPS = $null
 $script:userConfig = $null
 $script:lastMappedLibraryOptions = @()
+$script:lastOneDriveItemCount = -1
 $script:lastAlreadyExistingShortcuts = @()
 $script:bypassDeletionRatioOnce = $false
 $script:localOneDriveRootPath = $null
 $script:localShortcutFolderPath = $null
 $script:effectiveScriptPath = $null
 
-#determine URLs based on where the tenant resides
 switch($CloudType){
     'global' {
         $global:octo.idpUrl = "https://login.microsoftonline.com"
@@ -366,7 +352,6 @@ function Get-HttpStatusCode {
 }
 
 function Get-HttpErrorDetail {
-    # Status, headers and body of a failed web request, formatted for the log.
     param($ErrorRecord, [string]$Context = "")
 
     $lines = [System.Collections.Generic.List[string]]::new()
@@ -390,7 +375,6 @@ function Get-HttpErrorDetail {
             }
         } catch {}
         foreach($key in $headers.Keys) {
-            # Cookies can carry session material, so log their presence but not their value.
             $value = if($key -match 'cookie|authorization') { "<redacted>" } else { $headers[$key] }
             $lines.Add("  header  : $($key): $value")
         }
@@ -416,7 +400,6 @@ function Get-HttpErrorDetail {
 
 function Write-HttpErrorDetail {
     param($ErrorRecord, [string]$Context = "", [string]$Level = "WARN")
-    # One Write-Log per line, so every line keeps its timestamp and level in the log file.
     foreach($line in ((Get-HttpErrorDetail -ErrorRecord $ErrorRecord -Context $Context) -split "`r?`n")) {
         if($line) { Write-Log $line -Level $Level }
     }
@@ -457,7 +440,7 @@ function Invoke-RestWithRetry {
                 Uri         = $Uri
                 ErrorAction = 'Stop'
                 TimeoutSec  = $TimeoutSec
-                UserAgent   = "ISV|LiebenConsultancy|M365AutoLink|$ScriptVersion"
+                UserAgent   = "ISV|JSolveBV|M365AutoLink|$ScriptVersion"
                 Verbose     = $false
             }
             if($Headers) { $params.Headers = $Headers }
@@ -533,36 +516,26 @@ public static extern bool SetProcessDPIAware();
 }
 
 function Get-TotalItemCountStatus {
-    param(
-        [long]$TotalItemCount,
-        [long]$Threshold = $totalItemCountWarningThreshold,
-        [double]$WarningRatio = $totalItemCountWarningRatio
-    )
+    param([long]$TotalItemCount)
 
-    if($Threshold -le 0) { return "ok" }
-    if($TotalItemCount -ge $Threshold) { return "over" }
-    if($TotalItemCount -ge [long]($Threshold * $WarningRatio)) { return "approaching" }
+    if($totalItemCountWarningThreshold -gt 0 -and $TotalItemCount -ge $totalItemCountWarningThreshold) { return "red" }
+    if($totalItemCountOrangeThreshold -gt 0 -and $TotalItemCount -ge $totalItemCountOrangeThreshold) { return "orange" }
+    if($totalItemCountYellowThreshold -gt 0 -and $TotalItemCount -ge $totalItemCountYellowThreshold) { return "yellow" }
     return "ok"
 }
 
 function Get-ItemCountSummaryText {
     param(
         [long]$TotalItemCount,
-        [string]$Status,
-        [long]$Threshold = $totalItemCountWarningThreshold
+        [string]$Status
     )
 
     $formattedTotal = '{0:N0}' -f $TotalItemCount
     switch($Status) {
-        "over" {
-            return ("{0} / {1} items - over limit" -f $formattedTotal, ('{0:N0}' -f $Threshold))
-        }
-        "approaching" {
-            return ("{0} / {1} items - approaching limit" -f $formattedTotal, ('{0:N0}' -f $Threshold))
-        }
-        default {
-            return ("{0} items linked" -f $formattedTotal)
-        }
+        "red"    { return ("{0} / {1} items - over limit" -f $formattedTotal, ('{0:N0}' -f $totalItemCountWarningThreshold)) }
+        "orange" { return ("{0} items synced - too high for VDI" -f $formattedTotal) }
+        "yellow" { return ("{0} items synced - high for VDI" -f $formattedTotal) }
+        default  { return ("{0} items synced" -f $formattedTotal) }
     }
 }
 
@@ -624,11 +597,14 @@ function Get-DefaultUserConfig {
         preferences = @{
             excludedSiteUrls = @()
             excludedLibraryKeys = @()
+            heldBackLibraryKeys = @()
         }
         diagnostics = @{
             lastAlreadyExisting = @()
             totalItemCount = 0
+            oneDriveItemCount = 0
             lastDesiredCount = 0
+            firstRunPending = $false
         }
         cache = @{
             staticExcludedLibraries = @()
@@ -732,7 +708,6 @@ function Get-NormalizedLaunchModes {
 }
 
 function Get-RawScriptPath {
-    # The physical path the script is currently executing from (a temporary location when deployed via Intune).
     if(-not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
         return $PSCommandPath
     }
@@ -747,7 +722,6 @@ function Get-RawScriptPath {
 }
 
 function Get-M365AutoLinkScriptPath {
-    # Once self-deployment has resolved a permanent location, persistence must target that copy
     if(-not [string]::IsNullOrWhiteSpace($script:effectiveScriptPath)) {
         return $script:effectiveScriptPath
     }
@@ -818,7 +792,6 @@ function Test-PathUnderIntune {
 
     if([string]::IsNullOrWhiteSpace($Path)) { return $false }
 
-    # Well-known IME uses
     $intunePathFragments = @(
         'Microsoft Intune Management Extension\Policies\Scripts',
         'Microsoft Intune Management Extension\Content',
@@ -835,7 +808,6 @@ function Test-PathUnderIntune {
 }
 
 function Test-RunningUnderIntune {
-    # Intune enforces a timeout on PowerShell scripts
     try {
         $rawScriptPath = Get-RawScriptPath
         if(Test-PathUnderIntune -Path $rawScriptPath) {
@@ -926,7 +898,7 @@ function Get-PowerShellExecutablePath {
 }
 
 function Test-IsWindows11OrLater {
-    # Windows 11 is build 22000+; used to gate the conhost --headless launch (D5).
+    # Windows 11 is build 22000+; used to gate the conhost --headless launch
     try { return ([Environment]::OSVersion.Version.Build -ge 22000) } catch { return $false }
 }
 
@@ -941,8 +913,7 @@ function Get-PowerShellLaunchCommand {
     if($HiddenWindow) {
         $arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Sta -File "{0}"' -f $ScriptPath
 
-        # on Windows 11, launching through "conhost.exe --headless" avoids the brief console window
-        # flash that "-WindowStyle Hidden" alone still shows at logon.
+        # "conhost.exe --headless" avoids the brief console window
         if(Test-IsWindows11OrLater) {
             $conhostPath = Join-Path -Path $env:SystemRoot -ChildPath 'System32\conhost.exe'
             if(Test-Path -LiteralPath $conhostPath) {
@@ -1208,7 +1179,7 @@ function Sync-LaunchPersistence {
 function Invoke-Uninstall {
     param([string]$DeployToPath)
 
-    Write-Log "=== M365AutoLink Uninstall requested ===" "INFO"
+    Write-Log "=== M365AutoLink Uninstall ===" "INFO"
 
     $desktopShortcutPath = Join-Path -Path ([Environment]::GetFolderPath('DesktopDirectory')) -ChildPath 'M365AutoLink.lnk'
     $startMenuShortcutPath = Join-Path -Path ([Environment]::GetFolderPath('Programs')) -ChildPath 'M365AutoLink.lnk'
@@ -1230,12 +1201,12 @@ function Invoke-Uninstall {
     try {
         $removedAtLogon = Set-AtLogonPersistence -Mode 'AtLogon' -Remove
         if($removedAtLogon) {
-            Write-Log "Removed at-logon persistence" "INFO"
+            Write-Log "Removed logon persistence" "INFO"
         } else {
-            Write-Log "No at-logon persistence found to remove" "INFO"
+            Write-Log "No logon persistence found to remove" "INFO"
         }
     } catch {
-        Write-Log "Failed to remove at-logon persistence: $($_.Exception.Message)" "WARN"
+        Write-Log "Failed to remove logon persistence: $($_.Exception.Message)" "WARN"
     }
 
     foreach($ownFile in @(
@@ -1351,21 +1322,23 @@ function ConvertTo-UserConfig {
     }
     $config.preferences.excludedSiteUrls = @($normalizedExcluded)
 
-    $excludedLibraries = @()
-    try {
-        if($ConfigObject.preferences -and $ConfigObject.preferences.excludedLibraryKeys) {
-            $excludedLibraries = @($ConfigObject.preferences.excludedLibraryKeys)
-        }
-    } catch {}
+    foreach($keyListName in @('excludedLibraryKeys', 'heldBackLibraryKeys')) {
+        $libraryKeys = @()
+        try {
+            if($ConfigObject.preferences -and $ConfigObject.preferences.$keyListName) {
+                $libraryKeys = @($ConfigObject.preferences.$keyListName)
+            }
+        } catch {}
 
-    $normalizedExcludedLibraries = [System.Collections.Generic.List[string]]::new()
-    foreach($libraryKey in $excludedLibraries) {
-        $libraryKeyText = ([string]$libraryKey).Trim().ToLowerInvariant()
-        if(-not [string]::IsNullOrWhiteSpace($libraryKeyText) -and -not $normalizedExcludedLibraries.Contains($libraryKeyText)) {
-            $normalizedExcludedLibraries.Add($libraryKeyText)
+        $normalizedLibraryKeys = [System.Collections.Generic.List[string]]::new()
+        foreach($libraryKey in $libraryKeys) {
+            $libraryKeyText = ([string]$libraryKey).Trim().ToLowerInvariant()
+            if(-not [string]::IsNullOrWhiteSpace($libraryKeyText) -and -not $normalizedLibraryKeys.Contains($libraryKeyText)) {
+                $normalizedLibraryKeys.Add($libraryKeyText)
+            }
         }
+        $config.preferences.$keyListName = @($normalizedLibraryKeys)
     }
-    $config.preferences.excludedLibraryKeys = @($normalizedExcludedLibraries)
 
     $alreadyExisting = @()
     try {
@@ -1390,6 +1363,8 @@ function ConvertTo-UserConfig {
 
     try { if($ConfigObject.diagnostics -and $null -ne $ConfigObject.diagnostics.totalItemCount) { $config.diagnostics.totalItemCount = [long]$ConfigObject.diagnostics.totalItemCount } } catch {}
     try { if($ConfigObject.diagnostics -and $null -ne $ConfigObject.diagnostics.lastDesiredCount) { $config.diagnostics.lastDesiredCount = [int]$ConfigObject.diagnostics.lastDesiredCount } } catch {}
+    try { if($ConfigObject.diagnostics -and $null -ne $ConfigObject.diagnostics.oneDriveItemCount) { $config.diagnostics.oneDriveItemCount = [long]$ConfigObject.diagnostics.oneDriveItemCount } } catch {}
+    try { if($ConfigObject.diagnostics -and $null -ne $ConfigObject.diagnostics.firstRunPending) { $config.diagnostics.firstRunPending = [bool]$ConfigObject.diagnostics.firstRunPending } } catch {}
 
     $staticExcludedLibraries = @()
     try {
@@ -1467,7 +1442,6 @@ function Get-OneDriveUserConfig {
 }
 
 function Get-DisplaySiteUrl {
-    # Strips the "https://host/" prefix purely for on-screen display so the path is easier to scan.
     param([string]$SiteUrl)
 
     if([string]::IsNullOrWhiteSpace($SiteUrl)) { return $SiteUrl }
@@ -1478,7 +1452,6 @@ function Get-DisplaySiteUrl {
 }
 
 function Get-ManageDialogSizePath {
-    # remember the Manage-shortcuts window size in a small local file (avoids OneDrive round-trips).
     $dir = [System.IO.Path]::GetDirectoryName($global:octo.LogPath)
     if([string]::IsNullOrWhiteSpace($dir)) { return $null }
     return (Join-Path -Path $dir -ChildPath "manage-ui.json")
@@ -1546,7 +1519,7 @@ function Invoke-ManageShortcuts {
             }
         }
 
-        $selectionResult = Show-ManageShortcutsDialog -LibraryOptions @($script:lastMappedLibraryOptions)
+        $selectionResult = Show-ManageShortcutsDialog -LibraryOptions @($script:lastMappedLibraryOptions) -OneDriveItemCount $script:lastOneDriveItemCount
         if($selectionResult.isCanceled) {
             Update-TrayState -Text "M365AutoLink - Idle" -ProgressText "No changes"
             return
@@ -1558,9 +1531,21 @@ function Invoke-ManageShortcuts {
             if(-not [string]::IsNullOrWhiteSpace($keyText)) { [void]$chosenSet.Add($keyText) }
         }
 
+        $shownKeySet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $heldBackSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach($option in @($script:lastMappedLibraryOptions)) {
+            $optionKey = ([string]$option.key).Trim().ToLowerInvariant()
+            if([string]::IsNullOrWhiteSpace($optionKey)) { continue }
+            [void]$shownKeySet.Add($optionKey)
+            if($option.heldBack -and $chosenSet.Contains($optionKey)) { [void]$heldBackSet.Add($optionKey) }
+        }
+        foreach($libraryKey in @($script:userConfig.preferences.heldBackLibraryKeys)) {
+            if(-not $shownKeySet.Contains([string]$libraryKey)) { [void]$heldBackSet.Add([string]$libraryKey) }
+        }
+        $userExcludedSet = [System.Collections.Generic.HashSet[string]]::new($chosenSet, [System.StringComparer]::OrdinalIgnoreCase)
+        $userExcludedSet.ExceptWith($heldBackSet)
+
         $exclusionsChanged = -not $originalSet.SetEquals($chosenSet)
-        # Even with no exclusion change, migrate any legacy per-site exclusions into the per-library
-        # model so they stop being a separate, invisible mechanism.
         $hasLegacySiteExclusions = (@($script:userConfig.preferences.excludedSiteUrls).Count -gt 0)
 
         if(-not $exclusionsChanged -and -not $hasLegacySiteExclusions) {
@@ -1568,7 +1553,8 @@ function Invoke-ManageShortcuts {
             return
         }
 
-        $script:userConfig.preferences.excludedLibraryKeys = @($chosenSet)
+        $script:userConfig.preferences.excludedLibraryKeys = @($userExcludedSet)
+        $script:userConfig.preferences.heldBackLibraryKeys = @($heldBackSet)
         $script:userConfig.preferences.excludedSiteUrls = @()
         Save-OneDriveUserConfig -Config $script:userConfig
 
@@ -1589,7 +1575,8 @@ function Invoke-ManageShortcuts {
 
 function Show-ManageShortcutsDialog {
     param(
-        [Parameter(Mandatory = $true)][array]$LibraryOptions
+        [Parameter(Mandatory = $true)][array]$LibraryOptions,
+        [long]$OneDriveItemCount = -1
     )
 
     Add-Type -AssemblyName System.Windows.Forms
@@ -1605,7 +1592,6 @@ function Show-ManageShortcutsDialog {
 
     $excludedForeColor = [Drawing.Color]::FromArgb(150, 158, 168)
 
-    # Build the master item list once; the visible ListView is (re)populated from this by filter + sort.
     $allItems = [System.Collections.Generic.List[object]]::new()
 
     foreach($option in $LibraryOptions) {
@@ -1614,29 +1600,39 @@ function Show-ManageShortcutsDialog {
         $optionItemCount = [long]0
         try { $optionItemCount = [long]$option.itemCount } catch {}
         $isExcluded = [bool]$option.isExcluded
+        $isHeldBack = [bool]$option.heldBack
 
-        $itemsValue = if($isExcluded) { "-" } elseif($optionItemCount -gt 0) { '{0:N0}' -f $optionItemCount } else { "0" }
-        $statusValue = if($isExcluded) { "Excluded" } else { "Linked" }
-        $reasonValue = if($isExcluded) { "Excluded by you" } else { "" }
+        # Only libraries excluded by the user skip the metadata lookup, so only those have no count.
+        $itemsValue = if($isExcluded -and -not $isHeldBack) { "-" } elseif($optionItemCount -gt 0) { '{0:N0}' -f $optionItemCount } else { "0" }
 
         $item = New-Object Windows.Forms.ListViewItem("")
         [void]$item.SubItems.Add($libraryValue)
         [void]$item.SubItems.Add((Get-DisplaySiteUrl -SiteUrl ([string]$option.siteUrl)))
         [void]$item.SubItems.Add($itemsValue)
-        [void]$item.SubItems.Add($statusValue)
-        [void]$item.SubItems.Add($reasonValue)
+        [void]$item.SubItems.Add("")
+        [void]$item.SubItems.Add("")
         $item.ToolTipText = [string]$option.siteUrl
-        $item.Tag = @{ key = [string]$option.key; itemCount = $optionItemCount; autoSkipped = $false }
+        $item.Tag = @{ key = [string]$option.key; itemCount = $optionItemCount; autoSkipped = $false; heldBack = $isHeldBack }
         $item.Checked = $isExcluded
-        if($isExcluded) { $item.ForeColor = $excludedForeColor }
         $allItems.Add($item)
+    }
+
+    $oneDriveRow = $null
+    if($OneDriveItemCount -ge 0) {
+        $oneDriveRow = New-Object Windows.Forms.ListViewItem("")
+        foreach($text in @("OneDrive", "Your own files", ('{0:N0}' -f $OneDriveItemCount), "Always synced", "Cannot be excluded")) {
+            [void]$oneDriveRow.SubItems.Add($text)
+        }
+        $oneDriveRow.ToolTipText = "Your own OneDrive files always sync and count towards the total"
+        $oneDriveRow.Tag = @{ key = $null; itemCount = $OneDriveItemCount; autoSkipped = $true }
+        $oneDriveRow.ForeColor = $excludedForeColor
+        $oneDriveRow.BackColor = [Drawing.Color]::FromArgb(238, 240, 244)
     }
 
     $form = New-Object Windows.Forms.Form
     $form.Text = "M365AutoLink - Manage shortcuts"
     $form.StartPosition = "CenterScreen"
     $form.AutoScaleMode = [Windows.Forms.AutoScaleMode]::None
-    # a normal sizable window (resizable + remembers its size), rather than the old borderless one.
     $form.FormBorderStyle = [Windows.Forms.FormBorderStyle]::Sizable
     $form.MaximizeBox = $true
     $form.MinimumSize = New-Object Drawing.Size((ds 760), (ds 460))
@@ -1674,14 +1670,12 @@ function Show-ManageShortcutsDialog {
     $subLabel.Size = New-Object Drawing.Size(($clientW - ($pad * 2)), (ds 26))
     $subLabel.Font = New-Object Drawing.Font("Segoe UI", 9)
     $subLabel.ForeColor = [Drawing.Color]::FromArgb(191, 205, 223)
-    $subLabel.Text = "Tick Exclude to stop syncing a library. Type to filter, click a column to sort. Saving re-runs automatically."
+    $subLabel.Text = "Tick Exclude to stop syncing a library. Type to filter, click a column to sort."
     $subLabel.Anchor = $rightAnchor
 
     $headerPanel.Controls.Add($titleLabel)
     $headerPanel.Controls.Add($subLabel)
 
-    # Filter row: a search box plus quick Exclude-all / Include-all buttons. Widths are DPI-scaled and the
-    # label/buttons get their height synced to the text box (see $form.Add_Shown) so the row always lines up.
     $rowY = ds 74
     $labelW = ds 48
     $buttonW = ds 100
@@ -1716,7 +1710,6 @@ function Show-ManageShortcutsDialog {
     $includeAllButton.BackColor = [Drawing.Color]::FromArgb(231, 236, 244)
     $includeAllButton.Anchor = [Windows.Forms.AnchorStyles]::Top -bor [Windows.Forms.AnchorStyles]::Right
 
-    # Capacity bar: shows how much of the sync "budget" the currently INCLUDED libraries consume.
     $capPanel = New-Object Windows.Forms.Panel
     $capPanel.Location = New-Object Drawing.Point($pad, (ds 112))
     $capPanel.Size = New-Object Drawing.Size($contentWidth, (ds 44))
@@ -1742,6 +1735,17 @@ function Show-ManageShortcutsDialog {
     $capFill.BackColor = [Drawing.Color]::FromArgb(31, 122, 49)
     $capTrack.Controls.Add($capFill)
 
+    $capMarkers = @()
+    foreach($markerValue in @($totalItemCountYellowThreshold, $totalItemCountOrangeThreshold)) {
+        $marker = New-Object Windows.Forms.Panel
+        $marker.Size = New-Object Drawing.Size([Math]::Max(1, (ds 2)), (ds 14))
+        $marker.BackColor = [Drawing.Color]::FromArgb(110, 120, 135)
+        $marker.Tag = [long]$markerValue
+        $capTrack.Controls.Add($marker)
+        $marker.BringToFront()
+        $capMarkers += $marker
+    }
+
     $capPanel.Controls.Add($capLabel)
     $capPanel.Controls.Add($capTrack)
 
@@ -1766,63 +1770,78 @@ function Show-ManageShortcutsDialog {
     [void]$listView.Columns.Add("Status", (ds 90))
     [void]$listView.Columns.Add("Reason", (ds 150))
 
-    # Suppress capacity recompute while we bulk-repopulate the list (filter/sort), then recompute once.
     $script:mgSuspend = $false
+    $script:mgIncludedTotal = [long]0
+
+    $drawCapacity = {
+      try {
+        $total = [long]$script:mgIncludedTotal
+        $scaleMax = [long](@($totalItemCountWarningThreshold, $totalItemCountOrangeThreshold, $totalItemCountYellowThreshold) | Measure-Object -Maximum).Maximum
+        $status = Get-TotalItemCountStatus -TotalItemCount $total
+        $capFill.BackColor = switch($status) {
+            "red"    { [Drawing.Color]::FromArgb(196, 43, 28) }
+            "orange" { [Drawing.Color]::FromArgb(234, 88, 12) }
+            "yellow" { [Drawing.Color]::FromArgb(234, 179, 8) }
+            default  { [Drawing.Color]::FromArgb(31, 122, 49) }
+        }
+        $capLabel.ForeColor = switch($status) {
+            "red"    { [Drawing.Color]::FromArgb(196, 43, 28) }
+            "orange" { [Drawing.Color]::FromArgb(194, 65, 12) }
+            "yellow" { [Drawing.Color]::FromArgb(146, 94, 0) }
+            default  { [Drawing.Color]::FromArgb(31, 122, 49) }
+        }
+
+        $detail = switch($status) {
+            "red"    { "OVER the {0:N0} limit by {1:N0}" -f $totalItemCountWarningThreshold, ($total - $totalItemCountWarningThreshold) }
+            "orange" { "above {0:N0}, too many for most virtual desktops (VDI)" -f $totalItemCountOrangeThreshold }
+            "yellow" { "above {0:N0}, may be slow on virtual desktops (VDI)" -f $totalItemCountYellowThreshold }
+            default  { if($totalItemCountYellowThreshold -gt 0) { "{0:N0} remaining below {1:N0}" -f ($totalItemCountYellowThreshold - $total), $totalItemCountYellowThreshold } else { "within limits" } }
+        }
+        if($scaleMax -le 0) { $detail = "limit warnings disabled" }
+        $oneDrivePart = if($OneDriveItemCount -ge 0) { " (incl. {0:N0} in your OneDrive)" -f $OneDriveItemCount } else { "" }
+        $capLabel.Text = "{0:N0} items synced{1}  -  {2}" -f $total, $oneDrivePart, $detail
+
+        $ratio = 0.0
+        if($scaleMax -gt 0) { $ratio = [Math]::Min(1.0, [double]$total / [double]$scaleMax) }
+        $capFill.Width = [int]($capTrack.Width * $ratio)
+        foreach($marker in $capMarkers) {
+            $markerValue = [long]$marker.Tag
+            $marker.Visible = ($markerValue -gt 0 -and $markerValue -lt $scaleMax)
+            if($marker.Visible) { $marker.Left = [int]($capTrack.Width * $markerValue / $scaleMax) }
+        }
+      } catch {
+        Write-Log "Manage-shortcuts capacity draw failed: $($_.Exception.Message)" "WARN"
+      }
+    }
 
     $refreshCapacity = {
         if($script:mgSuspend) { return }
       try {
-        $includedTotal = [long]0
-        foreach($row in $listView.Items) {
-            # During the ListView handle-creation ItemChecked storm the enumeration can briefly yield a
-            # null/partial row; indexing $null.SubItems is what threw "Cannot index into a null array".
+        # Totals cover every row, not just the ones the filter shows.
+        $includedTotal = [long][Math]::Max(0, $OneDriveItemCount)
+        foreach($row in $allItems) {
             if($null -eq $row -or $null -eq $row.SubItems -or $row.SubItems.Count -lt 6) { continue }
-            if($row.Tag.autoSkipped) { continue }
             $rowCount = [long]0
             try { $rowCount = [long]$row.Tag.itemCount } catch {}
-            if($row.Checked) {
-                if([string]$row.SubItems[4].Text -ne "Excluded") { $row.SubItems[4].Text = "Excluded" }
-                if([string]$row.SubItems[5].Text -ne "Excluded by you") { $row.SubItems[5].Text = "Excluded by you" }
-                $row.ForeColor = $excludedForeColor
+            if($row.Checked -and $row.Tag.heldBack) {
+                $statusText = "Held back"; $reasonText = "First-run sync limit"
+            } elseif($row.Checked) {
+                $statusText = "Excluded"; $reasonText = "Excluded by you"
             } else {
-                if([string]$row.SubItems[4].Text -ne "Linked") { $row.SubItems[4].Text = "Linked" }
-                if([string]$row.SubItems[5].Text -ne "") { $row.SubItems[5].Text = "" }
-                $row.ForeColor = $listView.ForeColor
+                $statusText = "Linked"; $reasonText = ""
                 $includedTotal += $rowCount
             }
+            if([string]$row.SubItems[4].Text -ne $statusText) { $row.SubItems[4].Text = $statusText }
+            if([string]$row.SubItems[5].Text -ne $reasonText) { $row.SubItems[5].Text = $reasonText }
+            $row.ForeColor = if($row.Checked) { $excludedForeColor } else { $listView.ForeColor }
         }
-
-        $status = Get-TotalItemCountStatus -TotalItemCount $includedTotal
-        $accent = switch($status) {
-            "over"        { [Drawing.Color]::FromArgb(196, 43, 28) }
-            "approaching" { [Drawing.Color]::FromArgb(176, 110, 0) }
-            default       { [Drawing.Color]::FromArgb(31, 122, 49) }
-        }
-        $capLabel.ForeColor = $accent
-        $capFill.BackColor = $accent
-
-        if($totalItemCountWarningThreshold -gt 0) {
-            $ratio = [double]$includedTotal / [double]$totalItemCountWarningThreshold
-            if($ratio -gt 1) { $ratio = 1 }
-            if($ratio -lt 0) { $ratio = 0 }
-            $capFill.Width = [int]($capTrack.Width * $ratio)
-            $remaining = $totalItemCountWarningThreshold - $includedTotal
-            if($remaining -lt 0) {
-                $capLabel.Text = "{0:N0} of {1:N0} items synced  -  OVER by {2:N0}" -f $includedTotal, $totalItemCountWarningThreshold, [math]::Abs($remaining)
-            } else {
-                $capLabel.Text = "{0:N0} of {1:N0} items synced  -  {2:N0} remaining" -f $includedTotal, $totalItemCountWarningThreshold, $remaining
-            }
-        } else {
-            $capFill.Width = 0
-            $capLabel.Text = "{0:N0} items synced  (limit warning disabled)" -f $includedTotal
-        }
+        $script:mgIncludedTotal = $includedTotal
+        & $drawCapacity
       } catch {
-        # Never let a stray handler error surface as a WinForms Continue/Quit ThreadException popup.
         Write-Log "Manage-shortcuts capacity refresh failed: $($_.Exception.Message)" "WARN"
       }
     }
 
-    # (Re)build the visible rows from $allItems using the current filter text + sort column/direction.
     $applyView = {
       try {
         $filterText = ([string]$filterBox.Text).Trim().ToLowerInvariant()
@@ -1851,6 +1870,7 @@ function Show-ManageShortcutsDialog {
         $script:mgSuspend = $true
         $listView.BeginUpdate()
         $listView.Items.Clear()
+        if($oneDriveRow) { [void]$listView.Items.Add($oneDriveRow) }
         foreach($r in $rows) { [void]$listView.Items.Add($r) }
         $listView.EndUpdate()
         $script:mgSuspend = $false
@@ -1861,7 +1881,13 @@ function Show-ManageShortcutsDialog {
       }
     }
 
+    $listView.Add_ItemCheck({
+        param($s, $e)
+        # The pinned OneDrive row can never be ticked.
+        try { if($listView.Items[$e.Index].Tag.autoSkipped) { $e.NewValue = [Windows.Forms.CheckState]::Unchecked } } catch {}
+    })
     $listView.Add_ItemChecked({ & $refreshCapacity })
+    $capTrack.Add_SizeChanged({ & $drawCapacity })
     $listView.Add_ColumnClick({
         param($s, $e)
         if($script:mgSortColumn -eq $e.Column) { $script:mgSortAsc = -not $script:mgSortAsc }
@@ -2033,8 +2059,6 @@ foreach($featureId in $ExcludedListFeatureIDs) {
 }
 
 function Invoke-RefreshTokenExchange {
-    # Redeems the cached refresh token for an access token for a specific resource (v2 endpoint, B2).
-    # Persists the refresh token only when Entra rotated it (A1), so the hot path never writes to disk.
     param([Parameter(Mandatory = $true)][string]$Resource)
 
     $body = @{
@@ -2261,7 +2285,6 @@ function get-AccessToken{
     try {
         $response = Invoke-RefreshTokenExchange -Resource $resource
     } catch {
-        # Refresh token invalid/expired/revoked -> drop it, retry WAM once, then fall back to browser.
         Write-Warning "Cached refresh token invalid or expired, will re-authenticate..."
         $global:octo.LCRefreshToken = $Null
         Remove-Item $global:octo.TokenCachePath -ErrorAction SilentlyContinue
@@ -2275,7 +2298,6 @@ function get-AccessToken{
         throw "Failed to retrieve access token!"
     }
 
-    # Cache the access token against its real lifetime (expires_in seconds), defaulting to ~55 minutes.
     $expiresOn = (Get-Date).AddSeconds(3300)
     if($response.expires_in){
         try { $expiresOn = (Get-Date).AddSeconds([double]$response.expires_in) } catch {}
@@ -2287,8 +2309,6 @@ function get-AccessToken{
 }
 
 function Send-AuthListenerResponse {
-    # Writes an HTML response to an HttpListener callback and closes it. Everything reflected from the
-    # query string is HTML-encoded by the caller before it reaches here (B3).
     param(
         [Parameter(Mandatory = $true)]$Context,
         [Parameter(Mandatory = $true)][string]$Html,
@@ -2308,7 +2328,6 @@ function Send-AuthListenerResponse {
 }
 
 function Get-AuthLandingPage {
-    # Branded, self-closing landing page shown in the browser after the callback (D6).
     param(
         [Parameter(Mandatory = $true)][ValidateSet('success','failure')][string]$Kind,
         [string]$Detail = ""
@@ -2333,7 +2352,7 @@ function Get-AuthLandingPage {
  <p class="accent">$heading</p>
  <p>$message</p>
  $detailHtml
- <p class="brand">M365AutoLink &middot; Lieben Consultancy</p>
+ <p class="brand">M365AutoLink &middot; JSolve B.V.</p>
 </div>
 <script>setTimeout(function(){window.close();},1500);</script>
 </body></html>
@@ -2349,8 +2368,6 @@ function Get-BrowserAuthorizationCode {
 
     $redirectUri = "http://localhost:$port/"
 
-    # HttpListener handles HTTP correctly (vs. the raw TcpListener that only parsed the first line).
-    # Binding to localhost does not require admin rights.
     $listener = [System.Net.HttpListener]::new()
     $listener.Prefixes.Add($redirectUri)
     try {
@@ -2359,13 +2376,11 @@ function Get-BrowserAuthorizationCode {
         throw "Could not start the local sign-in listener on port $port : $($_.Exception.Message)"
     }
 
-    # PKCE (S256) + anti-forgery state so any other local process cannot inject a code.
     $codeVerifier = New-PkceCodeVerifier
     $codeChallenge = New-PkceCodeChallenge -Verifier $codeVerifier
     $state = [Guid]::NewGuid().ToString("N")
     $scope = "$($global:octo.graphUrl)/.default offline_access"
 
-    # v2 authorize endpoint (scope=, not resource=).
     $authUrl = "$($global:octo.authorizeUrl)?" +
         "client_id=$([System.Uri]::EscapeDataString($global:octo.LCClientId))" +
         "&response_type=code" +
@@ -2376,10 +2391,6 @@ function Get-BrowserAuthorizationCode {
         "&code_challenge=$([System.Uri]::EscapeDataString($codeChallenge))" +
         "&code_challenge_method=S256"
 
-    Write-Host ""
-    Write-Host "============================================" -ForegroundColor Cyan
-    Write-Host " First-time authentication required" -ForegroundColor Cyan
-    Write-Host "============================================" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "Opening browser for sign-in..." -ForegroundColor Yellow
     Write-Host "(After signing in once, future runs will be silent)" -ForegroundColor DarkGray
@@ -2407,8 +2418,6 @@ function Get-BrowserAuthorizationCode {
             $query = $context.Request.QueryString
             $returnedState = [string]$query["state"]
 
-            # ignore anything whose state doesn't match ours (junk, races, injection attempts)
-            # instead of terminating the wait.
             if($returnedState -ne $state){
                 Send-AuthListenerResponse -Context $context -StatusCode 400 -Html (Get-AuthLandingPage -Kind 'failure' -Detail 'Unexpected request ignored.')
                 continue
@@ -2429,7 +2438,6 @@ function Get-BrowserAuthorizationCode {
                 break
             }
 
-            # State matched but neither code nor error present: ignore and keep waiting.
             Send-AuthListenerResponse -Context $context -StatusCode 400 -Html (Get-AuthLandingPage -Kind 'failure' -Detail 'Incomplete request ignored.')
         }
     } finally {
@@ -2446,7 +2454,6 @@ function Get-BrowserAuthorizationCode {
 
     Write-Host "Authorization code received, exchanging for tokens..." -ForegroundColor Cyan
 
-    # v2 token endpoint. include the PKCE code_verifier in the exchange.
     $tokenBody = @{
         grant_type    = "authorization_code"
         client_id     = $global:octo.LCClientId
@@ -2461,7 +2468,7 @@ function Get-BrowserAuthorizationCode {
     if ($response.refresh_token) {
         Save-RefreshToken -RefreshToken $response.refresh_token
         Write-Host ""
-        Write-Host "Authentication successful! Token cached for future use." -ForegroundColor Green
+        Write-Host "Authentication successful! Token cached." -ForegroundColor Green
         Write-Host ""
         return $response.refresh_token
     }
@@ -2492,7 +2499,6 @@ function New-GraphQuery {
         [Parameter(Mandatory = $false)]
         [String]$ContentType = 'application/json; charset=utf-8',
 
-        # Set for calls where a failure is expected and handled by the caller (e.g. a 404 probe), to keep the log clean.
         [Parameter(Mandatory = $false)]
         [switch]$SuppressErrorDetail
     )
@@ -2544,9 +2550,9 @@ function New-GraphQuery {
             try {
                 $headers = get-resourceHeaders -resource $resource
                 if($IncludeBody){
-                    return (Invoke-RestMethod -Uri $RequestUri -Method $Method -Headers $headers -Body $Body -ContentType $ContentType -Verbose:$False -ErrorAction Stop -UserAgent "ISV|LiebenConsultancy|M365AutoLink|1.0")
+                    return (Invoke-RestMethod -Uri $RequestUri -Method $Method -Headers $headers -Body $Body -ContentType $ContentType -Verbose:$False -ErrorAction Stop -UserAgent "ISV|JSolveBV|M365AutoLink|1.0")
                 }
-                return (Invoke-RestMethod -Uri $RequestUri -Method $Method -Headers $headers -ContentType $ContentType -Verbose:$False -ErrorAction Stop -UserAgent "ISV|LiebenConsultancy|M365AutoLink|1.0")
+                return (Invoke-RestMethod -Uri $RequestUri -Method $Method -Headers $headers -ContentType $ContentType -Verbose:$False -ErrorAction Stop -UserAgent "ISV|JSolveBV|M365AutoLink|1.0")
             } catch {
                 $statusCode = $null
                 try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
@@ -2709,8 +2715,9 @@ function Update-TrayState {
         [ValidateSet("Info", "Warning", "Error")]
         [string]$BalloonIcon = "Info",
         [string]$BalloonClickUrl = "",
+        [string]$BalloonClickAction = "",
         [long]$TotalItemCount,
-        [ValidateSet("ok", "approaching", "over")]
+        [ValidateSet("ok", "yellow", "orange", "red")]
         [string]$ItemCountStatus,
         [switch]$IsRunning
     )
@@ -2751,6 +2758,7 @@ function Update-TrayState {
         $script:traySync.BalloonMsg = $BalloonMessage
         $script:traySync.BalloonIcon = $BalloonIcon
         $script:traySync.BalloonClickUrl = $BalloonClickUrl
+        $script:traySync.BalloonClickAction = $BalloonClickAction
         $script:traySync.ShowBalloon = $true
     }
 }
@@ -2782,6 +2790,7 @@ function Initialize-TrayIcon {
             BalloonMsg      = ""
             BalloonIcon     = "Info"
             BalloonClickUrl = ""
+            BalloonClickAction = ""
             ShowBalloon     = $false
             TotalItemCount  = 0
             ItemCountThreshold = $totalItemCountWarningThreshold
@@ -2826,9 +2835,10 @@ function Initialize-TrayIcon {
                 param([string]$Status)
 
                 $accent = switch($Status) {
-                    "over"        { [Drawing.Color]::FromArgb(220, 53, 69) }   # red
-                    "approaching" { [Drawing.Color]::FromArgb(245, 158, 11) }  # amber
-                    default       { [Drawing.Color]::FromArgb(0, 120, 215) }   # blue
+                    "red"    { [Drawing.Color]::FromArgb(220, 53, 69) }
+                    "orange" { [Drawing.Color]::FromArgb(245, 124, 0) }
+                    "yellow" { [Drawing.Color]::FromArgb(234, 179, 8) }
+                    default  { [Drawing.Color]::FromArgb(0, 120, 215) }
                 }
 
                 $bmp = New-Object Drawing.Bitmap(16, 16)
@@ -2860,6 +2870,10 @@ function Initialize-TrayIcon {
 
             $icon.Add_BalloonTipClicked({
                 try {
+                    if([string]$sync.BalloonClickAction -eq "ManageShortcuts") {
+                        if(-not $sync.IsRunning) { $sync.RequestManageShortcuts = $true }
+                        return
+                    }
                     $balloonUrl = [string]$sync.BalloonClickUrl
                     if(-not [string]::IsNullOrWhiteSpace($balloonUrl)) {
                         Start-Process $balloonUrl
@@ -2910,9 +2924,10 @@ function Initialize-TrayIcon {
                     if($hasItemCount) {
                         $itemCountInfoItem.Text = $itemCountText -replace '^M365AutoLink - ', ''
                         $itemCountInfoItem.ForeColor = switch([string]$sync.ItemCountStatus) {
-                            "over"        { [Drawing.Color]::FromArgb(196, 43, 28) }
-                            "approaching" { [Drawing.Color]::FromArgb(176, 110, 0) }
-                            default       { [Drawing.Color]::FromArgb(72, 82, 94) }
+                            "red"    { [Drawing.Color]::FromArgb(196, 43, 28) }
+                            "orange" { [Drawing.Color]::FromArgb(194, 65, 12) }
+                            "yellow" { [Drawing.Color]::FromArgb(146, 94, 0) }
+                            default  { [Drawing.Color]::FromArgb(72, 82, 94) }
                         }
                     }
                 } catch {}
@@ -3166,7 +3181,7 @@ function Initialize-TrayIcon {
 
                     if(-not $menu.Visible) {
                         $iconText = [string]$sync.Text
-                        if(($currentItemStatus -eq "over" -or $currentItemStatus -eq "approaching") -and -not [string]::IsNullOrWhiteSpace([string]$sync.ItemCountText)) {
+                        if($currentItemStatus -ne "ok" -and -not [string]::IsNullOrWhiteSpace([string]$sync.ItemCountText)) {
                             $iconText = [string]$sync.ItemCountText
                         }
                         if($iconText.Length -gt 63) { $iconText = $iconText.Substring(0, 63) }
@@ -3414,7 +3429,7 @@ function Get-ShortcutMetadataMap {
 
 
 function Test-IsShortcutFolder {
-    # A real shortcut carries A2OD* fields, anything else in the folder is not ours to keep.
+    # A real shortcut carries A2OD* fields
     param($Folder)
     foreach($fieldName in @("A2ODRemoteItemUniqueId", "A2ODRemoteItemListId", "A2ODRemoteItemSiteId")) {
         try { if([string]$Folder.ListItemAllFields.$fieldName) { return $true } } catch {}
@@ -3570,10 +3585,14 @@ function Invoke-M365AutoLinkRun {
         $script:userConfig = $null
         $configuredExcludedSiteSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         $userExcludedLibraryKeySet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $heldBackLibraryKeySet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         $cachedStaticExcludedLibraryKeySet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         $cachedStaticExcludedLibraryMap = @{}
         try {
             $script:userConfig = Get-OneDriveUserConfig
+            foreach($libraryKey in @($script:userConfig.preferences.heldBackLibraryKeys)) {
+                if(-not [string]::IsNullOrWhiteSpace([string]$libraryKey)) { [void]$heldBackLibraryKeySet.Add([string]$libraryKey) }
+            }
             foreach($siteUrl in @($script:userConfig.preferences.excludedSiteUrls)) {
                 $normalizedSiteUrl = Get-NormalizedSiteUrl -SiteUrl ([string]$siteUrl)
                 if(-not [string]::IsNullOrWhiteSpace($normalizedSiteUrl)) {
@@ -3663,13 +3682,20 @@ function Invoke-M365AutoLinkRun {
         Write-Log "Checking for '$FolderName' folder in OneDrive..." "INFO"
         Update-TrayState -Text "M365AutoLink - Preparing folder" -Percent 10 -ProgressText "Preparing OneDrive folder" -IsRunning
         $targetFolder = $null
+        # A first run that got interrupted is still a first run, so the flag lives in the user config until the selection is saved.
+        $isFirstRun = [bool]$script:userConfig.diagnostics.firstRunPending
 
         try {
             $targetFolder = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/me/drive/root:/$($FolderName)?`$expand=listItem" -Method "GET" -SuppressErrorDetail
             Write-Log "Folder '$FolderName' already exists" "INFO"
         } catch {
             if ($_.Exception.Response.StatusCode -eq 404) {
-                Write-Log "Creating folder '$FolderName'..." "INFO"
+                Write-Log "Creating folder '$FolderName', this is the first run for this user" "INFO"
+                $isFirstRun = $true
+                if($LimitFirstRun) {
+                    $script:userConfig.diagnostics.firstRunPending = $true
+                    try { Save-OneDriveUserConfig -Config $script:userConfig } catch { Write-Log "Failed to save the first-run marker: $($_.Exception.Message)" "WARN" }
+                }
 
                 $folderBody = @{
                     name = $FolderName
@@ -3727,6 +3753,18 @@ function Invoke-M365AutoLinkRun {
 
         $docLibrary = (New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/sites/$($targetFolder.parentReference.siteId)/lists" -Method "GET") | Where-Object { $_.list.template -eq "mySiteDocumentLibrary" -and !$_.list.hidden}
 
+        # The user's own OneDrive items sync too, so they count towards every total. -1 = unknown.
+        $oneDriveItemCount = [long]-1
+        try {
+            $oneDriveList = New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$rootUrl/personal/$userComponent/_api/web/lists('$($docLibrary.id)')?`$select=ItemCount" -Method GET
+            $oneDriveItemCount = [long](@($oneDriveList)[0].ItemCount)
+            Write-Log "Your OneDrive holds $('{0:N0}' -f $oneDriveItemCount) items" "INFO"
+        } catch {
+            Write-Log "Could not read the item count of your OneDrive, totals leave it out this run: $($_.Exception.Message)" "WARN"
+        }
+        $script:lastOneDriveItemCount = $oneDriveItemCount
+        $oneDriveItemCountForTotals = [long][Math]::Max(0, $oneDriveItemCount)
+
         $currentShortCuts = @()
 
         #retrieve current shortcuts
@@ -3742,7 +3780,6 @@ function Invoke-M365AutoLinkRun {
             Write-HttpErrorDetail -ErrorRecord $_ -Context "unexpected folder cleanup" -Level "WARN"
         }
 
-        # try to fetch all shortcut metadata in one RenderListDataAsStream call. Falls back to per-item.
         $shortcutMetadataMap = @{}
         try {
             $shortcutMetadataMap = Get-ShortcutMetadataMap -WebUrl "$rootUrl/personal/$userComponent" -ListId $docLibrary.id
@@ -3988,7 +4025,6 @@ function Invoke-M365AutoLinkRun {
                 $resolvedItemCount = 0
                 try { $resolvedItemCount = [long]$listMetaData.ItemCount } catch {}
 
-                # Record this library as a linkable candidate for the Manage shortcuts dialog.
                 if(-not [string]::IsNullOrWhiteSpace($cachedLibraryKey) -and -not $manageableLibraryTable.Contains($cachedLibraryKey)) {
                     $manageableLibraryTable[$cachedLibraryKey] = @{
                         key = $cachedLibraryKey
@@ -4000,7 +4036,6 @@ function Invoke-M365AutoLinkRun {
                     }
                 }
 
-                # Extract SharePoint IDs from search results and parent site context.
                 $desiredShortcuts += @{
                     shortCut = @{
                         siteId = $library.siteId
@@ -4058,14 +4093,57 @@ function Invoke-M365AutoLinkRun {
 
         $desiredShortcuts = @($dedupedDesiredShortcuts)
 
-        # Grand total of items across all libraries that will actually be linked (for the tray + bar).
+        $applyFirstRunLimit = $isFirstRun -and $LimitFirstRun -and $totalItemCountYellowThreshold -gt 0
+        $heldBackShortcuts = [System.Collections.Generic.List[hashtable]]::new()
+        $linkedShortcuts = [System.Collections.Generic.List[hashtable]]::new()
+        if($applyFirstRunLimit) {
+            $heldBackLibraryKeySet.Clear()
+            $firstRunBudget = [long][Math]::Max(0, [long]$totalItemCountYellowThreshold - $oneDriveItemCountForTotals)
+            $firstRunTotal = [long]0
+            $desiredShortcuts = @($desiredShortcuts | Sort-Object { [long]$_.itemCount })
+        }
+        foreach($desiredShortcut in $desiredShortcuts) {
+            $desiredTargetKey = Get-ShortcutTargetKey -SiteId ([string]$desiredShortcut.shortCut.siteId) -WebId ([string]$desiredShortcut.shortCut.webId) -ListId ([string]$desiredShortcut.shortCut.listId)
+            $isHeldBack = $false
+            if($applyFirstRunLimit) {
+                if($firstRunTotal + [long]$desiredShortcut.itemCount -le $firstRunBudget) {
+                    $firstRunTotal += [long]$desiredShortcut.itemCount
+                } else {
+                    $isHeldBack = $true
+                    if($desiredTargetKey) { [void]$heldBackLibraryKeySet.Add($desiredTargetKey) }
+                }
+            } elseif($LimitFirstRun -and $desiredTargetKey -and $heldBackLibraryKeySet.Contains($desiredTargetKey)) {
+                $isHeldBack = $true
+            }
+
+            if(-not $isHeldBack) {
+                $linkedShortcuts.Add($desiredShortcut)
+                continue
+            }
+            $heldBackShortcuts.Add($desiredShortcut)
+            if($desiredTargetKey -and $manageableLibraryTable.Contains($desiredTargetKey)) {
+                $manageableLibraryTable[$desiredTargetKey].isExcluded = $true
+                $manageableLibraryTable[$desiredTargetKey].heldBack = $true
+            }
+            Write-Log "  '$($desiredShortcut.listName)' on '$($desiredShortcut.shortCut.siteUrl)' ($('{0:N0}' -f [long]$desiredShortcut.itemCount) items) is held back by the first-run sync limit, include it via Manage shortcuts" "INFO"
+        }
+        $desiredShortcuts = @($linkedShortcuts)
+
+        if($applyFirstRunLimit) {
+            Write-Log "First run: linking $($linkedShortcuts.Count) of $($linkedShortcuts.Count + $heldBackShortcuts.Count) libraries to stay within $('{0:N0}' -f $totalItemCountYellowThreshold) items, $($heldBackShortcuts.Count) held back" $(if($heldBackShortcuts.Count -gt 0){"WARN"}else{"INFO"})
+            # Saved before any shortcut is created, so an interrupted run cannot link the held-back libraries next time.
+            $script:userConfig.preferences.heldBackLibraryKeys = @($heldBackLibraryKeySet)
+            $script:userConfig.diagnostics.firstRunPending = $false
+            try { Save-OneDriveUserConfig -Config $script:userConfig } catch { Write-Log "Failed to save the first-run selection: $($_.Exception.Message)" "WARN" }
+        }
+
         $totalLinkedItemCount = [long]0
         foreach($desiredShortcut in $desiredShortcuts) {
             try { $totalLinkedItemCount += [long]$desiredShortcut.itemCount } catch {}
         }
-        Write-Log "Combined item count across $($desiredShortcuts.Count) linked librar$(if($desiredShortcuts.Count -eq 1){'y'}else{'ies'}): $('{0:N0}' -f $totalLinkedItemCount)" "INFO"
+        $totalSyncedItemCount = $oneDriveItemCountForTotals + $totalLinkedItemCount
+        Write-Log "Combined item count across $($desiredShortcuts.Count) linked librar$(if($desiredShortcuts.Count -eq 1){'y'}else{'ies'}): $('{0:N0}' -f $totalLinkedItemCount), $('{0:N0}' -f $totalSyncedItemCount) including your OneDrive" "INFO"
 
-        # Per-library options feed the Manage shortcuts dialog (one row per candidate library).
         $script:lastMappedLibraryOptions = @($manageableLibraryTable.Values)
         $excludedLibraryCount = @($script:lastMappedLibraryOptions | Where-Object { $_.isExcluded }).Count
         Write-Log "Manageable libraries: $(@($script:lastMappedLibraryOptions).Count) ($excludedLibraryCount currently excluded by the user)" "INFO"
@@ -4139,7 +4217,6 @@ function Invoke-M365AutoLinkRun {
                     Write-Log "  Moved shortcut into '$FolderName' folder" "INFO"
                 }
 
-                # Rename the shortcut if the created name differs from our desired name (Graph may append suffix)
                 $cleanName = Get-SafeDriveItemName -Name (Get-CleanedShortcutName -Name $newShortCut.name)
                 if($newShortCut.id -and $cleanName -ne $newShortCut.name){
                     try {
@@ -4185,7 +4262,6 @@ function Invoke-M365AutoLinkRun {
             }
         }
 
-        # Rename existing shortcuts if link name cleanup patterns apply
         $renameCount = 0
         if($linkNameReplacements.Count -gt 0) {
             Write-Log "Checking existing shortcuts for name cleanup..." "INFO"
@@ -4211,7 +4287,6 @@ function Invoke-M365AutoLinkRun {
             }
         }
 
-        #delete shortcuts user should no longer have access to
         $deletedCount = 0
         $deleteTotal = [Math]::Max(1, $currentShortCuts.Count)
         $deleteIndex = 0
@@ -4284,13 +4359,15 @@ function Invoke-M365AutoLinkRun {
             }
         }
 
-        # Summary
         $modeLabel = if($DryRun) { " (DRY RUN)" } else { "" }
         Write-Log "=== Summary$modeLabel ===" "INFO"
-        Write-Log "Shortcuts Created: $successCount" "SUCCESS"
-        Write-Log "Shortcuts Renamed: $renameCount" "SUCCESS"
-        Write-Log "Shortcuts Skipped: $skipCount" "INFO"
-        Write-Log "Shortcuts Deleted: $deletedCount" "SUCCESS"
+        Write-Log "Created: $successCount" "SUCCESS"
+        Write-Log "Renamed: $renameCount" "SUCCESS"
+        Write-Log "Skipped: $skipCount" "INFO"
+        Write-Log "Deleted: $deletedCount" "SUCCESS"
+        if($heldBackShortcuts.Count -gt 0) {
+            Write-Log "Held back by the first-run limit: $($heldBackShortcuts.Count)" "INFO"
+        }
         if($errorCount -gt 0){
             Write-Log "Errors: $errorCount" "ERROR"
         }else{
@@ -4298,7 +4375,7 @@ function Invoke-M365AutoLinkRun {
         }
 
         if($alreadyExistingShortcuts.Count -gt 0) {
-            Write-Log "Already existing: $($alreadyExistingShortcuts.Count)" "SUCCESS"
+            Write-Log "Existing: $($alreadyExistingShortcuts.Count)" "SUCCESS"
         }
 
         $script:lastAlreadyExistingShortcuts = @($alreadyExistingShortcuts)
@@ -4314,6 +4391,7 @@ function Invoke-M365AutoLinkRun {
         $script:userConfig.cache.staticExcludedLibraries = @($cachedStaticExcludedLibraryMap.Values | Sort-Object key)
         $script:userConfig.diagnostics.lastAlreadyExisting = @($script:lastAlreadyExistingShortcuts)
         $script:userConfig.diagnostics.totalItemCount = $totalLinkedItemCount
+        if($oneDriveItemCount -ge 0) { $script:userConfig.diagnostics.oneDriveItemCount = $oneDriveItemCount }
 
         if(-not $script:searchIncomplete) {
             $script:userConfig.diagnostics.lastDesiredCount = [int]$desiredCount
@@ -4326,17 +4404,20 @@ function Invoke-M365AutoLinkRun {
 
         Update-TrayState -Text "M365AutoLink - Mapping complete" -Percent 100 -ProgressText "Completed" -IsRunning:$false
 
-        $totalItemCountStatus = Get-TotalItemCountStatus -TotalItemCount $totalLinkedItemCount
-        Update-TrayState -TotalItemCount $totalLinkedItemCount -ItemCountStatus $totalItemCountStatus
-        if($totalItemCountStatus -ne "ok") {
-            $itemCountBalloon = if($totalItemCountStatus -eq "over") {
-                "Your linked libraries now hold $('{0:N0}' -f $totalLinkedItemCount) items, over the $('{0:N0}' -f $totalItemCountWarningThreshold) limit. Explorer may not show all folders. Click to learn how to reduce this."
+        $totalItemCountStatus = Get-TotalItemCountStatus -TotalItemCount $totalSyncedItemCount
+        Update-TrayState -TotalItemCount $totalSyncedItemCount -ItemCountStatus $totalItemCountStatus
+        # Yellow only colors the icon, orange and red also notify on every run.
+        if($totalItemCountStatus -eq "red" -or $totalItemCountStatus -eq "orange") {
+            $itemCountBalloon = if($totalItemCountStatus -eq "red") {
+                "Your OneDrive and linked libraries now hold $('{0:N0}' -f $totalSyncedItemCount) items, over the $('{0:N0}' -f $totalItemCountWarningThreshold) limit. Explorer may not show all folders. Click to learn how to reduce this."
             } else {
-                "Your linked libraries hold $('{0:N0}' -f $totalLinkedItemCount) items, approaching the $('{0:N0}' -f $totalItemCountWarningThreshold) limit. Click to learn more."
+                "Your OneDrive and linked libraries hold $('{0:N0}' -f $totalSyncedItemCount) items. Above $('{0:N0}' -f $totalItemCountOrangeThreshold), sync can be slow, especially on virtual desktops. Click to learn more."
             }
-            $itemCountBalloonIcon = if($totalItemCountStatus -eq "over") { "Warning" } else { "Info" }
+            $itemCountBalloonIcon = if($totalItemCountStatus -eq "red") { "Warning" } else { "Info" }
             Update-TrayState -ShowBalloon -BalloonTitle "M365AutoLink" -BalloonMessage $itemCountBalloon -BalloonIcon $itemCountBalloonIcon -BalloonClickUrl $ItemCountHelpLink
-            Write-Log "Combined linked item count is $totalItemCountStatus the limit ($('{0:N0}' -f $totalLinkedItemCount)/$('{0:N0}' -f $totalItemCountWarningThreshold))" "WARN"
+        }
+        if($totalItemCountStatus -ne "ok") {
+            Write-Log "Combined item count including your OneDrive is at level $totalItemCountStatus ($('{0:N0}' -f $totalSyncedItemCount) items; yellow $('{0:N0}' -f $totalItemCountYellowThreshold), orange $('{0:N0}' -f $totalItemCountOrangeThreshold), red $('{0:N0}' -f $totalItemCountWarningThreshold))" "WARN"
         }
 
         Write-Log "=== Script Completed ===" "SUCCESS"
@@ -4348,6 +4429,8 @@ function Invoke-M365AutoLinkRun {
             deletedCount = $deletedCount
             errorCount = $errorCount
             existingConflictCount = @($alreadyExistingShortcuts).Count
+            firstRunLinkedCount = $(if($applyFirstRunLimit) { $desiredShortcuts.Count } else { 0 })
+            firstRunHeldBackCount = $(if($applyFirstRunLimit) { $heldBackShortcuts.Count } else { 0 })
         }
     } catch {
         Update-TrayState -Text "M365AutoLink - Error" -ProgressText "Failed" -IsRunning:$false
@@ -4365,7 +4448,6 @@ function Invoke-M365AutoLinkRun {
 $runInTrayMode = $EnableSystemTrayIcon -and $KeepRunningInTray
 
 if($Uninstall) {
-    # Uninstall short-circuits everything else: no deployment, no tray, no mapping run.
     Invoke-Uninstall -DeployToPath $deployToPath
     return
 }
@@ -4484,9 +4566,16 @@ try {
             }
 
             $shortcutsPresent = (([int]$summary.successCount) + ([int]$summary.existingConflictCount)) -gt 0
+            $firstRunHeldBackCount = [int]$summary.firstRunHeldBackCount
             try {
                 $onboardMarker = Join-Path -Path ([System.IO.Path]::GetDirectoryName($global:octo.LogPath)) -ChildPath ".onboarded"
-                if($shortcutsPresent -and -not (Test-Path -LiteralPath $onboardMarker)) {
+                if($firstRunHeldBackCount -gt 0) {
+                    # Only on the first run, later runs just log the held-back libraries. Replaces the onboarding balloon.
+                    $firstRunLibraryCount = $firstRunHeldBackCount + [int]$summary.firstRunLinkedCount
+                    $heldBackMessage = "To avoid sync issues, $firstRunHeldBackCount of $firstRunLibraryCount libraries were not linked on this first run. Click here, or right-click the M365AutoLink tray icon > Manage shortcuts, to add them."
+                    Update-TrayState -ShowBalloon -BalloonTitle "Not all shortcuts were created" -BalloonMessage $heldBackMessage -BalloonIcon "Info" -BalloonClickAction "ManageShortcuts"
+                    New-Item -ItemType File -Path $onboardMarker -Force | Out-Null
+                } elseif($shortcutsPresent -and -not (Test-Path -LiteralPath $onboardMarker)) {
                     $onboardMessage = "M365AutoLink created your shortcuts in the '$FolderName' folder in OneDrive. Allow a few minutes for OneDrive to sync them into File Explorer. Tip: right-click this tray icon > Manage shortcuts to include or exclude libraries."
                     $onboardClickTarget = if(-not [string]::IsNullOrWhiteSpace($script:localShortcutFolderPath)) { $script:localShortcutFolderPath } else { [string]$script:localOneDriveRootPath }
                     Update-TrayState -ShowBalloon -BalloonTitle "M365AutoLink is set up" -BalloonMessage $onboardMessage -BalloonIcon "Info" -BalloonClickUrl $onboardClickTarget

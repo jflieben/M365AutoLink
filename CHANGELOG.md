@@ -2,6 +2,19 @@
 
 All notable changes to the delegated (per-user) edition of **M365AutoLink** (`M365AutoLink.ps1`) are documented here.
 
+## [1.5.0]
+
+### Sync budget
+- **OneDrive counts towards the total.** The item count of the user's own OneDrive is now added to the linked libraries everywhere a total is shown or checked. **Manage shortcuts** shows it as a greyed-out top row that can't be excluded.
+- **Yellow and orange levels.** Besides red at 1,000,000 (fine for modern physical PCs), the total now turns yellow at 100,000 and orange at 250,000, since virtual desktops (VDI) struggle well before 1,000,000. Configurable via `$totalItemCountYellowThreshold` and `$totalItemCountOrangeThreshold`. They replace `$totalItemCountWarningRatio` and the amber "approaching" level. Yellow only colors the tray icon; orange and red also notify after each run.
+- The capacity bar in **Manage shortcuts** has tick marks at the yellow and orange levels, and its total now covers every library, not only the rows the filter shows.
+
+### First-run limit
+- **The first run links at most 100,000 items.** When the `AutoLink` folder doesn't exist yet, libraries are linked smallest first (the most libraries that fit) until the total, including OneDrive, would pass `$totalItemCountYellowThreshold`. The rest is held back, so new users don't get a sudden flood of sync metadata.
+- A notification says not all shortcuts were created; clicking it opens **Manage shortcuts**, where held-back libraries show as **Held back** with their item count. Unticking one includes it. Later runs keep them held back and only log them.
+- The selection is saved to the user's OneDrive config before any shortcut is created, and an interrupted first run is still treated as the first run next time.
+- Disable with `$LimitFirstRun = $false`.
+
 ## [1.4.0]
 
 ### Security & authentication

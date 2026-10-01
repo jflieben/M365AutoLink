@@ -17,7 +17,7 @@ This script (`M365AutoLink.ps1`) runs **as the signed-in user** (delegated authe
 - **Smart filtering**: include/exclude SharePoint sites by URL wildcard, and skip system libraries automatically.
 - **Permission-aware**: only links libraries you can actually access; obsolete shortcuts are removed when you lose access.
 - **Self-service shortcut management**: a built-in **Manage shortcuts** window lets you see every linked library and exclude the ones you don't want. Changes save to OneDrive and apply across your devices.
-- **Sync-budget awareness**: tracks the total number of items across all linked libraries and warns you (tray icon, tooltip, capacity bar) as you approach the point where Windows Explorer/OneDrive sync becomes unreliable.
+- **Sync-budget awareness**: tracks the total number of items OneDrive syncs (your own OneDrive plus all linked libraries) and warns you in yellow, orange and red (tray icon, tooltip, capacity bar) as you approach the point where Windows Explorer/OneDrive sync becomes unreliable. The first run links at most 100,000 items, so new users don't get a sudden flood of sync metadata.
 - **Tray workflow**: optional system tray icon keeps the script alive so you can re-run it, manage shortcuts, or open the log without restarting.
 - **Floating progress bar**: an optional bottom-right progress indicator shows what the script is doing.
 - **Launch persistence**: optionally create Desktop / Start Menu shortcuts, or run automatically at logon.
@@ -58,7 +58,9 @@ Right-click the tray icon and choose **Manage shortcuts** to open the self-servi
 
 ![Manage shortcuts and link status](exclusions_and_link_status.png)
 
-- The **capacity bar** at the top shows how many items your currently-included libraries add up to, against the recommended ~1,000,000-item budget. It turns amber as you approach the limit and red once you go over.
+- Your own **OneDrive** is the greyed-out top row. It always syncs and can't be excluded, but its items count towards the total.
+- The **capacity bar** at the top shows how many items your OneDrive and currently-included libraries add up to. It turns yellow above 100,000 (may be slow on virtual desktops), orange above 250,000 (too many for most virtual desktops) and red above 1,000,000 (over the limit, also for physical PCs).
+- **First run:** when the `AutoLink` folder doesn't exist yet, only libraries up to 100,000 items in total are linked, smallest first so you get as many as possible. A notification tells you the rest were held back; click it (or open **Manage shortcuts**) and untick the **Held back** rows to add them. Later runs keep them held back until you do.
 - Exclusions are saved to your OneDrive (`Apps/M365AutoLink/config.json`), so they follow you to every device where you run the script.
 - **Saving re-runs the script automatically** to apply your changes immediately.
 
@@ -85,11 +87,13 @@ Edit the `##########START CONFIGURATION##########` block at the top of the scrip
 ### Sync-budget warnings
 | Variable | Description | Default |
 |---|---|---|
-| `$totalItemCountWarningThreshold` | Combined item count across all linked libraries at which the tool shows a red "over limit" warning. | `1000000` |
-| `$totalItemCountWarningRatio` | Fraction of the threshold at which the amber "approaching" warning appears. | `0.9` |
-| `$ItemCountHelpLink` | Knowledgebase article opened from the over/approaching-limit notification. | lieben.nu article |
+| `$totalItemCountYellowThreshold` | Combined item count (OneDrive plus linked libraries) for the yellow warning: may be slow on virtual desktops (VDI). Also the first-run limit. | `100000` |
+| `$totalItemCountOrangeThreshold` | Combined item count for the orange warning: too many for most virtual desktops. Also shows a notification after each run. | `250000` |
+| `$totalItemCountWarningThreshold` | Combined item count for the red "over limit" warning. Also shows a notification after each run. | `1000000` |
+| `$LimitFirstRun` | On a user's first run, only link libraries up to `$totalItemCountYellowThreshold` items and hold back the rest until the user includes them in **Manage shortcuts**. | `$true` |
+| `$ItemCountHelpLink` | Knowledgebase article opened from the orange/red notification. | Microsoft support article |
 
-These only **warn** — the tool never blocks you from going over the limit.
+Set a threshold to `0` to disable it. Apart from the first-run limit, these only **warn**: the tool never blocks you from going over.
 
 ### UI / tray / progress
 | Variable | Description | Default |
@@ -142,15 +146,15 @@ Example `M365AutoLink.config.json`:
   "excludedSitesByWildcard": ["*/personal/*", "*/sites/AppCatalog*"]
 }
 ```
-Overridable keys include: `FolderName`, `CloudType`, `ClientID`, `WindowStyle`, `DryRun`, `LaunchModes`, `deployToPath`, `Uninstall`, `excludedSitesByWildcard`, `includedSitesByWildcard`, `maxFileCount`, `minFileCount`, `totalItemCountWarningThreshold`, `ShowProgressBar`, `EnableSystemTrayIcon`, `KeepRunningInTray`, `DeviceNameIncludeFilter`, `AutoRefreshHours`, `DeletionSafetyRatio`, `LogHistoryCount`, `TrayHelpLink`, `ItemCountHelpLink`.
+Overridable keys include: `FolderName`, `CloudType`, `ClientID`, `WindowStyle`, `DryRun`, `LaunchModes`, `deployToPath`, `Uninstall`, `excludedSitesByWildcard`, `includedSitesByWildcard`, `maxFileCount`, `minFileCount`, `totalItemCountYellowThreshold`, `totalItemCountOrangeThreshold`, `totalItemCountWarningThreshold`, `LimitFirstRun`, `ShowProgressBar`, `EnableSystemTrayIcon`, `KeepRunningInTray`, `DeviceNameIncludeFilter`, `AutoRefreshHours`, `DeletionSafetyRatio`, `LogHistoryCount`, `TrayHelpLink`, `ItemCountHelpLink`.
 
 ### Registry-based configuration
 
 The same keys can be set under `HKLM\Software\Policies\Lieben\M365AutoLink` (machine-wide, lockable, most authoritative) or `HKCU\Software\Policies\Lieben\M365AutoLink` (per-user). The value name matches the setting name exactly. Value types are coerced to the setting's type, so:
 
 - **Text** settings (`deployToPath`, `FolderName`, `CloudType`, `WindowStyle`, `DeviceNameIncludeFilter`) → `REG_SZ`.
-- **Number** settings (`AutoRefreshHours`, `maxFileCount`, `LogHistoryCount`, `totalItemCountWarningThreshold`) → `REG_DWORD` (or `REG_SZ`).
-- **On/off** settings (`DryRun`, `ShowProgressBar`, `EnableSystemTrayIcon`, `KeepRunningInTray`, `Uninstall`) → `REG_DWORD` `1`/`0`, or `REG_SZ` `true`/`false`.
+- **Number** settings (`AutoRefreshHours`, `maxFileCount`, `LogHistoryCount`, `totalItemCountYellowThreshold`, `totalItemCountOrangeThreshold`, `totalItemCountWarningThreshold`) → `REG_DWORD` (or `REG_SZ`).
+- **On/off** settings (`DryRun`, `ShowProgressBar`, `EnableSystemTrayIcon`, `KeepRunningInTray`, `Uninstall`, `LimitFirstRun`) → `REG_DWORD` `1`/`0`, or `REG_SZ` `true`/`false`.
 - **List** settings (`excludedSitesByWildcard`, `includedSitesByWildcard`, `LaunchModes`) → `REG_MULTI_SZ` (one pattern per line).
 
 **Example 1 — set the deploy path and folder name (PowerShell, machine policy):**
@@ -298,7 +302,8 @@ https://www.lieben.nu/liebensraum/commercial-use/
 | A site/library is never linked | The site is **excluded from Search**, or its content was only recently added (search index delay). | Check **Settings → Site → Search and offline availability** (`/_layouts/15/srchvis.aspx`); wait for the index to catch up for brand-new sites. |
 | Shortcuts are created but never appear in File Explorer | OneDrive isn't signed in / syncing a work account on the device. | Sign OneDrive into the work account; the pre-flight check warns about this in a tray balloon. |
 | A library shows as a **folder** full of files instead of a shortcut | The library became sync-blocked; OneDrive converted the shortcut to a folder. | The next run detects and removes these automatically. |
-| "Approaching/over limit" warning (amber/red tray icon) | Combined item count across linked libraries is near the ~1,000,000 sync budget. | Exclude large libraries in **Manage shortcuts**; see the linked KB article. |
+| Yellow, orange or red tray icon | Combined item count of your OneDrive plus linked libraries is above 100,000 / 250,000 / 1,000,000. | Exclude large libraries in **Manage shortcuts**; see the linked KB article. |
+| Some libraries were never linked after the first run | The first-run limit held them back (status **Held back** in **Manage shortcuts**). | Untick them in **Manage shortcuts**, or set `$LimitFirstRun = $false`. |
 | Some libraries are missing and you're a guest/B2B user | Guest accounts often can't run SharePoint Search in the host tenant. | Expected limitation; link those manually via OneDrive. |
 | Sign-in never completes / no browser appears | `$WindowStyle = "Hidden"` on a device without silent SSO. | Set `$WindowStyle = "Normal"`. |
 | "needs admin consent" balloon | The app registration hasn't been admin-consented in your tenant. | Have an admin [grant consent](https://login.microsoftonline.com/organizations/adminconsent?client_id=ae7727e4-0471-4690-b155-76cbf5fdcb30). |
