@@ -1,6 +1,6 @@
 <#PSScriptInfo
 
-.VERSION 1.5.0
+.VERSION 1.5.1
 
 .GUID 4ed75660-e426-4553-a432-7817d1f7d02b
 
@@ -42,7 +42,7 @@
 #>
 
 ##########START CONFIGURATION#############################
-$ScriptVersion = "1.5.0"
+$ScriptVersion = "1.5.1"
 $FolderName = "AutoLink" #folder that will be created in onedrive to house all links
 #WARNING: Any pre-existing folders in above folder will be deleted!
 $CloudType = "global" #global, usgov, usdod, china
@@ -393,6 +393,8 @@ function Get-HttpErrorDetail {
         try {
             $reader = New-Object System.IO.StreamReader($response.GetResponseStream())
             try { $body = $reader.ReadToEnd() } finally { $reader.Dispose() }
+            # The stream can only be read once, so hand the body on to callers that inspect ErrorDetails (e.g. shortcutAlreadyExists).
+            if($body) { $ErrorRecord.ErrorDetails = [System.Management.Automation.ErrorDetails]::new($body) }
         } catch {}
     }
     if($body) {
@@ -628,7 +630,9 @@ function Get-NormalizedSiteUrl {
 function Get-LocalOneDriveRootPath {
     $candidates = [System.Collections.Generic.List[string]]::new()
 
-    foreach($envValue in @($env:OneDriveCommercial, $env:OneDriveConsumer, $env:OneDrive)) {
+    # The process environment is a snapshot from startup, the User scope also sees a OneDrive signed in later.
+    $userScope = [System.EnvironmentVariableTarget]::User
+    foreach($envValue in @($env:OneDriveCommercial, [Environment]::GetEnvironmentVariable('OneDriveCommercial', $userScope), $env:OneDriveConsumer, $env:OneDrive, [Environment]::GetEnvironmentVariable('OneDrive', $userScope))) {
         if(-not [string]::IsNullOrWhiteSpace($envValue) -and -not $candidates.Contains([string]$envValue)) {
             $candidates.Add([string]$envValue)
         }
@@ -1292,13 +1296,18 @@ function Get-OneDriveFolder {
         if($statusCode -ne 404) { throw }
     }
 
+    # "fail" instead of "replace": a parallel run on another device may have just created it, replacing would drop its config.json.
     $folderBody = @{
         name = $FolderName
         folder = @{}
-        "@microsoft.graph.conflictBehavior" = "replace"
+        "@microsoft.graph.conflictBehavior" = "fail"
     } | ConvertTo-Json -Depth 3
 
-    [void](Invoke-GraphRaw -Method POST -Uri $ParentChildrenUri -Body $folderBody)
+    try {
+        [void](Invoke-GraphRaw -Method POST -Uri $ParentChildrenUri -Body $folderBody)
+    } catch {
+        if((Get-HttpStatusCode -ErrorRecord $_) -ne 409) { throw }
+    }
     return Invoke-GraphRaw -Method GET -Uri $folderUri
 }
 
@@ -1437,6 +1446,7 @@ function Get-OneDriveUserConfig {
         try {
             $configObject = $rawConfig | ConvertFrom-Json -ErrorAction Stop
         } catch {
+            Write-Log "Your OneDrive config.json is not valid JSON, starting from default settings: $($_.Exception.Message)" "WARN"
             $configObject = $null
         }
     } else {
@@ -1489,29 +1499,19 @@ function Save-ManageDialogSize {
     } catch {}
 }
 
-function Show-InfoDialog {
-    param(
-        [Parameter(Mandatory = $true)][string]$Title,
-        [Parameter(Mandatory = $true)][string]$Message
-    )
-
-    try {
-        Add-Type -AssemblyName System.Windows.Forms
-        [void][System.Windows.Forms.MessageBox]::Show($Message, $Title, [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
-    } catch {
-        Update-TrayState -ShowBalloon -BalloonTitle $Title -BalloonMessage $Message -BalloonIcon "Info"
-    }
-}
-
 function Invoke-ManageShortcuts {
+    # A balloon, not a MessageBox: a modal box that opens behind other windows blocks the main loop until a restart.
     if(-not $script:lastMappedLibraryOptions -or @($script:lastMappedLibraryOptions).Count -eq 0) {
-        Show-InfoDialog -Title "M365AutoLink" -Message "No shortcuts to manage yet.`r`n`r`nRun a mapping first, then open Manage shortcuts again."
+        Write-Log "Manage shortcuts: no libraries to manage yet" "INFO"
+        Update-TrayState -Text "M365AutoLink - Idle" -ShowBalloon -BalloonMessage "No libraries to manage yet. Use Run now and try again once it has finished." -BalloonIcon "Info"
         return
     }
 
     try {
         Update-TrayState -Text "M365AutoLink - Loading config" -ProgressText "Opening shortcut manager"
         if(-not $script:userConfig) {
+            # The last run could not read the config, so try again now rather than saving defaults over it.
+            Write-Log "Manage shortcuts: loading your settings from OneDrive" "INFO"
             $script:userConfig = Get-OneDriveUserConfig
         }
 
@@ -1527,6 +1527,7 @@ function Invoke-ManageShortcuts {
 
         $selectionResult = Show-ManageShortcutsDialog -LibraryOptions @($script:lastMappedLibraryOptions) -OneDriveItemCount $script:lastOneDriveItemCount
         if($selectionResult.isCanceled) {
+            Write-Log "Manage shortcuts: closed without saving" "INFO"
             Update-TrayState -Text "M365AutoLink - Idle" -ProgressText "No changes"
             return
         }
@@ -1555,6 +1556,7 @@ function Invoke-ManageShortcuts {
         $hasLegacySiteExclusions = (@($script:userConfig.preferences.excludedSiteUrls).Count -gt 0)
 
         if(-not $exclusionsChanged -and -not $hasLegacySiteExclusions) {
+            Write-Log "Manage shortcuts: saved without changes" "INFO"
             Update-TrayState -Text "M365AutoLink - Idle" -ProgressText "No changes" -ShowBalloon -BalloonMessage "No changes to apply." -BalloonIcon "Info"
             return
         }
@@ -1563,6 +1565,7 @@ function Invoke-ManageShortcuts {
         $script:userConfig.preferences.heldBackLibraryKeys = @($heldBackSet)
         $script:userConfig.preferences.excludedSiteUrls = @()
         Save-OneDriveUserConfig -Config $script:userConfig
+        Write-Log "Manage shortcuts: saved (excluded: $($userExcludedSet.Count), held back: $($heldBackSet.Count))" "INFO"
 
         if($exclusionsChanged) {
             # Exclusions changed: re-run automatically instead of asking the user to click Run now.
@@ -1974,6 +1977,8 @@ function Show-ManageShortcutsDialog {
                 $rowControl.Top = $filterBox.Top
             }
         } catch {}
+        # Opened from a hidden background process (e.g. after a toast click), Windows may keep it behind the active window.
+        try { $form.TopMost = $true; $form.Activate(); $form.TopMost = $false } catch {}
     })
 
     try {
@@ -2593,9 +2598,12 @@ function New-GraphQuery {
             return (Invoke-RequestOnce -RequestUri $nextURL -IncludeBody)
         } catch {
             # This branch throws a string, so the HTTP status has to be carried in the message itself.
-            $Message = ($_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction SilentlyContinue).error.message
-            if($null -eq $Message) { $Message = $($_.Exception.Message) }
-            $failedStatusCode = Get-HttpStatusCode -ErrorRecord $_
+            $requestError = $_
+            $Message = $null
+            # A non-JSON body (e.g. a proxy error page) makes ConvertFrom-Json throw even with SilentlyContinue.
+            try { $Message = ($requestError.ErrorDetails.Message | ConvertFrom-Json -ErrorAction Stop).error.message } catch {}
+            if($null -eq $Message) { $Message = $($requestError.Exception.Message) }
+            $failedStatusCode = Get-HttpStatusCode -ErrorRecord $requestError
             if($failedStatusCode) { $Message = "HTTP $failedStatusCode - $Message" }
             throw $Message
         }
@@ -2785,7 +2793,6 @@ function Initialize-TrayIcon {
             TrayReady       = $false
             IsRunning       = $false
             HasCompletedRun = $false
-            HasMappedSites  = $false
             HasExistingConflicts = $false
             RequestRerun    = $false
             RequestManageShortcuts = $false
@@ -2877,7 +2884,7 @@ function Initialize-TrayIcon {
             $icon.Add_BalloonTipClicked({
                 try {
                     if([string]$sync.BalloonClickAction -eq "ManageShortcuts") {
-                        if(-not $sync.IsRunning) { $sync.RequestManageShortcuts = $true }
+                        $sync.RequestManageShortcuts = $true
                         return
                     }
                     $balloonUrl = [string]$sync.BalloonClickUrl
@@ -2915,13 +2922,8 @@ function Initialize-TrayIcon {
 
             $menu.Add_Opening({
                 try {
-                    if($sync.IsRunning) {
-                        $remapItem.Enabled = $false
-                        $manageShortcutsItem.Enabled = $false
-                    } else {
-                        $remapItem.Enabled = $true
-                        $manageShortcutsItem.Enabled = [bool]$sync.HasMappedSites
-                    }
+                    # Manage shortcuts stays clickable, the main loop opens it once any run in progress is done.
+                    $remapItem.Enabled = -not $sync.IsRunning
 
                     $itemCountText = [string]$sync.ItemCountText
                     $hasItemCount = -not [string]::IsNullOrWhiteSpace($itemCountText)
@@ -2957,15 +2959,13 @@ function Initialize-TrayIcon {
             $manageShortcutsItem = New-Object Windows.Forms.ToolStripMenuItem("Manage shortcuts")
             $manageShortcutsItem.Add_Click({
                 try {
-                    if(-not $sync.IsRunning) {
-                        $sync.RequestManageShortcuts = $true
-                        $icon.ShowBalloonTip(1500, "M365AutoLink", "Opening Manage shortcuts...", [Windows.Forms.ToolTipIcon]::Info)
-                    }
+                    $sync.RequestManageShortcuts = $true
+                    $openingText = if($sync.IsRunning) { "Manage shortcuts opens when the current run is done..." } else { "Opening Manage shortcuts..." }
+                    $icon.ShowBalloonTip(1500, "M365AutoLink", $openingText, [Windows.Forms.ToolTipIcon]::Info)
                 } catch {
                     try { $icon.ShowBalloonTip(2000, "M365AutoLink", "Tray action failed. Please try again.", [Windows.Forms.ToolTipIcon]::Warning) } catch {}
                 }
             })
-            $manageShortcutsItem.Enabled = $false
 
             $helpItem = New-Object Windows.Forms.ToolStripMenuItem("Open help")
             $helpItem.Add_Click({
@@ -3407,32 +3407,6 @@ function Get-ListMetadataWithFallback {
     throw "List metadata lookup failed for list '$listId' using all GetById fallbacks"
 }
 
-function Get-ShortcutMetadataMap {
-    param(
-        [Parameter(Mandatory = $true)][string]$WebUrl,
-        [Parameter(Mandatory = $true)][string]$ListId
-    )
-
-    $map = @{}
-    $viewXml = "<View><ViewFields><FieldRef Name='UniqueId'/><FieldRef Name='FileLeafRef'/><FieldRef Name='A2ODRemoteItemSiteId'/><FieldRef Name='A2ODRemoteItemWebId'/><FieldRef Name='A2ODRemoteItemListId'/><FieldRef Name='A2ODRemoteItemUniqueId'/></ViewFields><RowLimit>5000</RowLimit></View>"
-    $body = @{ parameters = @{ RenderOptions = 2; ViewXml = $viewXml } } | ConvertTo-Json -Depth 5
-    $uri = "$WebUrl/_api/web/lists('$ListId')/RenderListDataAsStream"
-
-    $response = New-GraphQuery -resource $global:octo.sharepointUrl -Uri $uri -Method POST -Body $body
-    foreach($row in @($response.Row)) {
-        $uniqueId = ([string]$row.UniqueId).Trim('{}').ToLowerInvariant()
-        if([string]::IsNullOrWhiteSpace($uniqueId)) { continue }
-        $map[$uniqueId] = @{
-            Name = [string]$row.FileLeafRef
-            targetSiteId = [string]$row.A2ODRemoteItemSiteId
-            targetWebId = [string]$row.A2ODRemoteItemWebId
-            targetListId = [string]$row.A2ODRemoteItemListId
-            targetItemUniqueId = [string]$row.A2ODRemoteItemUniqueId
-        }
-    }
-    return $map
-}
-
 
 function Test-IsShortcutFolder {
     # A real shortcut carries A2OD* fields
@@ -3521,7 +3495,14 @@ function Invoke-PreflightChecks {
     $warnings = [System.Collections.Generic.List[string]]::new()
 
     # 1) Is the OneDrive client configured for a work/school account on this device?
+    # Resolved on every run, so the tray's left-click works once OneDrive is signed in after startup.
     $oneDriveRoot = Get-LocalOneDriveRootPath
+    $script:localOneDriveRootPath = $oneDriveRoot
+    $script:localShortcutFolderPath = Get-LocalShortcutFolderPath -FolderName $FolderName
+    if($script:traySync) {
+        $script:traySync.OneDriveRootPath = $script:localOneDriveRootPath
+        $script:traySync.LocalShortcutFolderPath = $script:localShortcutFolderPath
+    }
     if([string]::IsNullOrWhiteSpace($oneDriveRoot)) {
         $msg = "OneDrive does not appear to be set up for a work/school account here. Shortcuts will be created in your cloud OneDrive but may not appear in File Explorer until OneDrive is signed in and syncing."
         Write-Log "Pre-flight: $msg" "WARN"
@@ -3643,8 +3624,10 @@ function Invoke-M365AutoLinkRun {
                 Write-Log "Loaded $($cachedStaticExcludedLibraryKeySet.Count) cached static excluded librar$(if($cachedStaticExcludedLibraryKeySet.Count -eq 1){'y'}else{'ies'})" "INFO"
             }
         } catch {
-            Write-Log "Failed to load OneDrive config, continuing with defaults: $($_.Exception.Message)" "WARN"
-            $script:userConfig = Get-DefaultUserConfig
+            # Running on defaults would relink excluded/held-back libraries and later save the defaults over the user's config.
+            $script:userConfig = $null
+            Write-Log "Failed to load your settings (Apps/M365AutoLink/config.json) from OneDrive: $($_.Exception.Message)" "ERROR"
+            throw "Could not read your M365AutoLink settings from OneDrive, so nothing was changed. M365AutoLink retries automatically."
         }
 
         try {
@@ -3776,7 +3759,17 @@ function Invoke-M365AutoLinkRun {
         #retrieve current shortcuts
         Write-Log "Getting target info for all current shortcuts...." "INFO"
         Update-TrayState -Text "M365AutoLink - Reading current shortcuts" -Percent 25 -ProgressText "Reading current shortcuts" -IsRunning
-        $folderContents = New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$rootUrl/personal/$userComponent/_api/web/GetFolderByServerRelativeUrl('/personal/$userComponent/$libraryName/$FolderName')/Files?`$top=5000&`$format=json&`$expand=listItem" -Method GET
+        # The shortcut target fields are hidden, so they only come with the listing when selected by name.
+        # RenderListDataAsStream leaves shortcuts out entirely, even when scoped to this folder.
+        $folderFilesUri = "$rootUrl/personal/$userComponent/_api/web/GetFolderByServerRelativeUrl('/personal/$userComponent/$libraryName/$FolderName')/Files?`$top=5000&`$format=json"
+        $shortcutFieldSelect = (@('A2ODRemoteItemSiteId', 'A2ODRemoteItemWebId', 'A2ODRemoteItemListId', 'A2ODRemoteItemUniqueId') | ForEach-Object { "ListItemAllFields/$_" }) -join ','
+        try {
+            $folderContents = New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$folderFilesUri&`$expand=ListItemAllFields&`$select=Name,UniqueId,$shortcutFieldSelect" -Method GET -SuppressErrorDetail
+        } catch {
+            # E.g. a OneDrive that never held a shortcut may not have these fields yet; the per-item lookups below cover it.
+            Write-Log "Listing shortcuts with their targets failed, looking them up one by one instead: $($_.Exception.Message)" "WARN"
+            $folderContents = New-GraphQuery -resource $global:octo.sharepointUrl -Uri $folderFilesUri -Method GET
+        }
 
         #sometimes, e.g. when a library is changed to sync-blocked, onedrive changes it to a folder. These should be wiped as they would only confuse the user
         try {
@@ -3786,23 +3779,20 @@ function Invoke-M365AutoLinkRun {
             Write-HttpErrorDetail -ErrorRecord $_ -Context "unexpected folder cleanup" -Level "WARN"
         }
 
-        $shortcutMetadataMap = @{}
-        try {
-            $shortcutMetadataMap = Get-ShortcutMetadataMap -WebUrl "$rootUrl/personal/$userComponent" -ListId $docLibrary.id
-            Write-Log "Fetched metadata for $($shortcutMetadataMap.Count) shortcut(s) in a single call (RenderListDataAsStream)" "INFO"
-        } catch {
-            Write-Log "Bulk shortcut metadata call failed, falling back to per-item lookups: $($_.Exception.Message)" "WARN"
-        }
-
         $shortcutMetadataErrorCount = 0
+        $shortcutLookupCount = 0
         foreach($shortCut in $folderContents){
-            $normalizedUniqueId = ([string]$shortCut.UniqueId).Trim('{}').ToLowerInvariant()
-            $meta = $null
-            if($shortcutMetadataMap.ContainsKey($normalizedUniqueId)) {
-                $meta = $shortcutMetadataMap[$normalizedUniqueId]
+            $shortcutFields = $shortCut.ListItemAllFields
+            $meta = @{
+                Name = [string]$shortCut.Name
+                targetSiteId = [string]$shortcutFields.A2ODRemoteItemSiteId
+                targetWebId = [string]$shortcutFields.A2ODRemoteItemWebId
+                targetListId = [string]$shortcutFields.A2ODRemoteItemListId
+                targetItemUniqueId = [string]$shortcutFields.A2ODRemoteItemUniqueId
             }
 
-            if(-not $meta -or [string]::IsNullOrWhiteSpace([string]$meta.targetSiteId) -or [string]::IsNullOrWhiteSpace([string]$meta.targetListId)) {
+            if([string]::IsNullOrWhiteSpace($meta.targetSiteId) -or [string]::IsNullOrWhiteSpace($meta.targetListId)) {
+                $shortcutLookupCount++
                 try {
                     $shortCutMetaData = (New-GraphQuery -resource $global:octo.sharepointUrl -Uri "$rootUrl/personal/$userComponent/_api/web/lists('$($docLibrary.id)')/GetItemByUniqueId('$($shortCut.UniqueId)')?`$expand=FieldValuesAsText" -Method GET)
                     $meta = @{
@@ -3828,6 +3818,7 @@ function Invoke-M365AutoLinkRun {
                 "targetItemUniqueId" = $meta.targetItemUniqueId
             }
         }
+        Write-Log "Read the targets of $(@($folderContents).Count - $shortcutLookupCount) shortcut(s) from the folder listing, $shortcutLookupCount needed a separate lookup" "INFO"
         if($shortcutMetadataErrorCount -gt 0){
             Write-Log "Skipped $shortcutMetadataErrorCount existing shortcut(s) whose metadata could not be read this run." "WARN"
         }
@@ -4153,8 +4144,54 @@ function Invoke-M365AutoLinkRun {
         $script:lastMappedLibraryOptions = @($manageableLibraryTable.Values)
         $excludedLibraryCount = @($script:lastMappedLibraryOptions | Where-Object { $_.isExcluded }).Count
         Write-Log "Manageable libraries: $(@($script:lastMappedLibraryOptions).Count) ($excludedLibraryCount currently excluded by the user)" "INFO"
-        if($script:traySync) {
-            $script:traySync.HasMappedSites = (@($script:lastMappedLibraryOptions).Count -gt 0)
+
+        # Fix up existing shortcut names before creating new ones, so new names are checked against the fixed ones.
+        # Besides the cleanup patterns this strips the "<site title> - " that OneDrive puts in front of a new shortcut's
+        # name, when what remains is the name M365AutoLink gives that target (as Get-UniqueShortcutName would pick it).
+        $expectedShortcutNames = @{}
+        foreach($desired in $desiredShortcuts) {
+            $desiredKey = Get-ShortcutTargetKey -SiteId ([string]$desired.shortCut.siteId) -WebId ([string]$desired.shortCut.webId) -ListId ([string]$desired.shortCut.listId)
+            if([string]::IsNullOrWhiteSpace($desiredKey)) { continue }
+            $baseName = Get-SafeDriveItemName -Name (Get-CleanedShortcutName -Name $desired.listName)
+            $pathSuffix = Get-ShortcutPathSuffix -SiteUrl ([string]$desired.shortCut.siteUrl)
+            # Longest first, so "Site - Name - suffix" becomes "Name - suffix" rather than being cut too far.
+            $expectedShortcutNames[$desiredKey] = if($pathSuffix) { @((Get-SafeDriveItemName -Name "$baseName - $pathSuffix"), $baseName) } else { @($baseName) }
+        }
+
+        $renameCount = 0
+        Write-Log "Checking existing shortcut names..." "INFO"
+        Update-TrayState -Text "M365AutoLink - Renaming shortcuts" -Percent 55 -ProgressText "Renaming shortcuts" -IsRunning
+        foreach($existing in $currentShortCuts) {
+            if(-not $existing.Name) { continue }
+            $newName = Get-SafeDriveItemName -Name (Get-CleanedShortcutName -Name $existing.Name)
+            $existingKey = Get-ShortcutTargetKey -SiteId ([string]$existing.targetSiteId) -WebId ([string]$existing.targetWebId) -ListId ([string]$existing.targetListId)
+            $expectedNames = @()
+            if($existingKey -and $expectedShortcutNames.ContainsKey($existingKey)) { $expectedNames = @($expectedShortcutNames[$existingKey]) }
+            # Case-sensitive: "SUBSITE - SUBSITE" would otherwise pass for the unique name "SUBSITE - subsite".
+            if($expectedNames -cnotcontains $newName) {
+                foreach($expectedName in $expectedNames) {
+                    if($newName.EndsWith(" - $expectedName", [System.StringComparison]::OrdinalIgnoreCase)) { $newName = $expectedName; break }
+                }
+            }
+            if($newName -eq $existing.Name -or $existingShortcutNameSet.Contains($newName)) { continue }
+
+            if($DryRun) {
+                Write-Log "  [DRY RUN] Would rename '$($existing.Name)' to '$newName'" "INFO"
+                $renameCount++
+                continue
+            }
+            try {
+                $renameBody = @{ name = $newName } | ConvertTo-Json
+                $Null = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/me/drive/items/$($existing.ID)" -Method PATCH -Body $renameBody
+                Write-Log "  Renamed '$($existing.Name)' to '$newName'" "SUCCESS"
+                [void]$existingShortcutNameSet.Remove([string]$existing.Name)
+                [void]$existingShortcutNameSet.Add($newName)
+                [void]$reservedShortcutNameSet.Add($newName)
+                $existing.Name = $newName
+                $renameCount++
+            } catch {
+                Write-Log "  Failed to rename '$($existing.Name)': $($_.Exception.Message)" "WARN"
+            }
         }
 
         $createTotal = [Math]::Max(1, $desiredShortcuts.Count)
@@ -4223,12 +4260,13 @@ function Invoke-M365AutoLinkRun {
                     Write-Log "  Moved shortcut into '$FolderName' folder" "INFO"
                 }
 
-                $cleanName = Get-SafeDriveItemName -Name (Get-CleanedShortcutName -Name $newShortCut.name)
-                if($newShortCut.id -and $cleanName -ne $newShortCut.name){
+                # OneDrive names a new shortcut "<site title> - <requested name>" (and Graph may add a number on a conflict
+                # in the root), so rename it to the name that was asked for.
+                if($newShortCut.id -and $newShortCut.name -ne $safeShortcutName){
                     try {
-                        $renameBody = @{ name = $cleanName } | ConvertTo-Json
+                        $renameBody = @{ name = $safeShortcutName } | ConvertTo-Json
                         $Null = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/me/drive/items/$($newShortCut.id)" -Method PATCH -Body $renameBody
-                        Write-Log "  Renamed shortcut from '$($newShortCut.name)' to '$cleanName'" "INFO"
+                        Write-Log "  Renamed shortcut from '$($newShortCut.name)' to '$safeShortcutName'" "INFO"
                     } catch {
                         Write-Log "  Failed to rename shortcut '$($newShortCut.name)': $($_.Exception.Message)" "WARN"
                     }
@@ -4265,31 +4303,6 @@ function Invoke-M365AutoLinkRun {
 
                 Write-Log "  Failed to create shortcut for '$($desiredShortcut.shortcut.siteUrl)': $errorMessage" "ERROR"
                 $errorCount++
-            }
-        }
-
-        $renameCount = 0
-        if($linkNameReplacements.Count -gt 0) {
-            Write-Log "Checking existing shortcuts for name cleanup..." "INFO"
-            Update-TrayState -Text "M365AutoLink - Renaming shortcuts" -Percent 85 -ProgressText "Renaming shortcuts" -IsRunning
-            foreach($existing in $currentShortCuts) {
-                if(-not $existing.Name) { continue }
-                $cleanedName = Get-SafeDriveItemName -Name (Get-CleanedShortcutName -Name $existing.Name)
-                if($cleanedName -ne $existing.Name -and $currentShortCuts.Name -notcontains $cleanedName) {
-                    if($DryRun) {
-                        Write-Log "  [DRY RUN] Would rename '$($existing.Name)' to '$cleanedName'" "INFO"
-                        $renameCount++
-                        continue
-                    }
-                    try {
-                        $renameBody = @{ name = $cleanedName } | ConvertTo-Json
-                        $Null = New-GraphQuery -Uri "$($global:octo.graphUrl)/v1.0/me/drive/items/$($existing.ID)" -Method PATCH -Body $renameBody
-                        Write-Log "  Renamed '$($existing.Name)' to '$cleanedName'" "SUCCESS"
-                        $renameCount++
-                    } catch {
-                        Write-Log "  Failed to rename '$($existing.Name)': $($_.Exception.Message)" "WARN"
-                    }
-                }
             }
         }
 
@@ -4521,6 +4534,11 @@ try {
     Update-TrayState -Text "M365AutoLink - Ready" -Percent 0 -ProgressText "Waiting to start"
 
     $script:lastRunCompletedAt = $null
+    # A failed run (offline, OneDrive or sign-in not ready yet) is retried after these many minutes, the last one repeating.
+    $retryDelayMinutes = @(2, 5, 15, 30, 60)
+    $script:failedRunCount = 0
+    $script:retryRunAt = $null
+    $script:openManageAfterRun = $false
 
     $runRequested = $true
     while($true) {
@@ -4540,10 +4558,22 @@ try {
             } elseif($script:traySync -and $script:traySync.RequestManageShortcuts) {
                 $script:traySync.RequestManageShortcuts = $false
                 Write-Log "Tray action received: Manage shortcuts" "INFO"
-                Update-TrayState -Text "M365AutoLink - Opening shortcuts" -ProgressText "Opening shortcut manager"
-                Invoke-ManageShortcuts
-                Start-Sleep -Milliseconds 100
-                continue
+                if(@($script:lastMappedLibraryOptions).Count -eq 0) {
+                    # Nothing loaded yet (e.g. the logon run failed): run first, the dialog opens when it succeeds.
+                    Write-Log "No libraries loaded yet, running first and opening Manage shortcuts afterwards" "INFO"
+                    Update-TrayState -ShowBalloon -BalloonMessage "Loading your libraries first, Manage shortcuts opens when that is done." -BalloonIcon "Info"
+                    $script:openManageAfterRun = $true
+                    $runRequested = $true
+                } else {
+                    Update-TrayState -Text "M365AutoLink - Opening shortcuts" -ProgressText "Opening shortcut manager"
+                    Invoke-ManageShortcuts
+                    Start-Sleep -Milliseconds 100
+                    continue
+                }
+            } elseif($script:retryRunAt -and (Get-Date) -ge $script:retryRunAt) {
+                $script:retryRunAt = $null
+                Write-Log "Retrying after the failed run (attempt $($script:failedRunCount + 1))" "INFO"
+                $runRequested = $true
             } elseif($AutoRefreshHours -gt 0 -and $script:lastRunCompletedAt -and ((Get-Date) - $script:lastRunCompletedAt).TotalHours -ge $AutoRefreshHours) {
                 # periodic auto-refresh interval elapsed.
                 Write-Log "Auto-refresh interval ($AutoRefreshHours h) elapsed; starting a run." "INFO"
@@ -4592,11 +4622,33 @@ try {
             $hasIssues = ($summary.errorCount -gt 0)
             $idleProgressText = if($hasIssues) { "Idle - completed with errors (see log)" } else { "Idle - click Run now" }
             Update-TrayState -Text "M365AutoLink - Idle" -Percent 100 -ProgressText $idleProgressText -IsRunning:$false
+            $script:failedRunCount = 0
+            $script:retryRunAt = $null
+
+            if($script:openManageAfterRun) {
+                $script:openManageAfterRun = $false
+                Invoke-ManageShortcuts
+            }
         } catch {
+            $failureMessage = $_.Exception.Message
             if($script:traySync) {
                 $script:traySync.HasCompletedRun = $true
             }
-            Update-TrayState -Text "M365AutoLink - Error" -Percent 0 -ProgressText "Run failed - check log" -IsRunning:$false -ShowBalloon -BalloonMessage $_.Exception.Message -BalloonIcon "Error"
+            $script:openManageAfterRun = $false
+            $script:failedRunCount++
+            $trayText = "M365AutoLink - Run failed, check log"
+            if($runInTrayMode) {
+                $retryMinutes = $retryDelayMinutes[[Math]::Min($script:failedRunCount, $retryDelayMinutes.Count) - 1]
+                $script:retryRunAt = (Get-Date).AddMinutes($retryMinutes)
+                $trayText = "M365AutoLink - Run failed, retrying at $($script:retryRunAt.ToString('HH:mm'))"
+                Write-Log "Run failed, retrying automatically in $retryMinutes minute(s)" "WARN"
+            }
+            # Only the first failure in a row notifies, the retries after it only log.
+            if($script:failedRunCount -eq 1) {
+                Update-TrayState -Text $trayText -Percent 0 -ProgressText "Run failed - check log" -IsRunning:$false -ShowBalloon -BalloonMessage $failureMessage -BalloonIcon "Error"
+            } else {
+                Update-TrayState -Text $trayText -Percent 0 -ProgressText "Run failed - check log" -IsRunning:$false
+            }
             if(-not $runInTrayMode) {
                 throw
             }

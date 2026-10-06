@@ -303,6 +303,7 @@ https://www.lieben.nu/liebensraum/commercial-use/
 | Shortcuts are created but never appear in File Explorer | OneDrive isn't signed in / syncing a work account on the device. | Sign OneDrive into the work account; the pre-flight check warns about this in a tray balloon. |
 | A library shows as a **folder** full of files instead of a shortcut | The library became sync-blocked; OneDrive converted the shortcut to a folder. | The next run detects and removes these automatically. |
 | Yellow, orange or red tray icon | Combined item count of your OneDrive plus linked libraries is above 100,000 / 250,000 / 1,000,000. | Exclude large libraries in **Manage shortcuts**; see the linked KB article. |
+| Tray tooltip says "Run failed, retrying at ..." | The last run couldn't reach sign-in, OneDrive or your settings (see `lastRun.log`). | Nothing; it retries after 2, 5, 15, 30 and then every 60 minutes. **Run now** retries immediately. |
 | Some libraries were never linked after the first run | The first-run limit held them back (status **Held back** in **Manage shortcuts**). | Untick them in **Manage shortcuts**, or set `$LimitFirstRun = $false`. |
 | Some libraries are missing and you're a guest/B2B user | Guest accounts often can't run SharePoint Search in the host tenant. | Expected limitation; link those manually via OneDrive. |
 | Sign-in never completes / no browser appears | `$WindowStyle = "Hidden"` on a device without silent SSO. | Set `$WindowStyle = "Normal"`. |

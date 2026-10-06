@@ -2,6 +2,25 @@
 
 All notable changes to the delegated (per-user) edition of **M365AutoLink** (`M365AutoLink.ps1`) are documented here.
 
+## [1.5.1]
+
+### Shortcut names
+- **No more doubled names.** OneDrive now puts the site title in front of the name a new shortcut is created with, so shortcuts came out as `Finance - Finance` or `Site - Site - Library`.
+- **Faster reading of existing shortcuts.** Their targets now come with the folder listing in one call. The old bulk call read the OneDrive root instead of the `AutoLink` folder, so every shortcut needed its own lookup. 
+- A shortcut that already exists elsewhere in the user's OneDrive is reported as "already exists" again instead of as an error on Windows PowerShell 5.1. A non-JSON error response (e.g. from a proxy) no longer hides the real error on PowerShell 7.
+
+### Recovery without a restart
+- **Failed runs retry automatically** after 2, 5, 15, 30 and then every 60 minutes while M365AutoLink is in the tray, so a logon run that fails because OneDrive, sign-in or the network isn't ready yet recovers by itself. Only the first failure in a row shows a notification; the tray tooltip shows when the next retry is.
+- **Manage shortcuts is always available.** Before, it stayed greyed out until a run had succeeded. When nothing is loaded yet it now runs first and opens the window when that run is done. Clicking it, or the first-run notification, during a run opens it once the run finishes instead of being ignored.
+- The "nothing to manage yet" message is a notification instead of a modal box, which could open behind other windows and block M365AutoLink until it was restarted.
+- The Manage shortcuts window comes to the front when it opens, also after clicking a notification.
+- The local OneDrive folder is looked up again on every run, so clicking the tray icon opens the `AutoLink` folder once OneDrive is signed in after M365AutoLink started.
+
+### Settings safety
+- If your settings (`Apps/M365AutoLink/config.json`) can't be read from OneDrive, the run stops and retries later. Before, it continued with default settings, re-linked excluded and held-back libraries, and saved the defaults over your settings. Manage shortcuts loads the settings again in that case.
+- Creating the settings folders no longer replaces a folder that another device created at the same moment.
+- Manage shortcuts logs what happened (closed, no changes, saved), so a click is never silent in the log.
+
 ## [1.5.0]
 
 ### Sync budget
